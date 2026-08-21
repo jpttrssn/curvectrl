@@ -1,0 +1,24 @@
+# AGENTS.md
+
+COSMIC desktop app (libcosmic, Rust edition 2024) for film negative scanning and RAW image editing. Single-binary crate; early stage, no tests yet.
+
+## Commands
+
+- Lint/verify: `just check` — runs `cargo clippy --all-features --locked -- -W clippy::pedantic`. Use this to validate changes; no test suite exists.
+- Run the app: `just run` — builds and runs in **release** profile with `RUST_BACKTRACE=full` (not debug).
+- Build: `just` (= `build-release`) or `just build-debug`.
+- Edition 2024 needs a recent stable toolchain (rustup).
+
+## Dependencies
+
+- `libcosmic` is a **git dependency on pop-os master**, not crates.io. `Cargo.lock` pins the commit; always build/check with `--locked` (the just recipes already do).
+
+## Codegen and i18n
+
+- `build.rs` runs `xdgen` at compile time: generates `target/xdgen/app.desktop` and `app.metainfo.xml` from the templates in `resources/` combined with fluent strings from `i18n/`. Edit templates in `resources/`, never generated output (`target/` is gitignored).
+- User-facing strings use the `fl!` macro with message IDs from `i18n/en/exposure.ftl`. Add new messages there; missing translations fall back to English.
+
+## Conventions
+
+- Every `.rs` file starts with `// SPDX-License-Identifier: MPL-2.0` (repo license is MPL-2.0).
+- Distro packaging/vendoring flow is documented in README (`just vendor` → `just build-vendored`; `install` honors `rootdir`/`prefix`).
