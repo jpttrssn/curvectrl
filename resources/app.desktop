@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Exposure
+Comment=A film negative scanning and RAW image editor
+Type=Application
+Icon=io.github.jpttrssn.exposure
+Exec=exposure %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=COSMIC
+MimeType=

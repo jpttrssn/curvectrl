@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.jpttrssn.exposure</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MPL-2.0</project_license>
+  <name>Exposure</name>
+  <summary>A film negative scanning and RAW image editor</summary>
+  <icon type="remote" width="64" height="64" scale="1">
+    https://github.com/jpttrssn/exposure/raw/main/resources/icons/hicolor/scalable/apps/icon.svg
+  </icon>
+  <url type="vcs-browser">https://github.com/jpttrssn/exposure</url>
+  <launchable type="desktop-id">io.github.jpttrssn.exposure.desktop</launchable>
+  <provides>
+    <id>com.system76.CosmicApplication</id>
+    <binaries>
+      <binary>exposure</binary>
+    </binaries>
+  </provides>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+  <categories>
+    <category>COSMIC</category>
+  </categories>
+  <keywords>
+    <keyword>COSMIC</keyword>
+  </keywords>
+  <content_rating type="oars-1.1" />
+</component>
+
