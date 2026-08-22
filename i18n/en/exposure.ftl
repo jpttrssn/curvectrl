@@ -6,4 +6,5 @@ repository = Repository
 view = View
 welcome = Welcome to COSMIC! ✨
 page-id = Page { $num }
+no-files = No images found in ~/Pictures/exposure
 git-description = Git commit {$hash} on {$date}

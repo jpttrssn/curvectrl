@@ -5,12 +5,11 @@ use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
-use cosmic::iced::{Alignment, Length, Subscription, futures};
+use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, menu, nav_bar};
-use futures::SinkExt;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::path::Path;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/icon.svg");
@@ -30,20 +29,17 @@ pub struct AppModel {
     key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Configuration data that persists between application runs.
     config: Config,
-    /// Time active
-    time: u32,
-    /// Toggle the watch subscription
-    watch_is_active: bool,
+    /// File names from the pictures directory, displayed as tiles on Page 1.
+    files: Vec<String>,
 }
 
 /// Messages emitted by the application and its widgets.
 #[derive(Debug, Clone)]
 pub enum Message {
+    FilesLoaded(Vec<String>),
     LaunchUrl(String),
     ToggleContextPage(ContextPage),
-    ToggleWatch,
     UpdateConfig(Config),
-    WatchTick(u32),
 }
 
 /// Create a COSMIC application from the app model
@@ -120,12 +116,14 @@ impl cosmic::Application for AppModel {
                     }
                 })
                 .unwrap_or_default(),
-            time: 0,
-            watch_is_active: false,
+            files: Vec::new(),
         };
 
-        // Create a startup command that sets the window title.
-        let command = app.update_title();
+        // Set the window title and scan the pictures directory in parallel.
+        let command = Task::batch([
+            app.update_title(),
+            cosmic::task::future(async { Message::FilesLoaded(load_files().await) }),
+        ]);
 
         (app, command)
     }
@@ -177,21 +175,40 @@ impl cosmic::Application for AppModel {
                     .align_y(Alignment::End)
                     .spacing(space_s);
 
-                let counter_label = ["Watch: ", self.time.to_string().as_str()].concat();
-                let section = cosmic::widget::settings::section().add(
-                    cosmic::widget::settings::item::builder(counter_label).control(
-                        widget::button::text(if self.watch_is_active {
-                            "Stop"
-                        } else {
-                            "Start"
-                        })
-                        .on_press(Message::ToggleWatch),
-                    ),
-                );
+                let tiles: Element<'_, Message> = if self.files.is_empty() {
+                    widget::container(widget::text(fl!("no-files")))
+                        .width(Length::Fill)
+                        .align_x(Horizontal::Center)
+                        .into()
+                } else {
+                    let mut rows = widget::column::with_capacity(self.files.len().div_ceil(5));
+
+                    for chunk in self.files.chunks(5) {
+                        let mut row = widget::row::with_capacity(5);
+
+                        for name in chunk {
+                            row = row.push(
+                                widget::container(widget::text(name))
+                                    .width(Length::Fill)
+                                    .padding(space_s)
+                                    .align_x(Horizontal::Center),
+                            );
+                        }
+
+                        // Pad incomplete rows so every tile keeps an equal width.
+                        for _ in chunk.len()..5 {
+                            row = row.push(widget::space::horizontal());
+                        }
+
+                        rows = rows.push(row);
+                    }
+
+                    widget::scrollable(rows).height(Length::Fill).into()
+                };
 
                 widget::column::with_capacity(2)
                     .push(header)
-                    .push(section)
+                    .push(tiles)
                     .spacing(space_s)
                     .height(Length::Fill)
                     .into()
@@ -227,7 +244,7 @@ impl cosmic::Application for AppModel {
         };
 
         widget::container(content)
-            .width(600)
+            .width(Length::Fill)
             .height(Length::Fill)
             .apply(widget::container)
             .width(Length::Fill)
@@ -244,7 +261,7 @@ impl cosmic::Application for AppModel {
     /// indefinitely.
     fn subscription(&self) -> Subscription<Self::Message> {
         // Add subscriptions which are always active.
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             // Watch for application configuration changes.
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
@@ -257,22 +274,6 @@ impl cosmic::Application for AppModel {
                 }),
         ];
 
-        // Conditionally enables a timer that emits a message every second.
-        if self.watch_is_active {
-            subscriptions.push(Subscription::run(|| {
-                cosmic::iced::stream::channel(1, |mut emitter: futures::channel::mpsc::Sender<_>| async move {
-                    let mut time = 1;
-                    let mut interval = tokio::time::interval(Duration::from_secs(1));
-
-                    loop {
-                        interval.tick().await;
-                        _ = emitter.send(Message::WatchTick(time)).await;
-                        time += 1;
-                    }
-                })
-            }));
-        }
-
         Subscription::batch(subscriptions)
     }
 
@@ -282,12 +283,8 @@ impl cosmic::Application for AppModel {
     /// on the application's async runtime.
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
-            Message::WatchTick(time) => {
-                self.time = time;
-            }
-
-            Message::ToggleWatch => {
-                self.watch_is_active = !self.watch_is_active;
+            Message::FilesLoaded(files) => {
+                self.files = files;
             }
 
             Message::ToggleContextPage(context_page) => {
@@ -340,6 +337,31 @@ impl AppModel {
             Task::none()
         }
     }
+}
+
+/// Scans `~/Pictures/exposure` for regular files and returns their sorted names.
+async fn load_files() -> Vec<String> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+
+    let Ok(mut entries) =
+        tokio::fs::read_dir(Path::new(&home).join("Pictures").join("exposure")).await
+    else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_type().await.is_ok_and(|ty| ty.is_file())
+            && let Some(name) = entry.file_name().into_string().ok()
+        {
+            files.push(name);
+        }
+    }
+
+    files.sort();
+    files
 }
 
 /// The page to display in the application.
