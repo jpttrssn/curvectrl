@@ -2,12 +2,15 @@
 
 COSMIC desktop app (libcosmic, Rust edition 2024) for film negative scanning and RAW image editing. Single-binary crate; early stage, no tests yet.
 
+- `NOTES.md` tracks current working state and next-step targets for in-progress feature work (thumbnails/RAW rendering). Read it before continuing that work; update it when the state changes.
+
 ## Commands
 
 - Lint/verify: `just check` — runs `cargo clippy --all-features --locked -- -W clippy::pedantic`. Use this to validate changes; no test suite exists.
 - Run the app: `just run` — builds and runs in **release** profile with `RUST_BACKTRACE=full` (not debug).
 - Build: `just` (= `build-release`) or `just build-debug`.
 - Edition 2024 needs a recent stable toolchain (rustup).
+- Just recipes use `--locked`; the vendored build recipe (`build-vendored`) uses `--frozen --offline` since it must not touch the network.
 
 ## Dependencies
 

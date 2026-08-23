@@ -5,6 +5,7 @@ use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
+use cosmic::iced::widget::{Grid, grid};
 use cosmic::iced::{Alignment, ContentFit, Length, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, nav_bar};
@@ -14,10 +15,10 @@ use std::path::Path;
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/icon.svg");
 
-/// Maximum dimension of decoded RAW thumbnails.
-const THUMB_SIZE: u32 = 128;
-/// Height of the image area of a Page 1 tile.
-const TILE_IMAGE_HEIGHT: f32 = 96.0;
+/// Maximum dimension of decoded RAW thumbnails, also the maximum Page 1 tile width.
+const THUMB_SIZE: f32 = 384.0;
+/// Aspect ratio (width / height) of the image area of a Page 1 tile.
+const TILE_ASPECT: f32 = 1.0;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -205,24 +206,12 @@ impl cosmic::Application for AppModel {
                         .align_x(Horizontal::Center)
                         .into()
                 } else {
-                    let mut rows = widget::column::with_capacity(self.tiles.len().div_ceil(5));
+                    let grid = Grid::with_children(self.tiles.iter().map(tile_view))
+                        .fluid(THUMB_SIZE)
+                        .height(grid::Sizing::AspectRatio(TILE_ASPECT))
+                        .spacing(space_s);
 
-                    for chunk in self.tiles.chunks(5) {
-                        let mut row = widget::row::with_capacity(5);
-
-                        for tile in chunk {
-                            row = row.push(tile_view(tile));
-                        }
-
-                        // Pad incomplete rows so every tile keeps an equal width.
-                        for _ in chunk.len()..5 {
-                            row = row.push(widget::space::horizontal());
-                        }
-
-                        rows = rows.push(row);
-                    }
-
-                    widget::scrollable(rows).height(Length::Fill).into()
+                    widget::scrollable(grid).height(Length::Fill).into()
                 };
 
                 widget::column::with_capacity(2)
@@ -421,7 +410,7 @@ async fn load_files() -> Vec<String> {
     files
 }
 
-/// Renders a single Page 1 tile with its thumbnail above the file name.
+/// Renders a single Page 1 tile, filling the square cell the grid assigns it.
 fn tile_view(tile: &Tile) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
@@ -439,14 +428,12 @@ fn tile_view(tile: &Tile) -> Element<'_, Message> {
         .push(
             widget::container(preview)
                 .width(Length::Fill)
-                .height(Length::Fixed(TILE_IMAGE_HEIGHT))
+                .height(Length::Fill)
                 .align_x(Horizontal::Center)
-                .align_y(Vertical::Center)
-                .padding(space_s),
+                .align_y(Vertical::Center),
         )
         .push(widget::text(&tile.name))
         .spacing(space_s)
-        .width(Length::Fill)
         .align_x(Horizontal::Center)
         .into()
 }
@@ -550,7 +537,8 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         ]);
     }
 
-    let (rgba, width, height) = resize_nearest(&rgba, width as u32, height as u32, THUMB_SIZE);
+    let (rgba, width, height) =
+        resize_nearest(&rgba, width as u32, height as u32, THUMB_SIZE as u32);
     let (rgba, width, height) = orient(&rgba, width, height, image.orientation);
 
     Ok(Handle::from_rgba(width, height, rgba))
