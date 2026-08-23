@@ -490,6 +490,29 @@ fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
     }
 }
 
+/// Slices a sample buffer down to the usable area described by rawloader's
+/// `[top, right, bottom, left]` crops, discarding masked sensor borders.
+fn crop_samples(
+    samples: &[f32],
+    width: usize,
+    height: usize,
+    crops: [usize; 4],
+) -> Option<(Vec<f32>, usize, usize)> {
+    let [top, right, bottom, left] = crops;
+    if right + left >= width || top + bottom >= height || samples.len() < width * height {
+        return None;
+    }
+
+    let (out_width, out_height) = (width - right - left, height - top - bottom);
+    let mut cropped = Vec::with_capacity(out_width * out_height);
+    for y in top..top + out_height {
+        let row = y * width + left;
+        cropped.extend_from_slice(&samples[row..row + out_width]);
+    }
+
+    Some((cropped, out_width, out_height))
+}
+
 /// Reduces a mosaic sample buffer to half-resolution RGB pixels by averaging each
 /// 2x2 sensor block per CFA channel.
 ///
@@ -571,7 +594,13 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
 
-    let samples = normalize_samples(image);
+    let normalized = normalize_samples(image);
+
+    // Discard masked sensor borders before further processing.
+    let (samples, width, height) = match crop_samples(&normalized, width, height, image.crops) {
+        Some(cropped) => cropped,
+        None => (normalized, width, height),
+    };
 
     // RGB sources pass through; bayer mosaics are demosaiced into half-resolution
     // true-color pixels, falling back to a gray 2x2 box average for degenerate or
@@ -590,9 +619,13 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         }
 
         (rgb, width, height)
-    } else if let Some((rgb, half_width, half_height)) =
-        demosaic_half(&samples, width, height, &image.cfa)
-    {
+    } else if let Some((rgb, half_width, half_height)) = demosaic_half(
+        &samples,
+        width,
+        height,
+        // The usable area's origin shifts the CFA phase.
+        &image.cfa.shift(image.crops[3], image.crops[0]),
+    ) {
         let mut rgb = rgb;
         apply_white_balance(&mut rgb, image.wb_coeffs);
         (rgb, half_width, half_height)
@@ -778,5 +811,21 @@ mod tests {
         apply_white_balance(&mut rgb, [2.0, 2.0, 1.0, 1.0]);
 
         assert_eq!(rgb, vec![1.0, 1.0, 0.5]);
+    }
+
+    #[test]
+    fn crop_extracts_inner_region() {
+        let samples: Vec<f32> = (0_u16..12).map(f32::from).collect();
+
+        let (cropped, width, height) = crop_samples(&samples, 4, 3, [1, 1, 1, 2]).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(cropped, vec![6.0]);
+    }
+
+    #[test]
+    fn crop_rejects_degenerate_regions() {
+        assert!(crop_samples(&[0.0; 4], 2, 2, [2, 0, 0, 0]).is_none());
+        assert!(crop_samples(&[0.0; 4], 2, 2, [0, 1, 0, 2]).is_none());
     }
 }
