@@ -461,24 +461,23 @@ async fn decode_thumbnail(name: String) -> Message {
     Message::ThumbReady(name, result)
 }
 
-/// Converts a decoded RAW image into a small oriented RGBA thumbnail.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
+/// Normalizes raw sensor samples into linear 0..=1 intensity.
+fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
     let width = usize::max(image.width, 1);
-    let height = usize::max(image.height, 1);
 
-    // Normalize every sensor sample into linear 0..=1 intensity.
-    let samples: Vec<f32> = match &image.data {
-        rawloader::RawImageData::Integer(values) => {
-            let black = f32::from(image.blacklevels[0]);
-            let white = f32::from(image.whitelevels[0]);
-            let span = (white - black).max(f32::EPSILON);
+    match &image.data {
+        rawloader::RawImageData::Integer(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                // Black/white levels are per-channel, so look them up by CFA position.
+                let color = image.cfa.color_at(index / width, index % width);
+                let black = f32::from(image.blacklevels[color]);
+                let span = (f32::from(image.whitelevels[color]) - black).max(f32::EPSILON);
 
-            values
-                .iter()
-                .map(|value| (f32::from(*value) - black).clamp(0.0_f32, span) / span)
-                .collect()
-        }
+                (f32::from(*value) - black).clamp(0.0_f32, span) / span
+            })
+            .collect(),
         rawloader::RawImageData::Float(values) => {
             let max = values.iter().copied().fold(0.0_f32, f32::max);
             let gain = if max > f32::EPSILON { 1.0 / max } else { 1.0 };
@@ -488,11 +487,96 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
                 .map(|value| (*value * gain).clamp(0.0, 1.0))
                 .collect()
         }
+    }
+}
+
+/// Reduces a mosaic sample buffer to half-resolution RGB pixels by averaging each
+/// 2x2 sensor block per CFA channel.
+///
+/// Returns `None` when the dimensions degenerate or any block lacks an entire R/G/B
+/// channel, signaling callers to fall back to a simpler conversion.
+#[allow(clippy::cast_precision_loss)]
+fn demosaic_half(
+    samples: &[f32],
+    width: usize,
+    height: usize,
+    cfa: &rawloader::CFA,
+) -> Option<(Vec<f32>, usize, usize)> {
+    let (out_width, out_height) = (width / 2, height / 2);
+    if out_width == 0 || out_height == 0 || samples.len() < width * height {
+        return None;
+    }
+
+    let mut rgb = vec![0.0_f32; out_width * out_height * 3];
+    for by in 0..out_height {
+        for bx in 0..out_width {
+            let mut sums = [0.0_f32; 3];
+            let mut counts = [0_usize; 3];
+
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let y = by * 2 + dy;
+                    let x = bx * 2 + dx;
+                    let color = cfa.color_at(y, x);
+                    if color < 3 {
+                        sums[color] += samples[y * width + x];
+                        counts[color] += 1;
+                    }
+                }
+            }
+
+            let base = (by * out_width + bx) * 3;
+            for (channel, slot) in rgb[base..base + 3].iter_mut().enumerate() {
+                *slot = if counts[channel] > 0 {
+                    sums[channel] / counts[channel] as f32
+                } else {
+                    return None;
+                };
+            }
+        }
+    }
+
+    Some((rgb, out_width, out_height))
+}
+
+/// Applies in-file white balance gains to interleaved RGB, normalized against green.
+fn apply_white_balance(rgb: &mut [f32], coeffs: [f32; 4]) {
+    let green = coeffs[1];
+    let gains = if green > f32::EPSILON {
+        [coeffs[0] / green, 1.0, coeffs[2] / green]
+    } else {
+        [1.0; 3]
     };
 
-    // RGB sources pass through; bayer mosaics are reduced with a crude 2x2 box
-    // average, which washes out the mosaic pattern well enough for thumbnails.
-    let (rgb, width, height) = if image.cpp >= 3 {
+    for [r, g, b] in rgb.as_chunks_mut::<3>().0 {
+        *r *= gains[0];
+        *g *= gains[1];
+        *b *= gains[2];
+    }
+}
+
+/// Encodes a linear intensity into the sRGB transfer function.
+fn srgb_encode(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Converts a decoded RAW image into a small oriented RGBA thumbnail.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
+    let width = usize::max(image.width, 1);
+    let height = usize::max(image.height, 1);
+
+    let samples = normalize_samples(image);
+
+    // RGB sources pass through; bayer mosaics are demosaiced into half-resolution
+    // true-color pixels, falling back to a gray 2x2 box average for degenerate or
+    // unsupported CFA patterns.
+    let (mut rgb, width, height) = if image.cpp >= 3 {
         if samples.len() < width * height * 3 {
             return Err(());
         }
@@ -506,6 +590,12 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         }
 
         (rgb, width, height)
+    } else if let Some((rgb, half_width, half_height)) =
+        demosaic_half(&samples, width, height, &image.cfa)
+    {
+        let mut rgb = rgb;
+        apply_white_balance(&mut rgb, image.wb_coeffs);
+        (rgb, half_width, half_height)
     } else {
         let (half_width, half_height) = (width / 2, height / 2);
         if half_width == 0 || half_height == 0 || samples.len() < width * height {
@@ -526,6 +616,10 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
 
         (rgb, half_width, half_height)
     };
+
+    for value in &mut rgb {
+        *value = srgb_encode(*value);
+    }
 
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
     for [r, g, b] in rgb.as_chunks::<3>().0 {
@@ -638,5 +732,51 @@ impl menu::action::MenuAction for MenuAction {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srgb_encode_matches_reference_values() {
+        let assert_close = |value: f32, expected: f32| {
+            assert!((srgb_encode(value) - expected).abs() < 1e-6);
+        };
+
+        assert_close(0.0, 0.0);
+        assert_close(1.0, 1.0);
+        assert_close(0.5, 0.735_356_98);
+        assert!(srgb_encode(0.25) < srgb_encode(0.5));
+        assert_close(-0.5, 0.0);
+        assert_close(1.5, 1.0);
+    }
+
+    #[test]
+    fn demosaic_reduces_rggb_block_to_rgb() {
+        let cfa = rawloader::CFA::new("RGGB");
+        let samples = [1.0, 0.5, 0.25, 0.75];
+
+        let (rgb, width, height) = demosaic_half(&samples, 2, 2, &cfa).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(rgb, vec![1.0, 0.375, 0.75]);
+    }
+
+    #[test]
+    fn demosaic_rejects_blocks_missing_a_channel() {
+        let cfa = rawloader::CFA::new("GGGG");
+
+        assert!(demosaic_half(&[0.5; 4], 2, 2, &cfa).is_none());
+    }
+
+    #[test]
+    fn white_balance_normalizes_against_green() {
+        let mut rgb = vec![1.0, 1.0, 1.0];
+
+        apply_white_balance(&mut rgb, [2.0, 2.0, 1.0, 1.0]);
+
+        assert_eq!(rgb, vec![1.0, 1.0, 0.5]);
     }
 }
