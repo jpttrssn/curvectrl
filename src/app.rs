@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
-use crate::film::{ACTIVE_STOCK, invert_mono, measure_base_channels};
+use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
@@ -573,6 +573,19 @@ fn srgb_encode(value: f32) -> f32 {
     }
 }
 
+/// Collapses interleaved linear RGB to Rec.709 luminance.
+///
+/// Only meaningful in linear light, where luminance coefficients are defined;
+/// stripping the channels this way removes any capture cast from monochrome
+/// film scans outright.
+fn luma(rgb: &[f32]) -> Vec<f32> {
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[r, g, b]| 0.212_6 * r + 0.715_2 * g + 0.072_2 * b)
+        .collect()
+}
+
 /// Converts a decoded RAW image into a small oriented RGBA thumbnail.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
@@ -590,7 +603,7 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
     // RGB sources pass through; bayer mosaics are demosaiced into half-resolution
     // true-color pixels, falling back to a gray 2x2 box average for degenerate or
     // unsupported CFA patterns.
-    let (mut rgb, width, height) = if image.cpp >= 3 {
+    let (rgb, width, height) = if image.cpp >= 3 {
         if samples.len() < width * height * 3 {
             return Err(());
         }
@@ -633,28 +646,30 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         (rgb, half_width, half_height)
     };
 
-    // Anchor each channel on its own clear-film base, neutralizing capture
-    // casts, then invert the negative in density space.
-    let bases = measure_base_channels(&rgb).unwrap_or([ACTIVE_STOCK.base; 3]);
-    invert_mono(&mut rgb, &ACTIVE_STOCK, bases);
+    // Monochrome film carries no color signal: collapse to luminance so no
+    // capture cast can tint the positive.
+    let mut mono = luma(&rgb);
+
+    // Anchor the black point on the frame's clearest film, then invert the
+    // negative in density space.
+    let base = measure_base(&mono)
+        .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
+        .unwrap_or(ACTIVE_STOCK.base);
+    invert_gray(&mut mono, &ACTIVE_STOCK, base);
 
     // Downscale in linear light: averaging blocks of pixels suppresses sensor
     // noise and film-grain aliasing far better than sampling after encoding.
-    let (mut rgb, width, height) =
-        resize_area(&rgb, width as u32, height as u32, THUMB_SIZE as u32);
+    let (mut mono, width, height) =
+        resize_area(&mono, width as u32, height as u32, THUMB_SIZE as u32, 1);
 
-    for value in &mut rgb {
+    for value in &mut mono {
         *value = srgb_encode(*value);
     }
 
-    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for [r, g, b] in rgb.as_chunks::<3>().0 {
-        rgba.extend_from_slice(&[
-            (r * 255.0).round() as u8,
-            (g * 255.0).round() as u8,
-            (b * 255.0).round() as u8,
-            255,
-        ]);
+    let mut rgba = Vec::with_capacity(mono.len() * 4);
+    for &value in &mono {
+        let level = (value * 255.0).round() as u8;
+        rgba.extend_from_slice(&[level, level, level, 255]);
     }
 
     let (rgba, width, height) = orient(&rgba, width, height, image.orientation);
@@ -662,15 +677,22 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
     Ok(Handle::from_rgba(width, height, rgba))
 }
 
-/// Downscales an interleaved linear RGB buffer so no dimension exceeds `max`,
-/// never upscaling. Each output pixel averages the block of source pixels that
-/// maps into it, which suppresses noise and grain aliasing.
+/// Downscales an interleaved buffer of `channels`-component samples so no
+/// dimension exceeds `max`, never upscaling. Each output pixel averages the
+/// block of source pixels that maps into it, which suppresses noise and grain
+/// aliasing.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn resize_area(rgb: &[f32], width: u32, height: u32, max: u32) -> (Vec<f32>, u32, u32) {
+fn resize_area(
+    samples: &[f32],
+    width: u32,
+    height: u32,
+    max: u32,
+    channels: usize,
+) -> (Vec<f32>, u32, u32) {
     let scale = f32::min(
         1.0,
         f32::min(max as f32 / width as f32, max as f32 / height as f32),
@@ -678,7 +700,8 @@ fn resize_area(rgb: &[f32], width: u32, height: u32, max: u32) -> (Vec<f32>, u32
     let out_width = u32::max((width as f32 * scale) as u32, 1);
     let out_height = u32::max((height as f32 * scale) as u32, 1);
 
-    let mut resized = Vec::with_capacity((out_width * out_height * 3) as usize);
+    let mut resized = Vec::with_capacity(out_width as usize * out_height as usize * channels);
+    let mut sums = vec![0.0_f32; channels];
     for out_y in 0..out_height {
         let row_start = range(out_y, height, out_height);
         let rows = range_len(row_start, range(out_y + 1, height, out_height));
@@ -687,17 +710,17 @@ fn resize_area(rgb: &[f32], width: u32, height: u32, max: u32) -> (Vec<f32>, u32
             let cols = range_len(col_start, range(out_x + 1, width, out_width));
             let count = (rows * cols) as f32;
 
-            let mut sum = [0.0_f32; 3];
+            sums.fill(0.0);
             for y in row_start..row_start + rows {
                 for x in col_start..col_start + cols {
-                    let offset = (y * width as usize + x) * 3;
-                    sum[0] += rgb[offset];
-                    sum[1] += rgb[offset + 1];
-                    sum[2] += rgb[offset + 2];
+                    let offset = (y * width as usize + x) * channels;
+                    for (channel, sum) in sums.iter_mut().enumerate() {
+                        *sum += samples[offset + channel];
+                    }
                 }
             }
 
-            resized.extend_from_slice(&[sum[0] / count, sum[1] / count, sum[2] / count]);
+            resized.extend(sums.iter().map(|sum| sum / count));
         }
     }
 
@@ -824,6 +847,22 @@ mod tests {
     }
 
     #[test]
+    fn luma_preserves_neutral_levels() {
+        assert!((luma(&[1.0, 1.0, 1.0])[0] - 1.0).abs() < 1e-6);
+        assert!((luma(&[0.25, 0.25, 0.25])[0] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn luma_weights_green_over_blue() {
+        let green = luma(&[0.0, 1.0, 0.0])[0];
+        let blue = luma(&[0.0, 0.0, 1.0])[0];
+
+        assert!(green > blue);
+        assert!((green - 0.715_2).abs() < 1e-6);
+        assert!((blue - 0.072_2).abs() < 1e-6);
+    }
+
+    #[test]
     fn crop_extracts_inner_region() {
         let samples: Vec<f32> = (0_u16..12).map(f32::from).collect();
 
@@ -844,7 +883,7 @@ mod tests {
         // Gray ramp 1.0..16.0 over a 4x4 buffer.
         let rgb: Vec<f32> = (1_u16..=16).flat_map(|value| [f32::from(value); 3]).collect();
 
-        let (out, width, height) = resize_area(&rgb, 4, 4, 2);
+        let (out, width, height) = resize_area(&rgb, 4, 4, 2, 3);
 
         assert_eq!((width, height), (2, 2));
         assert_eq!(out, vec![
@@ -859,9 +898,19 @@ mod tests {
     fn resize_area_is_identity_without_shrink() {
         let rgb: Vec<f32> = (0_u16..4).flat_map(|value| [f32::from(value); 3]).collect();
 
-        let (out, width, height) = resize_area(&rgb, 2, 2, 384);
+        let (out, width, height) = resize_area(&rgb, 2, 2, 384, 3);
 
         assert_eq!((width, height), (2, 2));
         assert_eq!(out, rgb);
+    }
+
+    #[test]
+    fn resize_area_handles_single_channel_samples() {
+        let samples: Vec<f32> = (1_u16..=4).map(f32::from).collect();
+
+        let (out, width, height) = resize_area(&samples, 2, 2, 1, 1);
+
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(out, vec![2.5]); // mean of {1, 2, 3, 4}
     }
 }

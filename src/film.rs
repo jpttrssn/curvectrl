@@ -36,7 +36,23 @@ const MIN_TRANSMISSION: f32 = 1e-6;
 
 /// Measured channel bases below this are implausible — they indicate frames
 /// without any measurable clear film — and fall back to [`MonoStock::base`].
-const MIN_PLAUSIBLE_BASE: f32 = 0.1;
+pub const MIN_PLAUSIBLE_BASE: f32 = 0.1;
+
+/// Maps one scanned transmission to its positive tone value, anchored on its
+/// channel's clear-film transmission: optical density relative to that anchor,
+/// positioned within the stock's usable density range, then run through the
+/// contrast curve.
+fn positive(transmission: f32, base: f32, stock: &MonoStock) -> f32 {
+    let value = transmission.clamp(MIN_TRANSMISSION, base);
+    // Density relative to the clear-film anchor.
+    let density = f32::log10(base / value);
+    // Position within the film's usable density range, mapped through a
+    // contrast curve onto the full positive range: the clearest film
+    // areas print black, the densest useful areas print white.
+    let position = (density / stock.d_max).clamp(0.0, 1.0);
+
+    position.powf(stock.gamma)
+}
 
 /// Inverts interleaved linear RGB scanned from a monochrome negative into a
 /// positive, working in optical-density space.
@@ -44,19 +60,27 @@ const MIN_PLAUSIBLE_BASE: f32 = 0.1;
 /// `bases` holds each channel's clear-film transmission, anchoring the black
 /// point per channel so capture casts (light table, sensor response) are
 /// neutralized.
+///
+/// Unused while scans collapse to luminance before inversion; kept with its
+/// tests as the per-channel path for future color stocks.
+#[allow(dead_code)]
 pub fn invert_mono(rgb: &mut [f32], stock: &MonoStock, bases: [f32; 3]) {
-    for [r, g, b] in rgb.as_chunks_mut::<3>().0 {
-        for (slot, base) in [r, g, b].into_iter().zip(bases) {
-            let value = (*slot).clamp(MIN_TRANSMISSION, base);
-            // Density relative to the channel's own clear-film anchor.
-            let density = f32::log10(base / value);
-            // Position within the film's usable density range, mapped through a
-            // contrast curve onto the full positive range: the clearest film
-            // areas print black, the densest useful areas print white.
-            let position = (density / stock.d_max).clamp(0.0, 1.0);
-
-            *slot = position.powf(stock.gamma);
+    for pixel in rgb.as_chunks_mut::<3>().0 {
+        for (slot, base) in pixel.iter_mut().zip(bases) {
+            *slot = positive(*slot, base, stock);
         }
+    }
+}
+
+/// Inverts linear samples scanned from a monochrome negative into a positive,
+/// working in optical-density space.
+///
+/// `base` is the scan's clear-film transmission and anchors the black point;
+/// collapsing the capture to luminance beforehand removes any cast between
+/// channels outright.
+pub fn invert_gray(samples: &mut [f32], stock: &MonoStock, base: f32) {
+    for slot in samples {
+        *slot = positive(*slot, base, stock);
     }
 }
 
@@ -86,6 +110,9 @@ pub fn measure_base(samples: &[f32]) -> Option<f32> {
 ///
 /// Channels measuring below [`MIN_PLAUSIBLE_BASE`] fall back to the active
 /// stock's constant; returns `None` only when no channel has finite samples.
+///
+/// Unused alongside [`invert_mono`]; kept for future color stocks.
+#[allow(dead_code)]
 pub fn measure_base_channels(rgb: &[f32]) -> Option<[f32; 3]> {
     let mut channels: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for [r, g, b] in rgb.as_chunks::<3>().0 {
@@ -234,5 +261,49 @@ mod tests {
         invert_mono(&mut neutral, &linear, [ACTIVE_STOCK.base; 3]);
 
         assert!(lifted[0] > neutral[0]);
+    }
+
+    #[test]
+    fn inversion_gray_maps_base_and_dmax_to_endpoints() {
+        // White point sits at the film's usable density limit above base.
+        let white_point_input = ACTIVE_STOCK.base * 10.0_f32.powf(-ACTIVE_STOCK.d_max);
+        let mut gray = vec![ACTIVE_STOCK.base, white_point_input];
+
+        invert_gray(&mut gray, &ACTIVE_STOCK, ACTIVE_STOCK.base);
+
+        assert!(gray[0].abs() < 1e-5);
+        assert!((gray[1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn inversion_gray_is_monotonic_between_endpoints() {
+        let inputs = [0.05, 0.2, 0.5, ACTIVE_STOCK.base];
+        let mut gray = inputs.to_vec();
+
+        invert_gray(&mut gray, &ACTIVE_STOCK, ACTIVE_STOCK.base);
+
+        // Brighter scans (closer to clear base) must print darker.
+        for window in gray.windows(2) {
+            assert!(window[0] > window[1]);
+        }
+    }
+
+    #[test]
+    fn inversion_gray_matches_rgb_inversion_on_neutral_pixels() {
+        let inputs = [0.05, 0.2, 0.5, ACTIVE_STOCK.base];
+        let mut rgb = Vec::new();
+        for value in inputs {
+            rgb.extend_from_slice(&[value; 3]);
+        }
+        let mut gray = inputs.to_vec();
+
+        invert_mono(&mut rgb, &ACTIVE_STOCK, [ACTIVE_STOCK.base; 3]);
+        invert_gray(&mut gray, &ACTIVE_STOCK, ACTIVE_STOCK.base);
+
+        for (pixel, expected) in rgb.as_chunks::<3>().0.iter().zip(&gray) {
+            for value in pixel {
+                assert!((value - expected).abs() < 1e-6);
+            }
+        }
     }
 }
