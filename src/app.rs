@@ -514,53 +514,55 @@ fn crop_samples(
     Some((cropped, out_width, out_height))
 }
 
-/// Reduces a mosaic sample buffer to half-resolution RGB pixels by averaging each
-/// 2x2 sensor block per CFA channel.
+/// Approximate number of photosites sampled per CFA class when measuring
+/// clear-film bases in [`flatten_bayer`].
+const BASE_SAMPLE_TARGET: usize = 250_000;
+
+/// Reconstructs a full-resolution monochrome negative from bayer samples.
 ///
-/// Returns `None` when the dimensions degenerate or any block lacks an entire R/G/B
-/// channel, signaling callers to fall back to a simpler conversion.
-#[allow(clippy::cast_precision_loss)]
-fn demosaic_half(
-    samples: &[f32],
-    width: usize,
-    height: usize,
-    cfa: &rawloader::CFA,
-) -> Option<(Vec<f32>, usize, usize)> {
-    let (out_width, out_height) = (width / 2, height / 2);
-    if out_width == 0 || out_height == 0 || samples.len() < width * height {
-        return None;
+/// Monochrome film carries no color signal, so each CFA class is treated as an
+/// independent density measurement: every class's clear-film transmission is
+/// measured from a strided subsample and the classes are rescaled onto one
+/// common base. This reads the sensor at native resolution instead of
+/// averaging 2x2 blocks, keeping grain texture a demosaic would smear.
+fn flatten_bayer(samples: &[f32], width: usize, height: usize, cfa: &rawloader::CFA) -> Vec<f32> {
+    let pixels = width * height;
+    // An odd step cannot alias with the period-2 CFA grid.
+    let step = usize::max(pixels / BASE_SAMPLE_TARGET, 1) | 1;
+
+    let mut class_samples: [Vec<f32>; 4] = Default::default();
+    for idx in (0..pixels).step_by(step) {
+        let (y, x) = (idx / width, idx % width);
+        class_samples[cfa.color_at(y, x)].push(samples[idx]);
     }
 
-    let mut rgb = vec![0.0_f32; out_width * out_height * 3];
-    for by in 0..out_height {
-        for bx in 0..out_width {
-            let mut sums = [0.0_f32; 3];
-            let mut counts = [0_usize; 3];
-
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let y = by * 2 + dy;
-                    let x = bx * 2 + dx;
-                    let color = cfa.color_at(y, x);
-                    if color < 3 {
-                        sums[color] += samples[y * width + x];
-                        counts[color] += 1;
-                    }
-                }
-            }
-
-            let base = (by * out_width + bx) * 3;
-            for (channel, slot) in rgb[base..base + 3].iter_mut().enumerate() {
-                *slot = if counts[channel] > 0 {
-                    sums[channel] / counts[channel] as f32
-                } else {
-                    return None;
-                };
-            }
+    let mut anchored = [ACTIVE_STOCK.base; 4];
+    for (base, class) in anchored.iter_mut().zip(&class_samples) {
+        if let Some(measured) =
+            measure_base(class).filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
+        {
+            *base = measured;
         }
     }
+    // Anchor onto the green class when present (best SNR, keeps magnitudes
+    // close to true transmissions); otherwise the dimmest measurable class.
+    let reference = if class_samples[1].is_empty() {
+        class_samples
+            .iter()
+            .zip(anchored)
+            .filter(|(class, _)| !class.is_empty())
+            .map(|(_, base)| base)
+            .fold(f32::INFINITY, f32::min)
+    } else {
+        anchored[1]
+    };
 
-    Some((rgb, out_width, out_height))
+    let gains: [f32; 4] = std::array::from_fn(|class| reference / anchored[class]);
+    samples[..pixels]
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| value * gains[cfa.color_at(idx / width, idx % width)])
+        .collect()
 }
 
 /// Encodes a linear intensity into the sRGB transfer function.
@@ -600,10 +602,10 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         None => (normalized, width, height),
     };
 
-    // RGB sources pass through; bayer mosaics are demosaiced into half-resolution
-    // true-color pixels, falling back to a gray 2x2 box average for degenerate or
-    // unsupported CFA patterns.
-    let (rgb, width, height) = if image.cpp >= 3 {
+    // RGB sources collapse through luminance; bayer mosaics reconstruct into a
+    // full-resolution monochrome negative by rescaling CFA classes onto one
+    // common base.
+    let (mut mono, width, height) = if image.cpp >= 3 {
         if samples.len() < width * height * 3 {
             return Err(());
         }
@@ -616,39 +618,17 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
             rgb.push(samples[base + 2]);
         }
 
-        (rgb, width, height)
-    } else if let Some((rgb, half_width, half_height)) = demosaic_half(
-        &samples,
-        width,
-        height,
-        // The usable area's origin shifts the CFA phase.
-        &image.cfa.shift(image.crops[3], image.crops[0]),
-    ) {
-        (rgb, half_width, half_height)
+        (luma(&rgb), width, height)
     } else {
-        let (half_width, half_height) = (width / 2, height / 2);
-        if half_width == 0 || half_height == 0 || samples.len() < width * height {
+        if samples.len() < width * height {
             return Err(());
         }
 
-        let mut rgb = Vec::with_capacity(half_width * half_height * 3);
-        for y in 0..half_height {
-            for x in 0..half_width {
-                let sum = samples[y * 2 * width + x * 2]
-                    + samples[y * 2 * width + x * 2 + 1]
-                    + samples[(y * 2 + 1) * width + x * 2]
-                    + samples[(y * 2 + 1) * width + x * 2 + 1];
+        // The usable area's origin shifts the CFA phase.
+        let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
 
-                rgb.extend_from_slice(&[sum / 4.0, sum / 4.0, sum / 4.0]);
-            }
-        }
-
-        (rgb, half_width, half_height)
+        (flatten_bayer(&samples, width, height, &cfa), width, height)
     };
-
-    // Monochrome film carries no color signal: collapse to luminance so no
-    // capture cast can tint the positive.
-    let mut mono = luma(&rgb);
 
     // Anchor the black point on the frame's clearest film, then invert the
     // negative in density space.
@@ -661,6 +641,10 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
     // noise and film-grain aliasing far better than sampling after encoding.
     let (mut mono, width, height) =
         resize_area(&mono, width as u32, height as u32, THUMB_SIZE as u32, 1);
+
+    // Restore edge punch lost to the heavy downscale, before tone encoding so
+    // overshoot stays out of the perceptually amplified display range.
+    unsharp_mask(&mut mono, width as usize, height as usize);
 
     for value in &mut mono {
         *value = srgb_encode(*value);
@@ -738,6 +722,47 @@ fn range(out: u32, source: u32, out_total: u32) -> usize {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn range_len(start: usize, next_start: usize) -> usize {
     usize::max(next_start.saturating_sub(start), 1)
+}
+
+/// Strength of the post-downscale unsharp mask; 0 disables.
+const UNSHARP_AMOUNT: f32 = 0.4;
+
+/// Applies a gentle unsharp mask to a linear buffer, restoring edge punch lost
+/// to heavy downscaling. Runs before tone encoding so overshoot stays out of
+/// the perceptually amplified display range and shadow noise stays quiet.
+fn unsharp_mask(samples: &mut [f32], width: usize, height: usize) {
+    let blurred = blur_121(samples, width, height);
+    for (slot, blur) in samples.iter_mut().zip(blurred) {
+        *slot = (*slot + UNSHARP_AMOUNT * (*slot - blur)).clamp(0.0, 1.0);
+    }
+}
+
+/// Separable 3x3 binomial blur ([1, 2, 1] per axis), replicating edges.
+fn blur_121(samples: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let mut horizontal = vec![0.0_f32; samples.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let left = samples[y * width + x.saturating_sub(1)];
+            let center = samples[y * width + x];
+            let right = samples[y * width + usize::min(x + 1, width - 1)];
+
+            horizontal[y * width + x] = (left + 2.0 * center + right) / 4.0;
+        }
+    }
+
+    let mut blurred = vec![0.0_f32; samples.len()];
+    for y in 0..height {
+        let up = y.saturating_sub(1);
+        let down = usize::min(y + 1, height - 1);
+        for x in 0..width {
+            blurred[y * width + x] = (horizontal[up * width + x]
+                + 2.0 * horizontal[y * width + x]
+                + horizontal[down * width + x])
+                / 4.0;
+        }
+    }
+
+    blurred
 }
 
 /// Applies the RAW orientation metadata to an RGBA buffer.
@@ -829,21 +854,69 @@ mod tests {
     }
 
     #[test]
-    fn demosaic_reduces_rggb_block_to_rgb() {
+    fn flatten_bayer_scales_classes_to_a_common_base() {
+        // Neutral film at transmission 0.5 seen through per-class sensor casts
+        // (RGGB layout: one R, two G, one B site).
         let cfa = rawloader::CFA::new("RGGB");
-        let samples = [1.0, 0.5, 0.25, 0.75];
+        let samples = [0.60, 0.50, 0.50, 0.40]; // R, G, G, B sites
 
-        let (rgb, width, height) = demosaic_half(&samples, 2, 2, &cfa).unwrap();
+        let mono = flatten_bayer(&samples, 2, 2, &cfa);
 
-        assert_eq!((width, height), (1, 1));
-        assert_eq!(rgb, vec![1.0, 0.375, 0.75]);
+        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
     }
 
     #[test]
-    fn demosaic_rejects_blocks_missing_a_channel() {
-        let cfa = rawloader::CFA::new("GGGG");
+    fn flatten_bayer_respects_cfa_phase() {
+        // GBRG layout: blue sits top-left; only that site carries the cast.
+        let cfa = rawloader::CFA::new("GBRG");
+        let samples = [0.25, 0.20, 0.30, 0.25]; // G, B, R, G sites
 
-        assert!(demosaic_half(&[0.5; 4], 2, 2, &cfa).is_none());
+        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+
+        assert!(mono.iter().all(|value| (value - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn flatten_bayer_handles_fourth_color_sites() {
+        // Emerald-class sites get their own measured base like any other.
+        let cfa = rawloader::CFA::new("RGBE");
+        let samples = [0.45, 0.50, 0.55, 0.50]; // R, G, B, E sites
+
+        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+
+        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn unsharp_mask_leaves_flat_buffers_unchanged() {
+        let mut flat = vec![0.42_f32; 16];
+
+        unsharp_mask(&mut flat, 4, 4);
+
+        assert!(flat.iter().all(|value| (value - 0.42).abs() < 1e-6));
+    }
+
+    #[test]
+    fn unsharp_mask_increases_local_contrast() {
+        // Horizontal mid-gray step edge across a single row.
+        let mut edge = vec![0.2_f32, 0.2, 0.2, 0.8, 0.8, 0.8];
+
+        unsharp_mask(&mut edge, 6, 1);
+
+        assert!(edge[2] < 0.2); // dark side dips further
+        assert!(edge[3] > 0.8); // bright side overshoots
+    }
+
+    #[test]
+    fn unsharp_mask_clamps_to_unit_range() {
+        // A lone bright spike would overshoot past white without clamping.
+        let mut spike = vec![0.0_f32; 9];
+        spike[4] = 1.0;
+
+        unsharp_mask(&mut spike, 3, 3);
+
+        assert!(spike.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert_eq!(spike[4], 1.0);
     }
 
     #[test]
