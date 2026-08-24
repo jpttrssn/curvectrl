@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
+use crate::film::{ACTIVE_STOCK, invert_mono, measure_base_channels};
 use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
@@ -562,22 +563,6 @@ fn demosaic_half(
     Some((rgb, out_width, out_height))
 }
 
-/// Applies in-file white balance gains to interleaved RGB, normalized against green.
-fn apply_white_balance(rgb: &mut [f32], coeffs: [f32; 4]) {
-    let green = coeffs[1];
-    let gains = if green > f32::EPSILON {
-        [coeffs[0] / green, 1.0, coeffs[2] / green]
-    } else {
-        [1.0; 3]
-    };
-
-    for [r, g, b] in rgb.as_chunks_mut::<3>().0 {
-        *r *= gains[0];
-        *g *= gains[1];
-        *b *= gains[2];
-    }
-}
-
 /// Encodes a linear intensity into the sRGB transfer function.
 fn srgb_encode(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
@@ -626,8 +611,6 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         // The usable area's origin shifts the CFA phase.
         &image.cfa.shift(image.crops[3], image.crops[0]),
     ) {
-        let mut rgb = rgb;
-        apply_white_balance(&mut rgb, image.wb_coeffs);
         (rgb, half_width, half_height)
     } else {
         let (half_width, half_height) = (width / 2, height / 2);
@@ -650,6 +633,16 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         (rgb, half_width, half_height)
     };
 
+    // Anchor each channel on its own clear-film base, neutralizing capture
+    // casts, then invert the negative in density space.
+    let bases = measure_base_channels(&rgb).unwrap_or([ACTIVE_STOCK.base; 3]);
+    invert_mono(&mut rgb, &ACTIVE_STOCK, bases);
+
+    // Downscale in linear light: averaging blocks of pixels suppresses sensor
+    // noise and film-grain aliasing far better than sampling after encoding.
+    let (mut rgb, width, height) =
+        resize_area(&rgb, width as u32, height as u32, THUMB_SIZE as u32);
+
     for value in &mut rgb {
         *value = srgb_encode(*value);
     }
@@ -664,20 +657,20 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
         ]);
     }
 
-    let (rgba, width, height) =
-        resize_nearest(&rgba, width as u32, height as u32, THUMB_SIZE as u32);
     let (rgba, width, height) = orient(&rgba, width, height, image.orientation);
 
     Ok(Handle::from_rgba(width, height, rgba))
 }
 
-/// Resizes an RGBA buffer with nearest-neighbor sampling, never upscaling.
+/// Downscales an interleaved linear RGB buffer so no dimension exceeds `max`,
+/// never upscaling. Each output pixel averages the block of source pixels that
+/// maps into it, which suppresses noise and grain aliasing.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn resize_nearest(rgba: &[u8], width: u32, height: u32, max: u32) -> (Vec<u8>, u32, u32) {
+fn resize_area(rgb: &[f32], width: u32, height: u32, max: u32) -> (Vec<f32>, u32, u32) {
     let scale = f32::min(
         1.0,
         f32::min(max as f32 / width as f32, max as f32 / height as f32),
@@ -685,17 +678,43 @@ fn resize_nearest(rgba: &[u8], width: u32, height: u32, max: u32) -> (Vec<u8>, u
     let out_width = u32::max((width as f32 * scale) as u32, 1);
     let out_height = u32::max((height as f32 * scale) as u32, 1);
 
-    let mut resized = Vec::with_capacity((out_width * out_height * 4) as usize);
-    for y in 0..out_height {
-        let source_y = (u64::from(y) * u64::from(height) / u64::from(out_height)) as usize;
-        for x in 0..out_width {
-            let source_x = (u64::from(x) * u64::from(width) / u64::from(out_width)) as usize;
-            let offset = (source_y * width as usize + source_x) * 4;
-            resized.extend_from_slice(&rgba[offset..offset + 4]);
+    let mut resized = Vec::with_capacity((out_width * out_height * 3) as usize);
+    for out_y in 0..out_height {
+        let row_start = range(out_y, height, out_height);
+        let rows = range_len(row_start, range(out_y + 1, height, out_height));
+        for out_x in 0..out_width {
+            let col_start = range(out_x, width, out_width);
+            let cols = range_len(col_start, range(out_x + 1, width, out_width));
+            let count = (rows * cols) as f32;
+
+            let mut sum = [0.0_f32; 3];
+            for y in row_start..row_start + rows {
+                for x in col_start..col_start + cols {
+                    let offset = (y * width as usize + x) * 3;
+                    sum[0] += rgb[offset];
+                    sum[1] += rgb[offset + 1];
+                    sum[2] += rgb[offset + 2];
+                }
+            }
+
+            resized.extend_from_slice(&[sum[0] / count, sum[1] / count, sum[2] / count]);
         }
     }
 
     (resized, out_width, out_height)
+}
+
+/// Start of the source range that output coordinate `out` covers.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn range(out: u32, source: u32, out_total: u32) -> usize {
+    (u64::from(out) * u64::from(source) / u64::from(out_total)) as usize
+}
+
+/// Length of the source range between `start` and the next output coordinate's
+/// start, always covering at least one source pixel.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn range_len(start: usize, next_start: usize) -> usize {
+    usize::max(next_start.saturating_sub(start), 1)
 }
 
 /// Applies the RAW orientation metadata to an RGBA buffer.
@@ -805,15 +824,6 @@ mod tests {
     }
 
     #[test]
-    fn white_balance_normalizes_against_green() {
-        let mut rgb = vec![1.0, 1.0, 1.0];
-
-        apply_white_balance(&mut rgb, [2.0, 2.0, 1.0, 1.0]);
-
-        assert_eq!(rgb, vec![1.0, 1.0, 0.5]);
-    }
-
-    #[test]
     fn crop_extracts_inner_region() {
         let samples: Vec<f32> = (0_u16..12).map(f32::from).collect();
 
@@ -827,5 +837,31 @@ mod tests {
     fn crop_rejects_degenerate_regions() {
         assert!(crop_samples(&[0.0; 4], 2, 2, [2, 0, 0, 0]).is_none());
         assert!(crop_samples(&[0.0; 4], 2, 2, [0, 1, 0, 2]).is_none());
+    }
+
+    #[test]
+    fn resize_area_averages_source_blocks() {
+        // Gray ramp 1.0..16.0 over a 4x4 buffer.
+        let rgb: Vec<f32> = (1_u16..=16).flat_map(|value| [f32::from(value); 3]).collect();
+
+        let (out, width, height) = resize_area(&rgb, 4, 4, 2);
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(out, vec![
+            3.5, 3.5, 3.5, // mean of {1, 2, 5, 6}
+            5.5, 5.5, 5.5, // mean of {3, 4, 7, 8}
+            11.5, 11.5, 11.5, // mean of {9, 10, 13, 14}
+            13.5, 13.5, 13.5, // mean of {11, 12, 15, 16}
+        ]);
+    }
+
+    #[test]
+    fn resize_area_is_identity_without_shrink() {
+        let rgb: Vec<f32> = (0_u16..4).flat_map(|value| [f32::from(value); 3]).collect();
+
+        let (out, width, height) = resize_area(&rgb, 2, 2, 384);
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(out, rgb);
     }
 }
