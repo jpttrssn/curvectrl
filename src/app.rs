@@ -6,18 +6,27 @@ use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
-use cosmic::iced::widget::{Grid, grid};
+use cosmic::iced::keyboard;
+use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{Alignment, ContentFit, Length, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, nav_bar};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/icon.svg");
 
 /// Maximum dimension of decoded RAW thumbnails, also the maximum Page 1 tile width.
 const THUMB_SIZE: f32 = 384.0;
+/// Maximum dimension of the hi-res decode displayed in the detail view.
+///
+/// Sharp at typical window sizes while keeping the decoded buffer a fraction
+/// of a full sensor frame.
+const HI_RES_SIZE: f32 = 2048.0;
+/// Opacity units per second for the hi-res crossfade (~0.2 s full ramp).
+const FADE_SPEED: f32 = 5.0;
 /// Aspect ratio (width / height) of the image area of a Page 1 tile.
 const TILE_ASPECT: f32 = 1.0;
 
@@ -38,6 +47,17 @@ pub struct AppModel {
     config: Config,
     /// File entries from the pictures directory, displayed as tiles on Page 1.
     tiles: Vec<Tile>,
+    /// File shown enlarged in the detail view in place of the grid, if any.
+    selected: Option<String>,
+    /// Hi-resolution image for the selected file; `None` falls back to its
+    /// thumbnail until the decode lands.
+    detail_hi_res: Option<Handle>,
+    /// File handed to the one permitted in-flight hi-res detail decode.
+    detail_inflight: Option<String>,
+    /// Current opacity of the hi-res detail layer during crossfade (0.0→1.0).
+    detail_hi_res_opacity: f32,
+    /// Timestamp of the last animation frame for framerate-independent fading.
+    detail_last_frame: Option<Instant>,
 }
 
 /// A file entry displayed as a tile on Page 1.
@@ -61,9 +81,17 @@ enum Thumb {
 /// Messages emitted by the application and its widgets.
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Close the detail view, returning to the grid.
+    DetailClosed,
+    /// A hi-res decode for the detail view finished.
+    DetailReady(String, Result<Handle, ()>),
     FilesLoaded(Vec<String>),
     LaunchUrl(String),
     ThumbReady(String, Result<Handle, ()>),
+    /// A thumbnail was double-clicked, opening it in the detail view.
+    ThumbnailActivated(String),
+    /// Animation tick driving the hi-res crossfade.
+    DetailFadeTick,
     ToggleContextPage(ContextPage),
     UpdateConfig(Config),
 }
@@ -143,6 +171,11 @@ impl cosmic::Application for AppModel {
                 })
                 .unwrap_or_default(),
             tiles: Vec::new(),
+            selected: None,
+            detail_hi_res: None,
+            detail_inflight: None,
+            detail_hi_res_opacity: 0.0,
+            detail_last_frame: None,
         };
 
         // Set the window title and scan the pictures directory in parallel.
@@ -215,10 +248,17 @@ impl cosmic::Application for AppModel {
                     widget::scrollable(grid).height(Length::Fill).into()
                 };
 
-                widget::column::with_capacity(2)
-                    .push(header)
-                    .push(tiles)
-                    .spacing(space_s)
+                // The detail view takes over the page in place of the grid;
+                // Escape returns to it.
+                let mut page = widget::column::with_capacity(2).push(header);
+
+                if let Some(detail) = detail_view(self) {
+                    page = page.push(detail);
+                } else {
+                    page = page.push(tiles);
+                }
+
+                page.spacing(space_s)
                     .height(Length::Fill)
                     .into()
             }
@@ -270,7 +310,16 @@ impl cosmic::Application for AppModel {
     /// indefinitely.
     fn subscription(&self) -> Subscription<Self::Message> {
         // Add subscriptions which are always active.
-        let subscriptions = vec![
+        let mut subscriptions = vec![
+            // Close the detail view when Escape is pressed outside any widget
+            // that captures the key first.
+            keyboard::listen().filter_map(|event| match event {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                } => Some(Message::DetailClosed),
+                _ => None,
+            }),
             // Watch for application configuration changes.
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
@@ -283,6 +332,17 @@ impl cosmic::Application for AppModel {
                 }),
         ];
 
+        // Drive the hi-res crossfade while opacity is ramping.
+        if self.selected.is_some()
+            && self.detail_hi_res.is_some()
+            && self.detail_hi_res_opacity < 1.0
+        {
+            subscriptions.push(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Message::DetailFadeTick),
+            );
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -292,6 +352,59 @@ impl cosmic::Application for AppModel {
     /// on the application's async runtime.
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
+            Message::DetailClosed => {
+                // Dropping the selection drops the hi-res buffer with it.
+                self.selected = None;
+                self.detail_hi_res = None;
+                self.detail_hi_res_opacity = 0.0;
+                self.detail_last_frame = None;
+                Task::none()
+            }
+
+            Message::DetailReady(name, result) => {
+                if detail_result_is_current(
+                    self.selected.as_deref(),
+                    self.detail_inflight.as_deref(),
+                    &name,
+                ) {
+                    self.detail_hi_res = result.ok();
+                    self.detail_hi_res_opacity = 0.0;
+                    self.detail_last_frame = None;
+                    self.detail_inflight = None;
+                } else {
+                    // A superseded decode finished and freed the single slot;
+                    // start the current selection's queued request, if any.
+                    self.detail_inflight = None;
+
+                    return self.decode_detail_next();
+                }
+
+                Task::none()
+            }
+
+            Message::ThumbnailActivated(name) => {
+                if self.selected.as_deref() != Some(name.as_str()) {
+                    self.selected = Some(name);
+                    // The superseded hi-res buffer is dropped here; its
+                    // in-flight result is discarded by the stale guard.
+                    self.detail_hi_res = None;
+                    self.detail_hi_res_opacity = 0.0;
+                    self.detail_last_frame = None;
+                }
+
+                self.decode_detail_next()
+            }
+
+            Message::DetailFadeTick => {
+                let dt = self
+                    .detail_last_frame
+                    .map_or(0.0, |t| t.elapsed().as_secs_f32().min(0.1));
+                self.detail_last_frame = Some(Instant::now());
+                self.detail_hi_res_opacity =
+                    (self.detail_hi_res_opacity + dt * FADE_SPEED).min(1.0);
+                Task::none()
+            }
+
             Message::FilesLoaded(files) => {
                 self.tiles = files
                     .into_iter()
@@ -384,6 +497,25 @@ impl AppModel {
             None => Task::none(),
         }
     }
+
+    /// Spawns the hi-res decode behind the detail view when one is due.
+    ///
+    /// Only one detail decode is ever in flight: a newer selection simply
+    /// waits for the older request to land, and [`Message::DetailReady`]
+    /// frees the slot before pumping again.
+    fn decode_detail_next(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.detail_inflight.is_some()
+            || self.selected.is_none()
+            || self.detail_hi_res.is_some()
+        {
+            return Task::none();
+        }
+
+        let name = self.selected.clone().expect("selected when a decode is due");
+        self.detail_inflight = Some(name.clone());
+
+        cosmic::task::future(decode_detail(name))
+    }
 }
 
 /// Scans `~/Pictures/exposure` for regular files and returns their sorted names.
@@ -416,11 +548,14 @@ fn tile_view(tile: &Tile) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
     let preview: Element<'_, Message> = match &tile.thumb {
-        Thumb::Ready(handle) => widget::image(handle.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(ContentFit::Contain)
-            .into(),
+        Thumb::Ready(handle) => MouseArea::new(
+            widget::image(handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(ContentFit::Contain),
+        )
+        .on_double_click(Message::ThumbnailActivated(tile.name.clone()))
+        .into(),
         Thumb::Loading => icon::from_name("image-loading-symbolic").icon().into(),
         Thumb::Failed => icon::from_name("image-missing-symbolic").icon().into(),
     };
@@ -439,27 +574,107 @@ fn tile_view(tile: &Tile) -> Element<'_, Message> {
         .into()
 }
 
+/// Renders the detail view for the selected file, if any, in place of the grid.
+///
+/// The cached thumbnail is layered underneath the hi-res decode: both are
+/// fitted to the same rect, so the sharper image simply covers the blurrier
+/// one when it lands — and until that first paint completes, the thumbnail
+/// keeps the view from flashing empty while the large texture is uploaded.
+/// Pending and failed thumbnails fall back to status icons.
+fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
+    let space_s = cosmic::theme::spacing().space_s;
+    let name = app.selected.as_ref()?;
+    let tile = app.tiles.iter().find(|tile| &tile.name == name)?;
+
+    // Bottom to top: thumbnail first so the hi-res decode covers it exactly.
+    // The hi-res layer fades in over FADE_SPEED seconds to avoid a jarring
+    // perceptual shift (irradiation illusion: blurry edges appear wider than
+    // sharp ones, so hard-covering reads as a squeeze from all sides).
+    let mut layers: Vec<Element<'_, Message>> = Vec::with_capacity(2);
+    if let Thumb::Ready(thumb) = &tile.thumb {
+        layers.push(
+            widget::image(thumb.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(ContentFit::Contain)
+                .into(),
+        );
+    }
+    if let Some(hi_res) = &app.detail_hi_res {
+        layers.push(
+            widget::image(hi_res.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(ContentFit::Contain)
+                .opacity(app.detail_hi_res_opacity)
+                .into(),
+        );
+    }
+
+    let preview: Element<'_, Message> = if layers.is_empty() {
+        // Nothing decoded yet; pending and failed files show a status icon.
+        let icon_name = match &tile.thumb {
+            Thumb::Loading => "image-loading-symbolic",
+            Thumb::Failed | Thumb::Ready(_) => "image-missing-symbolic",
+        };
+        icon::from_name(icon_name).icon().into()
+    } else {
+        Stack::with_children(layers).into()
+    };
+
+    Some(
+        widget::column::with_capacity(2)
+            .push(
+                widget::container(preview)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(Horizontal::Center)
+                    .align_y(Vertical::Center),
+            )
+            .push(widget::text(name))
+            .spacing(space_s)
+            .align_x(Horizontal::Center)
+            .into(),
+    )
+}
+
 /// Decodes a RAW file from the pictures directory into a thumbnail message.
 async fn decode_thumbnail(name: String) -> Message {
+    let result = decode_raw(name.clone(), |image| convert_thumbnail(image, THUMB_SIZE)).await;
+
+    Message::ThumbReady(name, result)
+}
+
+/// Decodes a RAW file from the pictures directory into a hi-res message for
+/// the detail view.
+async fn decode_detail(name: String) -> Message {
+    let result = decode_raw(name.clone(), |image| convert_thumbnail(image, HI_RES_SIZE)).await;
+
+    Message::DetailReady(name, result)
+}
+
+/// Runs a RAW decode plus conversion on a blocking worker thread so the UI
+/// never stalls on CPU-heavy work.
+async fn decode_raw<F>(name: String, convert: F) -> Result<Handle, ()>
+where
+    F: Fn(&rawloader::RawImage) -> Result<Handle, ()> + Send + 'static,
+{
     let Ok(home) = std::env::var("HOME") else {
-        return Message::ThumbReady(name, Err(()));
+        return Err(());
     };
 
     let path = Path::new(&home)
         .join("Pictures")
         .join("exposure")
-        .join(&name);
+        .join(name);
 
-    // RAW decoding is CPU-heavy, so run it on a blocking worker thread.
-    let result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         rawloader::decode_file(&path)
             .map_err(|_| ())
-            .and_then(|image| convert_thumbnail(&image))
+            .and_then(|image| convert(&image))
     })
     .await
-    .unwrap_or(Err(()));
-
-    Message::ThumbReady(name, result)
+    .unwrap_or(Err(()))
 }
 
 /// Normalizes raw sensor samples into linear 0..=1 intensity.
@@ -588,9 +803,10 @@ fn luma(rgb: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Converts a decoded RAW image into a small oriented RGBA thumbnail.
+/// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
+/// dimension exceeds `max_size`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
+fn convert_thumbnail(image: &rawloader::RawImage, max_size: f32) -> Result<Handle, ()> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
 
@@ -640,7 +856,7 @@ fn convert_thumbnail(image: &rawloader::RawImage) -> Result<Handle, ()> {
     // Downscale in linear light: averaging blocks of pixels suppresses sensor
     // noise and film-grain aliasing far better than sampling after encoding.
     let (mut mono, width, height) =
-        resize_area(&mono, width as u32, height as u32, THUMB_SIZE as u32, 1);
+        resize_area(&mono, width as u32, height as u32, max_size as u32, 1);
 
     // Restore edge punch lost to the heavy downscale, before tone encoding so
     // overshoot stays out of the perceptually amplified display range.
@@ -806,6 +1022,15 @@ fn orient(
     (oriented, out_width, out_height)
 }
 
+/// Whether a finished hi-res decode belongs to the current selection and is
+/// the one this model dispatched.
+///
+/// Guards [`Message::DetailReady`] against results from selections that were
+/// replaced or closed while their decode was still running.
+fn detail_result_is_current(selected: Option<&str>, inflight: Option<&str>, finished: &str) -> bool {
+    selected == Some(finished) && inflight == Some(finished)
+}
+
 /// The page to display in the application.
 pub enum Page {
     Page1,
@@ -838,6 +1063,27 @@ impl menu::action::MenuAction for MenuAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_result_applies_to_its_own_selection() {
+        assert!(detail_result_is_current(Some("a"), Some("a"), "a"));
+    }
+
+    #[test]
+    fn detail_result_rejected_for_replaced_selection() {
+        // "a" finished, but the user already moved on to "b".
+        assert!(!detail_result_is_current(Some("b"), Some("a"), "a"));
+    }
+
+    #[test]
+    fn detail_result_rejected_after_close() {
+        assert!(!detail_result_is_current(None, Some("a"), "a"));
+    }
+
+    #[test]
+    fn detail_result_rejected_without_inflight_request() {
+        assert!(!detail_result_is_current(Some("a"), None, "a"));
+    }
 
     #[test]
     fn srgb_encode_matches_reference_values() {
