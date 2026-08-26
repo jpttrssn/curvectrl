@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
+use crate::exposure_shader;
 use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
 use cosmic::app::context_drawer;
@@ -29,6 +30,8 @@ const HI_RES_SIZE: f32 = 2048.0;
 const FADE_SPEED: f32 = 5.0;
 /// Aspect ratio (width / height) of the image area of a Page 1 tile.
 const TILE_ASPECT: f32 = 1.0;
+/// Width of the inline editing panel in pixels.
+const PANEL_WIDTH: f32 = 240.0;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -49,15 +52,23 @@ pub struct AppModel {
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
     selected: Option<String>,
-    /// Hi-resolution image for the selected file; `None` falls back to its
-    /// thumbnail until the decode lands.
-    detail_hi_res: Option<Handle>,
+    /// GPU shader program for the detail view, rendering mono data with
+    /// live exposure adjustment.  `None` while the decode is in flight.
+    detail_shader: Option<exposure_shader::ExposureProgram>,
     /// File handed to the one permitted in-flight hi-res detail decode.
     detail_inflight: Option<String>,
-    /// Current opacity of the hi-res detail layer during crossfade (0.0→1.0).
-    detail_hi_res_opacity: f32,
+    /// Current opacity of the thumbnail layer during crossfade (1.0→0.0).
+    detail_thumb_opacity: f32,
     /// Timestamp of the last animation frame for framerate-independent fading.
     detail_last_frame: Option<Instant>,
+    /// Cached thumbnail kept visible over the shader during crossfade.
+    detail_thumb: Option<Handle>,
+    /// Exposure compensation in EV (−3.00 to +3.00).
+    exposure_ev: f32,
+    /// Monotonic counter incremented each time a new detail decode finishes;
+    /// stamped into [`ExposureProgram::image_id`] so the GPU pipeline
+    /// recognises a new image and rebuilds its texture.
+    next_image_id: u64,
 }
 
 /// A file entry displayed as a tile on Page 1.
@@ -83,8 +94,9 @@ enum Thumb {
 pub enum Message {
     /// Close the detail view, returning to the grid.
     DetailClosed,
-    /// A hi-res decode for the detail view finished.
-    DetailReady(String, Result<Handle, ()>),
+    /// A hi-res decode for the detail view finished, returning the linear
+    /// pre-sRGB mono buffer for the GPU shader.
+    DetailReady(String, Result<(Vec<f32>, u32, u32), ()>),
     FilesLoaded(Vec<String>),
     LaunchUrl(String),
     ThumbReady(String, Result<Handle, ()>),
@@ -92,6 +104,8 @@ pub enum Message {
     ThumbnailActivated(String),
     /// Animation tick driving the hi-res crossfade.
     DetailFadeTick,
+    /// The user moved the exposure slider.
+    ExposureChanged(f32),
     ToggleContextPage(ContextPage),
     UpdateConfig(Config),
 }
@@ -172,10 +186,13 @@ impl cosmic::Application for AppModel {
                 .unwrap_or_default(),
             tiles: Vec::new(),
             selected: None,
-            detail_hi_res: None,
+            detail_shader: None,
             detail_inflight: None,
-            detail_hi_res_opacity: 0.0,
+            detail_thumb_opacity: 1.0,
             detail_last_frame: None,
+            detail_thumb: None,
+            exposure_ev: 0.0,
+            next_image_id: 0,
         };
 
         // Set the window title and scan the pictures directory in parallel.
@@ -249,18 +266,29 @@ impl cosmic::Application for AppModel {
                 };
 
                 // The detail view takes over the page in place of the grid;
-                // Escape returns to it.
+                // Escape returns to it. An inline editing panel appears to the
+                // right when a selection is active.
                 let mut page = widget::column::with_capacity(2).push(header);
 
                 if let Some(detail) = detail_view(self) {
-                    page = page.push(detail);
+                    if self.selected.is_some() {
+                        let content_row = widget::row::with_capacity(2)
+                            .push(
+                                widget::container(detail)
+                                    .width(Length::Fill)
+                                    .height(Length::Fill),
+                            )
+                            .push(editing_panel(self))
+                            .spacing(space_s);
+                        page = page.push(content_row);
+                    } else {
+                        page = page.push(detail);
+                    }
                 } else {
                     page = page.push(tiles);
                 }
 
-                page.spacing(space_s)
-                    .height(Length::Fill)
-                    .into()
+                page.spacing(space_s).height(Length::Fill).into()
             }
 
             Page::Page2 => {
@@ -332,10 +360,11 @@ impl cosmic::Application for AppModel {
                 }),
         ];
 
-        // Drive the hi-res crossfade while opacity is ramping.
+        // Drive the thumbnail crossfade while opacity is ramping down.
         if self.selected.is_some()
-            && self.detail_hi_res.is_some()
-            && self.detail_hi_res_opacity < 1.0
+            && self.detail_shader.is_some()
+            && self.detail_thumb.is_some()
+            && self.detail_thumb_opacity > 0.0
         {
             subscriptions.push(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
@@ -353,43 +382,17 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::DetailClosed => {
-                // Dropping the selection drops the hi-res buffer with it.
                 self.selected = None;
-                self.detail_hi_res = None;
-                self.detail_hi_res_opacity = 0.0;
-                self.detail_last_frame = None;
+                self.clear_detail();
                 Task::none()
             }
 
-            Message::DetailReady(name, result) => {
-                if detail_result_is_current(
-                    self.selected.as_deref(),
-                    self.detail_inflight.as_deref(),
-                    &name,
-                ) {
-                    self.detail_hi_res = result.ok();
-                    self.detail_hi_res_opacity = 0.0;
-                    self.detail_last_frame = None;
-                    self.detail_inflight = None;
-                } else {
-                    // A superseded decode finished and freed the single slot;
-                    // start the current selection's queued request, if any.
-                    self.detail_inflight = None;
-
-                    return self.decode_detail_next();
-                }
-
-                Task::none()
-            }
+            Message::DetailReady(name, result) => self.handle_detail_ready(&name, result),
 
             Message::ThumbnailActivated(name) => {
                 if self.selected.as_deref() != Some(name.as_str()) {
                     self.selected = Some(name);
-                    // The superseded hi-res buffer is dropped here; its
-                    // in-flight result is discarded by the stale guard.
-                    self.detail_hi_res = None;
-                    self.detail_hi_res_opacity = 0.0;
-                    self.detail_last_frame = None;
+                    self.clear_detail();
                 }
 
                 self.decode_detail_next()
@@ -400,8 +403,19 @@ impl cosmic::Application for AppModel {
                     .detail_last_frame
                     .map_or(0.0, |t| t.elapsed().as_secs_f32().min(0.1));
                 self.detail_last_frame = Some(Instant::now());
-                self.detail_hi_res_opacity =
-                    (self.detail_hi_res_opacity + dt * FADE_SPEED).min(1.0);
+                self.detail_thumb_opacity = (self.detail_thumb_opacity - dt * FADE_SPEED).max(0.0);
+                // Crossfade complete — drop the thumbnail cache.
+                if self.detail_thumb_opacity <= 0.0 {
+                    self.detail_thumb = None;
+                }
+                Task::none()
+            }
+
+            Message::ExposureChanged(ev) => {
+                self.exposure_ev = ev;
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_exposure(ev);
+                }
                 Task::none()
             }
 
@@ -504,17 +518,77 @@ impl AppModel {
     /// waits for the older request to land, and [`Message::DetailReady`]
     /// frees the slot before pumping again.
     fn decode_detail_next(&mut self) -> Task<cosmic::Action<Message>> {
-        if self.detail_inflight.is_some()
-            || self.selected.is_none()
-            || self.detail_hi_res.is_some()
+        if self.detail_inflight.is_some() || self.selected.is_none() || self.detail_shader.is_some()
         {
             return Task::none();
         }
 
-        let name = self.selected.clone().expect("selected when a decode is due");
+        let name = self
+            .selected
+            .clone()
+            .expect("selected when a decode is due");
         self.detail_inflight = Some(name.clone());
 
         cosmic::task::future(decode_detail(name))
+    }
+
+    /// Reset all detail-view buffers and crossfade state.
+    fn clear_detail(&mut self) {
+        self.detail_shader = None;
+        self.detail_thumb_opacity = 1.0;
+        self.detail_last_frame = None;
+        self.detail_thumb = None;
+        self.exposure_ev = 0.0;
+    }
+
+    /// Handle the completion of a hi-res detail decode, applying the result
+    /// only if it matches the current selection and re-pumping if superseded.
+    fn handle_detail_ready(
+        &mut self,
+        name: &str,
+        result: Result<(Vec<f32>, u32, u32), ()>,
+    ) -> Task<cosmic::Action<Message>> {
+        if detail_result_is_current(
+            self.selected.as_deref(),
+            self.detail_inflight.as_deref(),
+            name,
+        ) {
+            if let Ok((mono, width, height)) = result {
+                // Cache the current thumbnail so it stays visible
+                // over the shader during the crossfade.
+                if let Some(tile) =
+                    self.tiles
+                        .iter()
+                        .find(|t| t.name == name)
+                        .and_then(|t| match &t.thumb {
+                            Thumb::Ready(h) => Some(h.clone()),
+                            _ => None,
+                        })
+                {
+                    self.detail_thumb = Some(tile);
+                }
+                let image_id = self.next_image_id;
+                self.next_image_id = self.next_image_id.wrapping_add(1);
+                self.detail_shader = Some(exposure_shader::ExposureProgram::new(
+                    mono,
+                    width,
+                    height,
+                    self.exposure_ev,
+                    image_id,
+                ));
+            }
+            self.detail_thumb_opacity = 1.0;
+            self.detail_last_frame = None;
+            self.detail_inflight = None;
+        } else {
+            // A superseded decode finished and freed the single slot;
+            // start the current selection's queued request, if any.
+            self.detail_inflight = None;
+
+            return self.decode_detail_next();
+        }
+
+        Task::none()
     }
 }
 
@@ -541,6 +615,41 @@ async fn load_files() -> Vec<String> {
 
     files.sort();
     files
+}
+
+/// Renders the inline editing panel for the detail view.
+///
+/// Shown whenever a selection is active; the body is empty while the GPU
+/// shader is still loading, since `detail_view` already shows the cached
+/// thumbnail during that brief decode gap.
+fn editing_panel(app: &AppModel) -> Element<'_, Message> {
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let title = widget::text::heading(fl!("editing-title"));
+
+    if app.detail_shader.is_none() {
+        return widget::column::with_capacity(1)
+            .push(title)
+            .spacing(space_s)
+            .width(PANEL_WIDTH)
+            .padding(space_s)
+            .into();
+    }
+
+    let label = widget::text(fl!("exposure-label"));
+    let value_text = widget::text(format!("{:+.2} EV", app.exposure_ev));
+    let slider =
+        widget::slider(-3.0..=3.0, app.exposure_ev, Message::ExposureChanged).step(0.01_f32);
+
+    widget::column::with_capacity(4)
+        .push(title)
+        .push(label)
+        .push(slider)
+        .push(value_text)
+        .spacing(space_s)
+        .width(PANEL_WIDTH)
+        .padding(space_s)
+        .into()
 }
 
 /// Renders a single Page 1 tile, filling the square cell the grid assigns it.
@@ -576,50 +685,56 @@ fn tile_view(tile: &Tile) -> Element<'_, Message> {
 
 /// Renders the detail view for the selected file, if any, in place of the grid.
 ///
-/// The cached thumbnail is layered underneath the hi-res decode: both are
-/// fitted to the same rect, so the sharper image simply covers the blurrier
-/// one when it lands — and until that first paint completes, the thumbnail
-/// keeps the view from flashing empty while the large texture is uploaded.
-/// Pending and failed thumbnails fall back to status icons.
+/// Shows the cached thumbnail while the GPU shader is loading, then
+/// crossfades: the thumbnail sits on top of the shader in a Stack and
+/// fades out via `.opacity()`. The shader widget is wrapped in an
+/// `Grid` container so its bounds preserve the source image's
+/// aspect ratio during window resize — without it the texture would
+/// stretch to whatever rectangle the layout hands in.
 fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     let space_s = cosmic::theme::spacing().space_s;
     let name = app.selected.as_ref()?;
     let tile = app.tiles.iter().find(|tile| &tile.name == name)?;
 
-    // Bottom to top: thumbnail first so the hi-res decode covers it exactly.
-    // The hi-res layer fades in over FADE_SPEED seconds to avoid a jarring
-    // perceptual shift (irradiation illusion: blurry edges appear wider than
-    // sharp ones, so hard-covering reads as a squeeze from all sides).
-    let mut layers: Vec<Element<'_, Message>> = Vec::with_capacity(2);
-    if let Thumb::Ready(thumb) = &tile.thumb {
-        layers.push(
-            widget::image(thumb.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(ContentFit::Contain)
-                .into(),
-        );
-    }
-    if let Some(hi_res) = &app.detail_hi_res {
-        layers.push(
-            widget::image(hi_res.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(ContentFit::Contain)
-                .opacity(app.detail_hi_res_opacity)
-                .into(),
-        );
-    }
+    let shader_widget = |shader: &exposure_shader::ExposureProgram| {
+        Grid::with_capacity(1)
+            .height(grid::Sizing::AspectRatio(shader.aspect()))
+            .columns(1)
+            .spacing(space_s)
+            .push(shader.view())
+    };
 
-    let preview: Element<'_, Message> = if layers.is_empty() {
-        // Nothing decoded yet; pending and failed files show a status icon.
-        let icon_name = match &tile.thumb {
-            Thumb::Loading => "image-loading-symbolic",
-            Thumb::Failed | Thumb::Ready(_) => "image-missing-symbolic",
-        };
-        icon::from_name(icon_name).icon().into()
-    } else {
-        Stack::with_children(layers).into()
+    let preview: Element<'_, Message> = match (
+        app.detail_shader.as_ref(),
+        app.detail_thumb.as_ref(),
+        app.detail_thumb_opacity > 0.0,
+    ) {
+        (Some(shader), Some(thumb), true) => {
+            // Crossfade in progress — thumbnail fading out over shader.
+            Stack::with_children([
+                shader_widget(shader).into(),
+                widget::image(thumb.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(ContentFit::Contain)
+                    .opacity(app.detail_thumb_opacity)
+                    .into(),
+            ])
+            .into()
+        }
+        (Some(shader), _, _) => shader_widget(shader).into(),
+        (None, _, _) => {
+            // Shader not ready — show the cached thumbnail or a status icon.
+            match &tile.thumb {
+                Thumb::Ready(handle) => widget::image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(ContentFit::Contain)
+                    .into(),
+                Thumb::Loading => icon::from_name("image-loading-symbolic").icon().into(),
+                Thumb::Failed => icon::from_name("image-missing-symbolic").icon().into(),
+            }
+        }
     };
 
     Some(
@@ -646,11 +761,80 @@ async fn decode_thumbnail(name: String) -> Message {
 }
 
 /// Decodes a RAW file from the pictures directory into a hi-res message for
-/// the detail view.
+/// the detail view, returning the oriented linear mono data that the GPU
+/// shader uploads and applies exposure to.
 async fn decode_detail(name: String) -> Message {
-    let result = decode_raw(name.clone(), |image| convert_thumbnail(image, HI_RES_SIZE)).await;
-
+    let result = decode_raw_detail(name.clone()).await;
     Message::DetailReady(name, result)
+}
+
+/// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
+/// returning linear `mono` (post-downscale, post-unsharp) oriented to display
+/// upright.  The GPU shader applies exposure and sRGB encoding per frame.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+async fn decode_raw_detail(name: String) -> Result<(Vec<f32>, u32, u32), ()> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Err(());
+    };
+
+    let path = Path::new(&home)
+        .join("Pictures")
+        .join("exposure")
+        .join(name);
+
+    tokio::task::spawn_blocking(move || {
+        let image = rawloader::decode_file(&path).map_err(|_| ())?;
+
+        let width = usize::max(image.width, 1);
+        let height = usize::max(image.height, 1);
+
+        let normalized = normalize_samples(&image);
+
+        let (samples, width, height) = match crop_samples(&normalized, width, height, image.crops) {
+            Some(cropped) => cropped,
+            None => (normalized, width, height),
+        };
+
+        let (mut mono, width, height) = if image.cpp >= 3 {
+            if samples.len() < width * height * 3 {
+                return Err(());
+            }
+
+            let mut rgb = Vec::with_capacity(width * height * 3);
+            for pixel in 0..width * height {
+                let base = pixel * image.cpp;
+                rgb.push(samples[base]);
+                rgb.push(samples[base + 1]);
+                rgb.push(samples[base + 2]);
+            }
+
+            (luma(&rgb), width, height)
+        } else {
+            if samples.len() < width * height {
+                return Err(());
+            }
+
+            let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
+            (flatten_bayer(&samples, width, height, &cfa), width, height)
+        };
+
+        let base = measure_base(&mono)
+            .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
+            .unwrap_or(ACTIVE_STOCK.base);
+        invert_gray(&mut mono, &ACTIVE_STOCK, base);
+
+        let (mono, width, height) =
+            resize_area(&mono, width as u32, height as u32, HI_RES_SIZE as u32, 1);
+
+        let mut mono = mono;
+        unsharp_mask(&mut mono, width as usize, height as usize);
+
+        let (oriented, width, height) = orient_mono(&mono, width, height, image.orientation);
+
+        Ok((oriented, width, height))
+    })
+    .await
+    .unwrap_or(Err(()))
 }
 
 /// Runs a RAW decode plus conversion on a blocking worker thread so the UI
@@ -981,6 +1165,52 @@ fn blur_121(samples: &[f32], width: usize, height: usize) -> Vec<f32> {
     blurred
 }
 
+/// Applies the RAW orientation metadata to a linear mono buffer.
+///
+/// Mirror of [`orient`] for `Vec<f32>` data going to the GPU shader: same
+/// transformations, per-element instead of per-RGBA-bunch. Equivalent in
+/// behaviour to orientation-after-quantization when the per-element source
+/// `(sx, sy)` mapping is identical.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn orient_mono(
+    mono: &[f32],
+    width: u32,
+    height: u32,
+    orientation: rawloader::Orientation,
+) -> (Vec<f32>, u32, u32) {
+    use rawloader::Orientation;
+
+    let (out_width, out_height) = match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Transpose
+        | Orientation::Transverse => (height, width),
+        _ => (width, height),
+    };
+
+    let mut oriented = vec![0.0_f32; (out_width * out_height) as usize];
+    for y in 0..out_height {
+        for x in 0..out_width {
+            let (sx, sy) = match orientation {
+                Orientation::Normal | Orientation::Unknown => (x, y),
+                Orientation::HorizontalFlip => (width - 1 - x, y),
+                Orientation::Rotate180 => (width - 1 - x, height - 1 - y),
+                Orientation::VerticalFlip => (x, height - 1 - y),
+                Orientation::Transpose => (y, x),
+                Orientation::Transverse => (height - 1 - y, width - 1 - x),
+                Orientation::Rotate90 => (y, height - 1 - x),
+                Orientation::Rotate270 => (width - 1 - y, x),
+            };
+
+            let source = (sy * width + sx) as usize;
+            let target = (y * out_width + x) as usize;
+            oriented[target] = mono[source];
+        }
+    }
+
+    (oriented, out_width, out_height)
+}
+
 /// Applies the RAW orientation metadata to an RGBA buffer.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn orient(
@@ -1027,7 +1257,11 @@ fn orient(
 ///
 /// Guards [`Message::DetailReady`] against results from selections that were
 /// replaced or closed while their decode was still running.
-fn detail_result_is_current(selected: Option<&str>, inflight: Option<&str>, finished: &str) -> bool {
+fn detail_result_is_current(
+    selected: Option<&str>,
+    inflight: Option<&str>,
+    finished: &str,
+) -> bool {
     selected == Some(finished) && inflight == Some(finished)
 }
 
@@ -1182,6 +1416,30 @@ mod tests {
     }
 
     #[test]
+    fn exposure_math_ev_zero_is_identity() {
+        // EV=0 → 2^0 = 1.0, so exposed = mono × 1.0 = mono.
+        let mono = 0.5_f32;
+        let exposed = mono * 2.0_f32.powf(0.0);
+        assert!((exposed - 0.5).abs() < 1e-6);
+
+        // sRGB(0.5) ≈ 188/255.
+        let expected_level = (srgb_encode(0.5) * 255.0).round() as u8;
+        assert_eq!(expected_level, 188);
+
+        // EV +1 → 0.5 × 2 = 1.0 → sRGB(1.0) = 255.
+        let bright = mono * 2.0_f32.powf(1.0);
+        let bright_level = (srgb_encode(bright) * 255.0).round() as u8;
+        assert_eq!(bright_level, 255);
+
+        // EV −1 → 0.5 × 0.5 = 0.25 → sRGB(0.25) ≈ 137.
+        let dark = mono * 2.0_f32.powf(-1.0);
+        let dark_level = (srgb_encode(dark) * 255.0).round() as u8;
+        assert_eq!(dark_level, 137);
+
+        assert!(bright_level > dark_level);
+    }
+
+    #[test]
     fn crop_extracts_inner_region() {
         let samples: Vec<f32> = (0_u16..12).map(f32::from).collect();
 
@@ -1200,17 +1458,22 @@ mod tests {
     #[test]
     fn resize_area_averages_source_blocks() {
         // Gray ramp 1.0..16.0 over a 4x4 buffer.
-        let rgb: Vec<f32> = (1_u16..=16).flat_map(|value| [f32::from(value); 3]).collect();
+        let rgb: Vec<f32> = (1_u16..=16)
+            .flat_map(|value| [f32::from(value); 3])
+            .collect();
 
         let (out, width, height) = resize_area(&rgb, 4, 4, 2, 3);
 
         assert_eq!((width, height), (2, 2));
-        assert_eq!(out, vec![
-            3.5, 3.5, 3.5, // mean of {1, 2, 5, 6}
-            5.5, 5.5, 5.5, // mean of {3, 4, 7, 8}
-            11.5, 11.5, 11.5, // mean of {9, 10, 13, 14}
-            13.5, 13.5, 13.5, // mean of {11, 12, 15, 16}
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                3.5, 3.5, 3.5, // mean of {1, 2, 5, 6}
+                5.5, 5.5, 5.5, // mean of {3, 4, 7, 8}
+                11.5, 11.5, 11.5, // mean of {9, 10, 13, 14}
+                13.5, 13.5, 13.5, // mean of {11, 12, 15, 16}
+            ]
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod exposure_shader;
 mod film;
 mod i18n;
 

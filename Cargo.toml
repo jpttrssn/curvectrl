@@ -7,6 +7,7 @@ description = "A film negative scanning and RAW image editor"
 repository = "https://github.com/jpttrssn/exposure"
 
 [dependencies]
+bytemuck = { version = "1", features = ["derive"] }
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
     "desktop-requester",
