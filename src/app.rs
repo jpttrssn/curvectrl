@@ -245,12 +245,6 @@ impl cosmic::Application for AppModel {
         let space_s = cosmic::theme::spacing().space_s;
         let content: Element<_> = match self.nav.active_data::<Page>().unwrap() {
             Page::Page1 => {
-                let header = widget::row::with_capacity(2)
-                    .push(widget::text::title1(fl!("welcome")))
-                    .push(widget::text::title3(fl!("page-id", num = 1)))
-                    .align_y(Alignment::End)
-                    .spacing(space_s);
-
                 let tiles: Element<'_, Message> = if self.tiles.is_empty() {
                     widget::container(widget::text(fl!("no-files")))
                         .width(Length::Fill)
@@ -268,7 +262,7 @@ impl cosmic::Application for AppModel {
                 // The detail view takes over the page in place of the grid;
                 // Escape returns to it. An inline editing panel appears to the
                 // right when a selection is active.
-                let mut page = widget::column::with_capacity(2).push(header);
+                let mut page = widget::column::with_capacity(1);
 
                 if let Some(detail) = detail_view(self) {
                     if self.selected.is_some() {
@@ -725,12 +719,8 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                     .height(Length::Fill)
                     .content_fit(ContentFit::Contain)
                     .into(),
-                Thumb::Loading => icon::from_name("image-loading-symbolic")
-                    .icon()
-                    .into(),
-                Thumb::Failed => icon::from_name("image-missing-symbolic")
-                    .icon()
-                    .into(),
+                Thumb::Loading => icon::from_name("image-loading-symbolic").icon().into(),
+                Thumb::Failed => icon::from_name("image-missing-symbolic").icon().into(),
             }
         }
     };
