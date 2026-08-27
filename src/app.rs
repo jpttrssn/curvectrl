@@ -687,22 +687,11 @@ fn tile_view(tile: &Tile) -> Element<'_, Message> {
 ///
 /// Shows the cached thumbnail while the GPU shader is loading, then
 /// crossfades: the thumbnail sits on top of the shader in a Stack and
-/// fades out via `.opacity()`. The shader widget is wrapped in an
-/// `Grid` container so its bounds preserve the source image's
-/// aspect ratio during window resize — without it the texture would
-/// stretch to whatever rectangle the layout hands in.
+/// fades out via `.opacity()`.
 fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     let space_s = cosmic::theme::spacing().space_s;
     let name = app.selected.as_ref()?;
     let tile = app.tiles.iter().find(|tile| &tile.name == name)?;
-
-    let shader_widget = |shader: &exposure_shader::ExposureProgram| {
-        Grid::with_capacity(1)
-            .height(grid::Sizing::AspectRatio(shader.aspect()))
-            .columns(1)
-            .spacing(space_s)
-            .push(shader.view())
-    };
 
     let preview: Element<'_, Message> = match (
         app.detail_shader.as_ref(),
@@ -712,7 +701,7 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
         (Some(shader), Some(thumb), true) => {
             // Crossfade in progress — thumbnail fading out over shader.
             Stack::with_children([
-                shader_widget(shader).into(),
+                shader.view().into(),
                 widget::image(thumb.clone())
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -722,7 +711,12 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
             ])
             .into()
         }
-        (Some(shader), _, _) => shader_widget(shader).into(),
+        (Some(_shader), _, _) => app
+            .detail_shader
+            .as_ref()
+            .map(exposure_shader::ExposureProgram::view)
+            .unwrap()
+            .into(),
         (None, _, _) => {
             // Shader not ready — show the cached thumbnail or a status icon.
             match &tile.thumb {
@@ -731,20 +725,28 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                     .height(Length::Fill)
                     .content_fit(ContentFit::Contain)
                     .into(),
-                Thumb::Loading => icon::from_name("image-loading-symbolic").icon().into(),
-                Thumb::Failed => icon::from_name("image-missing-symbolic").icon().into(),
+                Thumb::Loading => icon::from_name("image-loading-symbolic")
+                    .icon()
+                    .into(),
+                Thumb::Failed => icon::from_name("image-missing-symbolic")
+                    .icon()
+                    .into(),
             }
         }
     };
 
+    // The shader widget is `Length::Fill × Length::Fill`; bounding it inside
+    // a Fill × Fill container caps its widget bounds at the parent column's
+    // allocation. The WGSL's `contained_uv` does `ContentFit::Contain` math so
+    // the image letterbox/pillarbox-fits within those bounds with
+    // transparent bars (alpha=0 + `BlendState::ALPHA_BLENDING`) — no overflow
+    // into the header or any other widget.
     Some(
         widget::column::with_capacity(2)
             .push(
                 widget::container(preview)
                     .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Horizontal::Center)
-                    .align_y(Vertical::Center),
+                    .height(Length::Fill),
             )
             .push(widget::text(name))
             .spacing(space_s)

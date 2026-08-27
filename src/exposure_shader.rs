@@ -42,13 +42,6 @@ impl ExposureProgram {
         self.exposure = ev;
     }
 
-    /// Aspect ratio (width / height) of the texture — used by callers that
-    /// need to constrain layout to match (e.g. `aspect_ratio_container`).
-    #[allow(clippy::cast_precision_loss)]
-    pub fn aspect(&self) -> f32 {
-        self.width as f32 / self.height as f32
-    }
-
     /// Wrap in a `Shader` widget sized to fill the parent.
     pub fn view<M>(&self) -> Shader<M, Self> {
         Shader::new(self.clone())
@@ -216,12 +209,17 @@ impl Primitive for ExposurePrimitive {
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         let sf = viewport.scale_factor() as f32;
         #[allow(clippy::cast_precision_loss)]
+        let tex_w = self.width as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let tex_h = self.height as f32;
         let uniforms = Uniforms {
             // Convert raw EV (slider value) to linear-light gain once per
             // frame; the WGSL shader reads this as a direct multiplier.
             exposure: self.exposure.exp2(),
-            vp_w: viewport.physical_width() as f32,
-            vp_h: viewport.physical_height() as f32,
+            // Texture dimensions feed the WGSL's `contained_uv` math so the
+            // shader mirrors `widget::image.content_fit(ContentFit::Contain)`.
+            tex_w,
+            tex_h,
             sc_x: bounds.x * sf,
             sc_y: bounds.y * sf,
             sc_w: bounds.width * sf,
@@ -432,7 +430,10 @@ fn build_render_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(cosmic::iced::wgpu::ColorTargetState {
                 format: cosmic::iced::wgpu::TextureFormat::Bgra8Unorm,
-                blend: Some(cosmic::iced::wgpu::BlendState::REPLACE),
+                // Alpha-blend so the WGSL's `alpha=0` letterbox bars let the
+                // COSMIC panel background show through. Image pixels have
+                // `alpha=1`, so they composite the same as `REPLACE` would.
+                blend: Some(cosmic::iced::wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: cosmic::iced::wgpu::ColorWrites::ALL,
             })],
             compilation_options: cosmic::iced::wgpu::PipelineCompilationOptions::default(),
@@ -456,8 +457,10 @@ fn build_render_pipeline(
 #[derive(Default, Clone, Copy)]
 struct Uniforms {
     exposure: f32,
-    vp_w: f32,
-    vp_h: f32,
+    /// Texture width in pixels — drives the WGSL contained-sub-rect math.
+    tex_w: f32,
+    /// Texture height in pixels.
+    tex_h: f32,
     sc_x: f32,
     sc_y: f32,
     sc_w: f32,
