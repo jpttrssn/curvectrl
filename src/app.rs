@@ -30,8 +30,6 @@ const HI_RES_SIZE: f32 = 2048.0;
 const FADE_SPEED: f32 = 5.0;
 /// Aspect ratio (width / height) of the image area of a Page 1 tile.
 const TILE_ASPECT: f32 = 1.0;
-/// Width of the inline editing panel in pixels.
-const PANEL_WIDTH: f32 = 240.0;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -134,7 +132,7 @@ impl cosmic::Application for AppModel {
 
     /// Initializes the application with any given flags and startup commands.
     fn init(
-        core: cosmic::Core,
+        mut core: cosmic::Core,
         _flags: Self::Flags,
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
         // Create a nav bar with three page items.
@@ -163,6 +161,10 @@ impl cosmic::Application for AppModel {
             .version(env!("CARGO_PKG_VERSION"))
             .links([(fl!("repository"), REPOSITORY)])
             .license(env!("CARGO_PKG_LICENSE"));
+
+        // The editing panel drawer sits beside the detail view as a side pane
+        // that resizes the content, rather than overlaying it.
+        core.window.context_is_overlay = false;
 
         // Construct the app model with the runtime's core.
         let mut app = AppModel {
@@ -217,6 +219,24 @@ impl cosmic::Application for AppModel {
         vec![menu_bar.into()]
     }
 
+    /// Elements to pack at the end of the header bar.
+    fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
+        // Toggles the editing panel drawer for the active detail view.
+        let active = self.context_page == ContextPage::Editing
+            && self.core.window.show_context
+            && self.selected.is_some();
+
+        vec![widget::button::icon(icon::from_name("edit-symbolic"))
+            .selected(active)
+            .tooltip(fl!("editing-toggle"))
+            .on_press_maybe(
+                self.selected
+                    .is_some()
+                    .then_some(Message::ToggleContextPage(ContextPage::Editing)),
+            )
+            .into()]
+    }
+
     /// Enables the COSMIC application to create a nav bar with this model.
     fn nav_model(&self) -> Option<&nav_bar::Model> {
         Some(&self.nav)
@@ -228,13 +248,25 @@ impl cosmic::Application for AppModel {
             return None;
         }
 
-        Some(match self.context_page {
-            ContextPage::About => context_drawer::about(
+        match self.context_page {
+            ContextPage::About => Some(context_drawer::about(
                 &self.about,
                 |url| Message::LaunchUrl(url.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
-            ),
-        })
+            )),
+            ContextPage::Editing => {
+                // Without a selection there is nothing to edit.
+                self.selected.as_ref()?;
+
+                Some(
+                    context_drawer::context_drawer(
+                        editing_panel(self),
+                        Message::ToggleContextPage(ContextPage::Editing),
+                    )
+                    .title(fl!("editing-title")),
+                )
+            }
+        }
     }
 
     /// Describes the interface based on the current state of the application model.
@@ -260,24 +292,12 @@ impl cosmic::Application for AppModel {
                 };
 
                 // The detail view takes over the page in place of the grid;
-                // Escape returns to it. An inline editing panel appears to the
-                // right when a selection is active.
+                // Escape returns to it. An editing panel can be revealed
+                // in the context drawer via the header toggle.
                 let mut page = widget::column::with_capacity(1);
 
                 if let Some(detail) = detail_view(self) {
-                    if self.selected.is_some() {
-                        let content_row = widget::row::with_capacity(2)
-                            .push(
-                                widget::container(detail)
-                                    .width(Length::Fill)
-                                    .height(Length::Fill),
-                            )
-                            .push(editing_panel(self))
-                            .spacing(space_s);
-                        page = page.push(content_row);
-                    } else {
-                        page = page.push(detail);
-                    }
+                    page = page.push(detail);
                 } else {
                     page = page.push(tiles);
                 }
@@ -378,6 +398,11 @@ impl cosmic::Application for AppModel {
             Message::DetailClosed => {
                 self.selected = None;
                 self.clear_detail();
+                // Without a selection the editing drawer has nothing to
+                // show; close it so it does not linger empty.
+                if self.context_page == ContextPage::Editing && self.core.window.show_context {
+                    self.core_mut().set_show_context(false);
+                }
                 Task::none()
             }
 
@@ -611,11 +636,12 @@ async fn load_files() -> Vec<String> {
     files
 }
 
-/// Renders the inline editing panel for the detail view.
+/// Renders the editing panel for the context drawer.
 ///
 /// Shown whenever a selection is active; the body is empty while the GPU
 /// shader is still loading, since `detail_view` already shows the cached
-/// thumbnail during that brief decode gap.
+/// thumbnail during that brief decode gap. The drawer pane supplies the
+/// width and padding, so the panel fills the available space.
 fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
@@ -625,8 +651,7 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         return widget::column::with_capacity(1)
             .push(title)
             .spacing(space_s)
-            .width(PANEL_WIDTH)
-            .padding(space_s)
+            .width(Length::Fill)
             .into();
     }
 
@@ -641,8 +666,7 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(slider)
         .push(value_text)
         .spacing(space_s)
-        .width(PANEL_WIDTH)
-        .padding(space_s)
+        .width(Length::Fill)
         .into()
 }
 
@@ -1269,6 +1293,8 @@ pub enum Page {
 pub enum ContextPage {
     #[default]
     About,
+    /// The editing panel for the active detail view.
+    Editing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
