@@ -104,6 +104,9 @@ pub enum Message {
     DetailFadeTick,
     /// The user moved the exposure slider.
     ExposureChanged(f32),
+    /// Consume an input event without acting on it, blocking the grid
+    /// beneath the detail view's input surface.
+    Ignore,
     ToggleContextPage(ContextPage),
     UpdateConfig(Config),
 }
@@ -291,18 +294,38 @@ impl cosmic::Application for AppModel {
                     widget::scrollable(grid).height(Length::Fill).into()
                 };
 
-                // The detail view takes over the page in place of the grid;
-                // Escape returns to it. An editing panel can be revealed
-                // in the context drawer via the header toggle.
-                let mut page = widget::column::with_capacity(1);
+                // The grid stays mounted (scroll position persists) under an
+                // opaque, theme-colored detail surface that captures input,
+                // so the detail view cannot leak wheel/clicks to the grid.
+                let mut page = Stack::with_capacity(1);
+                page = page.push(tiles);
 
                 if let Some(detail) = detail_view(self) {
-                    page = page.push(detail);
-                } else {
-                    page = page.push(tiles);
+                    page = page.push(
+                        widget::container(
+                            MouseArea::new(detail)
+                                .on_press(Message::Ignore)
+                                .on_double_press(Message::Ignore)
+                                .on_double_click(Message::Ignore)
+                                .on_release(Message::Ignore)
+                                .on_right_press(Message::Ignore)
+                                .on_right_release(Message::Ignore)
+                                .on_middle_press(Message::Ignore)
+                                .on_middle_release(Message::Ignore)
+                                .on_scroll(|_delta| Message::Ignore),
+                        )
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|theme| cosmic::iced::widget::container::Style {
+                            background: Some(cosmic::iced::Background::Color(
+                                theme.cosmic().background(false).base.into(),
+                            )),
+                            ..Default::default()
+                        }),
+                    );
                 }
 
-                page.spacing(space_s).height(Length::Fill).into()
+                page.width(Length::Fill).height(Length::Fill).into()
             }
 
             Page::Page2 => {
@@ -477,6 +500,8 @@ impl cosmic::Application for AppModel {
                 self.config = config;
                 Task::none()
             }
+
+            Message::Ignore => Task::none(),
 
             Message::LaunchUrl(url) => match open::that_detached(&url) {
                 Ok(()) => Task::none(),
@@ -701,7 +726,8 @@ fn tile_view(tile: &Tile) -> Element<'_, Message> {
         .into()
 }
 
-/// Renders the detail view for the selected file, if any, in place of the grid.
+/// Renders the detail view for the selected file, if any, over the still-mounted
+/// thumbnail grid (which the caller paints an opaque, theme-colored surface on).
 ///
 /// Shows the cached thumbnail while the GPU shader is loading, then
 /// crossfades: the thumbnail sits on top of the shader in a Stack and
