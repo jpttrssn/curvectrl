@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
+use crate::edit_manifest::{self, RollManifest};
 use crate::exposure_shader;
 use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
@@ -13,7 +14,7 @@ use cosmic::iced::{Alignment, ContentFit, Length, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, nav_bar};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -50,6 +51,10 @@ pub struct AppModel {
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
     selected: Option<String>,
+    /// Persisted per-file edits for the film roll, loaded at startup and
+    /// reconciled against the files on disk on each scan. Writes to the
+    /// manifest happen only on explicit flush messages, never per frame.
+    roll: RollManifest,
     /// GPU shader program for the detail view, rendering mono data with
     /// live exposure adjustment.  `None` while the decode is in flight.
     detail_shader: Option<exposure_shader::ExposureProgram>,
@@ -104,6 +109,8 @@ pub enum Message {
     DetailFadeTick,
     /// The user moved the exposure slider.
     ExposureChanged(f32),
+    /// Flush the in-memory roll edits to the manifest file on disk.
+    EditSave,
     /// Consume an input event without acting on it, blocking the grid
     /// beneath the detail view's input surface.
     Ignore,
@@ -191,6 +198,7 @@ impl cosmic::Application for AppModel {
                 .unwrap_or_default(),
             tiles: Vec::new(),
             selected: None,
+            roll: RollManifest::default(),
             detail_shader: None,
             detail_inflight: None,
             detail_thumb_opacity: 1.0,
@@ -419,6 +427,7 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::DetailClosed => {
+                self.persist_roll();
                 self.selected = None;
                 self.clear_detail();
                 // Without a selection the editing drawer has nothing to
@@ -433,8 +442,14 @@ impl cosmic::Application for AppModel {
 
             Message::ThumbnailActivated(name) => {
                 if self.selected.as_deref() != Some(name.as_str()) {
+                    // Persist unsaved tweaks to the outgoing file first.
+                    self.persist_roll();
+                    // Read the stored edit before the decode builds the
+                    // shader, which consumes `self.exposure_ev`.
+                    let stored_ev = self.roll.exposure_ev(name.as_str());
                     self.selected = Some(name);
                     self.clear_detail();
+                    self.exposure_ev = stored_ev;
                 }
 
                 self.decode_detail_next()
@@ -455,6 +470,10 @@ impl cosmic::Application for AppModel {
 
             Message::ExposureChanged(ev) => {
                 self.exposure_ev = ev;
+                // RAM-only until an edit flush point; the shader stays live.
+                if let Some(selected) = &self.selected {
+                    self.roll.set_exposure(selected, ev);
+                }
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_exposure(ev);
                 }
@@ -462,6 +481,14 @@ impl cosmic::Application for AppModel {
             }
 
             Message::FilesLoaded(files) => {
+                // Load the roll manifest and reconcile it against what is on
+                // disk, so edits for removed files never reattach to a name
+                // that later returns.
+                self.roll = library_dir()
+                    .map(|dir| edit_manifest::load_roll_manifest(&dir))
+                    .unwrap_or_default();
+                edit_manifest::reconcile(&mut self.roll, &files);
+
                 self.tiles = files
                     .into_iter()
                     .map(|name| Tile {
@@ -503,6 +530,11 @@ impl cosmic::Application for AppModel {
 
             Message::Ignore => Task::none(),
 
+            Message::EditSave => {
+                self.persist_roll();
+                Task::none()
+            }
+
             Message::LaunchUrl(url) => match open::that_detached(&url) {
                 Ok(()) => Task::none(),
                 Err(err) => {
@@ -511,6 +543,12 @@ impl cosmic::Application for AppModel {
                 }
             },
         }
+    }
+
+    /// Called when the user requests an app window to be closed; flush any
+    /// unsaved edits before the window goes away.
+    fn on_close_requested(&self, _id: cosmic::iced::window::Id) -> Option<Self::Message> {
+        Some(Message::EditSave)
     }
 
     /// Called when a nav item is selected.
@@ -585,6 +623,16 @@ impl AppModel {
         self.exposure_ev = 0.0;
     }
 
+    /// Writes the in-memory roll edits to the manifest file on disk.
+    fn persist_roll(&self) {
+        let Some(dir) = library_dir() else {
+            return;
+        };
+        if let Err(err) = edit_manifest::save_roll_manifest(&dir, &self.roll) {
+            eprintln!("failed to save edits: {err}");
+        }
+    }
+
     /// Handle the completion of a hi-res detail decode, applying the result
     /// only if it matches the current selection and re-pumping if superseded.
     fn handle_detail_ready(
@@ -636,15 +684,24 @@ impl AppModel {
     }
 }
 
-/// Scans `~/Pictures/exposure` for regular files and returns their sorted names.
+/// The directory the POC treats as its one film roll.
+///
+/// Eventually this becomes the first entry in a user-managed list of roll
+/// directories; the storage layer is already parameterized by directory.
+fn library_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| Path::new(&home).join("Pictures").join("exposure"))
+}
+
+/// Scans the film roll directory for regular files and returns their sorted
+/// names. Dotfiles (including the edit manifest) are never shown as tiles.
 async fn load_files() -> Vec<String> {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(dir) = library_dir() else {
         return Vec::new();
     };
 
-    let Ok(mut entries) =
-        tokio::fs::read_dir(Path::new(&home).join("Pictures").join("exposure")).await
-    else {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
     };
 
@@ -652,6 +709,7 @@ async fn load_files() -> Vec<String> {
     while let Ok(Some(entry)) = entries.next_entry().await {
         if entry.file_type().await.is_ok_and(|ty| ty.is_file())
             && let Some(name) = entry.file_name().into_string().ok()
+            && !name.starts_with('.')
         {
             files.push(name);
         }
@@ -682,8 +740,10 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
 
     let label = widget::text(fl!("exposure-label"));
     let value_text = widget::text(format!("{:+.2} EV", app.exposure_ev));
-    let slider =
-        widget::slider(-3.0..=3.0, app.exposure_ev, Message::ExposureChanged).step(0.01_f32);
+    let slider = widget::slider(-3.0..=3.0, app.exposure_ev, Message::ExposureChanged)
+        .step(0.01_f32)
+        // A finished drag is an edit flush point.
+        .on_release(Message::EditSave);
 
     widget::column::with_capacity(4)
         .push(title)
@@ -885,14 +945,11 @@ async fn decode_raw<F>(name: String, convert: F) -> Result<Handle, ()>
 where
     F: Fn(&rawloader::RawImage) -> Result<Handle, ()> + Send + 'static,
 {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(dir) = library_dir() else {
         return Err(());
     };
 
-    let path = Path::new(&home)
-        .join("Pictures")
-        .join("exposure")
-        .join(name);
+    let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
         rawloader::decode_file(&path)
