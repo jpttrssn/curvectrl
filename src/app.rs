@@ -51,6 +51,9 @@ pub struct AppModel {
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
     selected: Option<String>,
+    /// Name handed to the single permitted in-flight thumbnail decode, so
+    /// re-baked tiles never race the startup chain (memory bound).
+    thumb_inflight: Option<String>,
     /// Persisted per-file edits for the film roll, loaded at startup and
     /// reconciled against the files on disk on each scan. Writes to the
     /// manifest happen only on explicit flush messages, never per frame.
@@ -198,6 +201,7 @@ impl cosmic::Application for AppModel {
                 .unwrap_or_default(),
             tiles: Vec::new(),
             selected: None,
+            thumb_inflight: None,
             roll: RollManifest::default(),
             detail_shader: None,
             detail_inflight: None,
@@ -489,6 +493,9 @@ impl cosmic::Application for AppModel {
                     .unwrap_or_default();
                 edit_manifest::reconcile(&mut self.roll, &files);
 
+                // A refresh supersedes any earlier chain.
+                self.thumb_inflight = None;
+
                 self.tiles = files
                     .into_iter()
                     .map(|name| Tile {
@@ -508,6 +515,7 @@ impl cosmic::Application for AppModel {
                     };
                 }
 
+                self.thumb_inflight = None;
                 self.decode_next()
             }
 
@@ -532,6 +540,16 @@ impl cosmic::Application for AppModel {
 
             Message::EditSave => {
                 self.persist_roll();
+                // The stored edit changed; re-bake the active file's grid
+                // thumbnail so the tile reflects the exposure. The decode
+                // reads the EV from the manifest when it starts, so even a
+                // queued re-bake catches the latest value.
+                if let Some(name) = self.selected.clone() {
+                    if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
+                        tile.thumb = Thumb::Loading;
+                    }
+                    return self.decode_next();
+                }
                 Task::none()
             }
 
@@ -580,16 +598,27 @@ impl AppModel {
     /// Spawns decoding of the next pending thumbnail, if any.
     ///
     /// Decoding is chained sequentially so that only one full-resolution RAW
-    /// buffer is held in memory at a time.
+    /// buffer is held in memory at a time; `thumb_inflight` blocks a new
+    /// spawn while a decode is still running, so a re-bake requested mid-chain
+    /// waits for the slot instead of racing it. The exposure read here is the
+    /// value at spawn time, so every tile (initial chain or re-bake) bakes in
+    /// the version of the edit that is current when it actually decodes.
     fn decode_next(&mut self) -> Task<cosmic::Action<Message>> {
-        let name = self
+        if self.thumb_inflight.is_some() {
+            return Task::none();
+        }
+
+        let tile = self
             .tiles
             .iter()
             .find(|tile| matches!(tile.thumb, Thumb::Loading))
-            .map(|tile| tile.name.clone());
+            .map(|tile| (tile.name.clone(), self.roll.exposure_ev(&tile.name)));
 
-        match name {
-            Some(name) => cosmic::task::future(decode_thumbnail(name)),
+        match tile {
+            Some((name, ev)) => {
+                self.thumb_inflight = Some(name.clone());
+                cosmic::task::future(decode_thumbnail(name, ev))
+            }
             None => Task::none(),
         }
     }
@@ -855,9 +884,12 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     )
 }
 
-/// Decodes a RAW file from the pictures directory into a thumbnail message.
-async fn decode_thumbnail(name: String) -> Message {
-    let result = decode_raw(name.clone(), |image| convert_thumbnail(image, THUMB_SIZE)).await;
+/// Decodes a RAW file from the pictures directory into a thumbnail message,
+/// baking in the given exposure so the grid tile reflects the stored edit.
+async fn decode_thumbnail(name: String, exposure_ev: f32) -> Message {
+    let result =
+        decode_raw(name.clone(), move |image| convert_thumbnail(image, THUMB_SIZE, exposure_ev))
+            .await;
 
     Message::ThumbReady(name, result)
 }
@@ -1063,6 +1095,15 @@ fn flatten_bayer(samples: &[f32], width: usize, height: usize, cfa: &rawloader::
         .collect()
 }
 
+/// Multiplies linear samples by `2^EV` in place, mirroring the detail
+/// shader's gain so CPU and GPU rendering stay bit-consistent.
+fn apply_exposure(mono: &mut [f32], exposure_ev: f32) {
+    let gain = f32::exp2(exposure_ev);
+    for value in mono {
+        *value *= gain;
+    }
+}
+
 /// Encodes a linear intensity into the sRGB transfer function.
 fn srgb_encode(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
@@ -1087,9 +1128,13 @@ fn luma(rgb: &[f32]) -> Vec<f32> {
 }
 
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
-/// dimension exceeds `max_size`.
+/// dimension exceeds `max_size`, baking `exposure_ev` into the pixels.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn convert_thumbnail(image: &rawloader::RawImage, max_size: f32) -> Result<Handle, ()> {
+fn convert_thumbnail(
+    image: &rawloader::RawImage,
+    max_size: f32,
+    exposure_ev: f32,
+) -> Result<Handle, ()> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
 
@@ -1144,6 +1189,10 @@ fn convert_thumbnail(image: &rawloader::RawImage, max_size: f32) -> Result<Handl
     // Restore edge punch lost to the heavy downscale, before tone encoding so
     // overshoot stays out of the perceptually amplified display range.
     unsharp_mask(&mut mono, width as usize, height as usize);
+
+    // Bake the stored exposure in linear light, matching the detail shader's
+    // `mono_linear * 2^EV`, so grid tile and detail view agree.
+    apply_exposure(&mut mono, exposure_ev);
 
     for value in &mut mono {
         *value = srgb_encode(*value);
@@ -1514,6 +1563,26 @@ mod tests {
         assert!(green > blue);
         assert!((green - 0.715_2).abs() < 1e-6);
         assert!((blue - 0.072_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_exposure_scales_in_linear_light() {
+        let mut mono = [0.5_f32; 8];
+
+        apply_exposure(&mut mono, 1.0);
+        assert!(mono.iter().all(|value| (*value - 1.0).abs() < 1e-6));
+
+        apply_exposure(&mut mono, -1.0);
+        assert!(mono.iter().all(|value| (*value - 0.5).abs() < 1e-6));
+
+        // EV=0 → 2^0 = 1.0, identity.
+        apply_exposure(&mut mono, 0.0);
+        assert!(mono.iter().all(|value| (*value - 0.5).abs() < 1e-6));
+
+        // 1 EV doubles linear light at any level.
+        let mut dim = [0.125_f32; 4];
+        apply_exposure(&mut dim, 1.0);
+        assert!(dim.iter().all(|value| (*value - 0.25).abs() < 1e-6));
     }
 
     #[test]
