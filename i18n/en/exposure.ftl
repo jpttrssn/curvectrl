@@ -11,3 +11,7 @@ git-description = Git commit {$hash} on {$date}
 editing-title = Editing
 editing-toggle = Show editing panel
 exposure-label = Exposure
+tone-label = Tone curve
+contrast-label = Contrast
+rolloff-label = Highlight rolloff
+tone-reset = Reset tone

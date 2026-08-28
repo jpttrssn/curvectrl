@@ -3,6 +3,7 @@
 //! Film stock profiles and monochrome negative inversion.
 
 /// A developed monochrome film stock's scan-response profile.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MonoStock {
     /// Display name of the stock.
     // Unused until a stock picker exists.

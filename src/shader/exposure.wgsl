@@ -25,8 +25,12 @@ struct Uniforms {
     zoom: f32,       // detail-view zoom, 1.0 = contain fit, each +1 doubles scale
     pan_x: f32,      // pan offset of the image center, physical pixels
     pan_y: f32,
-    _pad0: f32,
-    _pad1: f32,
+    // Live tone curve applied to the sampled positive: `clamp(ratio * p^exp, 0, 1)`.
+    // The CPU folds the contrast/rolloff power curves (pivoted at the image's
+    // measured mid-gray and white point) into this single pair; both are 1.0 at
+    // the defaults, making the remap the identity.
+    curve_ratio: f32,
+    curve_exp: f32,
 };
 
 @group(0) @binding(0) var t_mono: texture_2d<f32>;
@@ -89,8 +93,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // edges when rasterizing across the contained boundary).
     let mono_linear = textureSample(t_mono, s_mono, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0))).r;
 
+    // Live tone curve re-shapes the baked positive's values: the CPU folds
+    // the contrast power (pivot at the image's measured mid-gray) and the
+    // highlight-rolloff power (pivot at the measured white point) into one
+    // `ratio * p^exp`. Identity at the defaults (byte-identical render).
+    let remapped = clamp(uniforms.curve_ratio * pow(mono_linear, uniforms.curve_exp), 0.0, 1.0);
+
     // Linear-light exposure via the Rust-computed 2^EV gain.
-    let exposed = mono_linear * uniforms.exposure;
+    let exposed = remapped * uniforms.exposure;
     let clamped = clamp(exposed, 0.0, 1.0);
     let srgb = linear_to_srgb(clamped);
 

@@ -92,6 +92,15 @@ pub struct AppModel {
     /// Most recent cursor position over the detail preview, widget-relative
     /// logical points; anchors wheel-zoom at the cursor.
     detail_cursor: Option<Point>,
+    /// Contrast power previewed in the detail view, pivoting the live tone
+    /// curve at the image's measured mid-gray. Non-persisted: resets to
+    /// `1.0` (identity) on every detail open. GPU-uniform only — the grid
+    /// thumbnails always render with the default curve.
+    curve_contrast: f32,
+    /// Highlight-rolloff power previewed in the detail view, pivoting the
+    /// live tone curve at the image's measured white point. Same lifecycle
+    /// and rules as [`Self::curve_contrast`].
+    curve_rolloff: f32,
     /// Exposure compensation in EV (−3.00 to +3.00).
     exposure_ev: f32,
     /// Monotonic counter incremented each time a new detail decode finishes;
@@ -145,6 +154,11 @@ pub enum Message {
     DetailPanMove(Point),
     /// The mouse was released or left the preview — grab-pan ends.
     DetailPanRelease,
+    /// The live tone curve changed: new contrast and rolloff powers. Applies
+    /// to the shader as a uniform-only remap (non-persisted).
+    CurveChanged(f32, f32),
+    /// Reset the tone curve back to the identity (contrast = rolloff = 1).
+    CurveReset,
     /// Flush the in-memory roll edits to the manifest file on disk.
     EditSave,
     /// Consume an input event without acting on it, blocking the grid
@@ -242,9 +256,11 @@ impl cosmic::Application for AppModel {
             detail_last_frame: None,
             detail_thumb: None,
             detail_zoom: 1.0,
-            detail_pan: (0.0, 0.0),
-            detail_panning: false,
-            detail_cursor: None,
+detail_pan: (0.0, 0.0),
+        detail_panning: false,
+        detail_cursor: None,
+        curve_contrast: 1.0,
+        curve_rolloff: 1.0,
             exposure_ev: 0.0,
             next_image_id: 0,
         };
@@ -560,6 +576,24 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
+            Message::CurveChanged(contrast, rolloff) => {
+                self.curve_contrast = contrast;
+                self.curve_rolloff = rolloff;
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_curve(contrast, rolloff);
+                }
+                Task::none()
+            }
+
+            Message::CurveReset => {
+                self.curve_contrast = 1.0;
+                self.curve_rolloff = 1.0;
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_curve(self.curve_contrast, self.curve_rolloff);
+                }
+                Task::none()
+            }
+
             Message::FilesLoaded(files) => {
                 // Load the roll manifest and reconcile it against what is on
                 // disk, so edits for removed files never reattach to a name
@@ -730,7 +764,8 @@ impl AppModel {
         cosmic::task::future(decode_detail(name))
     }
 
-    /// Reset all detail-view buffers, crossfade state, and view transform.
+    /// Reset all detail-view buffers, crossfade state, the view transform, and
+    /// the non-persisted tone-curve preview (each open starts at the identity).
     fn clear_detail(&mut self) {
         self.detail_shader = None;
         self.detail_thumb_opacity = 1.0;
@@ -740,6 +775,8 @@ impl AppModel {
         self.detail_pan = (0.0, 0.0);
         self.detail_panning = false;
         self.detail_cursor = None;
+        self.curve_contrast = 1.0;
+        self.curve_rolloff = 1.0;
         self.exposure_ev = 0.0;
     }
 
@@ -792,6 +829,7 @@ impl AppModel {
                 // was in flight (the program starts at contain fit).
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_view(self.detail_zoom, self.detail_pan);
+                    shader.set_curve(self.curve_contrast, self.curve_rolloff);
                 }
             }
             self.detail_thumb_opacity = 1.0;
@@ -870,11 +908,45 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         // A finished drag is an edit flush point.
         .on_release(Message::EditSave);
 
-    widget::column::with_capacity(4)
+    // Non-persisted tone-curve preview: two power sliders re-shape the GPU
+    // texture via a uniform-only remap. Contrast pivots at the image's
+    // measured mid-gray; highlight rolloff at the measured white point —
+    // each visibly different from exposure's gain. Grid thumbnails are
+    // unaffected; every detail open starts from the identity.
+    let tone_label = widget::text(fl!("tone-label"));
+    let contrast_label = widget::text(fl!("contrast-label"));
+    let contrast_value = widget::text(format!("{:.2}", app.curve_contrast));
+    let contrast_slider = widget::slider(
+        0.5..=1.5,
+        app.curve_contrast,
+        // When either slider moves, the other value travels along so the
+        // remap always composes the full curve, not a half-updated one.
+        move |contrast| Message::CurveChanged(contrast, app.curve_rolloff),
+    )
+    .step(0.05_f32);
+    let rolloff_label = widget::text(fl!("rolloff-label"));
+    let rolloff_value = widget::text(format!("{:.2}", app.curve_rolloff));
+    let rolloff_slider = widget::slider(
+        0.5..=1.5,
+        app.curve_rolloff,
+        move |rolloff| Message::CurveChanged(app.curve_contrast, rolloff),
+    )
+    .step(0.05_f32);
+    let reset = widget::button::standard(fl!("tone-reset")).on_press(Message::CurveReset);
+
+    widget::column::with_capacity(12)
         .push(title)
         .push(label)
         .push(slider)
         .push(value_text)
+        .push(tone_label)
+        .push(contrast_label)
+        .push(contrast_slider)
+        .push(contrast_value)
+        .push(rolloff_label)
+        .push(rolloff_slider)
+        .push(rolloff_value)
+        .push(reset)
         .spacing(space_s)
         .width(Length::Fill)
         .into()
