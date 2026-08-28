@@ -32,6 +32,14 @@ const FADE_SPEED: f32 = 5.0;
 /// Aspect ratio (width / height) of the image area of a Page 1 tile.
 const TILE_ASPECT: f32 = 1.0;
 
+/// Maximum number of thumbnail decodes in flight at once.
+///
+/// Decodes run on the blocking thread pool, so several proceed in parallel on
+/// multicore machines. The bound keeps the transient footprint (each in-flight
+/// decode holds one full-resolution RAW buffer until it finishes downscaling)
+/// to a few dozen hundred MB, not the whole roll.
+const MAX_CONCURRENT_THUMBS: usize = 4;
+
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
 pub struct AppModel {
@@ -51,9 +59,9 @@ pub struct AppModel {
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
     selected: Option<String>,
-    /// Name handed to the single permitted in-flight thumbnail decode, so
-    /// re-baked tiles never race the startup chain (memory bound).
-    thumb_inflight: Option<String>,
+    /// Names handed to the bounded in-flight thumbnail decodes, so re-baked
+    /// tiles never double-spawn against the startup chain (memory bound).
+    thumb_inflight: Vec<String>,
     /// Persisted per-file edits for the film roll, loaded at startup and
     /// reconciled against the files on disk on each scan. Writes to the
     /// manifest happen only on explicit flush messages, never per frame.
@@ -201,7 +209,7 @@ impl cosmic::Application for AppModel {
                 .unwrap_or_default(),
             tiles: Vec::new(),
             selected: None,
-            thumb_inflight: None,
+            thumb_inflight: Vec::new(),
             roll: RollManifest::default(),
             detail_shader: None,
             detail_inflight: None,
@@ -494,7 +502,7 @@ impl cosmic::Application for AppModel {
                 edit_manifest::reconcile(&mut self.roll, &files);
 
                 // A refresh supersedes any earlier chain.
-                self.thumb_inflight = None;
+                self.thumb_inflight.clear();
 
                 self.tiles = files
                     .into_iter()
@@ -515,7 +523,7 @@ impl cosmic::Application for AppModel {
                     };
                 }
 
-                self.thumb_inflight = None;
+                self.thumb_inflight.retain(|pending| pending != &name);
                 self.decode_next()
             }
 
@@ -595,32 +603,43 @@ impl AppModel {
         }
     }
 
-    /// Spawns decoding of the next pending thumbnail, if any.
+    /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] pending thumbnails.
     ///
-    /// Decoding is chained sequentially so that only one full-resolution RAW
-    /// buffer is held in memory at a time; `thumb_inflight` blocks a new
-    /// spawn while a decode is still running, so a re-bake requested mid-chain
-    /// waits for the slot instead of racing it. The exposure read here is the
-    /// value at spawn time, so every tile (initial chain or re-bake) bakes in
-    /// the version of the edit that is current when it actually decodes.
+    /// Decoding is bounded rather than strictly sequential so several
+    /// `spawn_blocking` RAW decodes overlap on multicore machines; the count
+    /// keeps the transient footprint to a few full-resolution buffers. A name
+    /// already in flight is never spawned again, so a re-bake requested
+    /// mid-chain waits for the running decode instead of racing it. The
+    /// exposure read here is the value at spawn time, so every tile (initial
+    /// chain or re-bake) bakes in the version of the edit that is current when
+    /// it actually decodes.
     fn decode_next(&mut self) -> Task<cosmic::Action<Message>> {
-        if self.thumb_inflight.is_some() {
+        let capacity = MAX_CONCURRENT_THUMBS.saturating_sub(self.thumb_inflight.len());
+        if capacity == 0 {
             return Task::none();
         }
 
-        let tile = self
+        let pending: Vec<(String, f32)> = self
             .tiles
             .iter()
-            .find(|tile| matches!(tile.thumb, Thumb::Loading))
-            .map(|tile| (tile.name.clone(), self.roll.exposure_ev(&tile.name)));
+            .filter(|tile| matches!(tile.thumb, Thumb::Loading))
+            .filter(|tile| !self.thumb_inflight.iter().any(|name| name == &tile.name))
+            .take(capacity)
+            .map(|tile| (tile.name.clone(), self.roll.exposure_ev(&tile.name)))
+            .collect();
 
-        match tile {
-            Some((name, ev)) => {
-                self.thumb_inflight = Some(name.clone());
-                cosmic::task::future(decode_thumbnail(name, ev))
-            }
-            None => Task::none(),
+        if pending.is_empty() {
+            return Task::none();
         }
+
+        self.thumb_inflight
+            .extend(pending.iter().map(|(name, _)| name.clone()));
+
+        Task::batch(
+            pending
+                .into_iter()
+                .map(|(name, ev)| cosmic::task::future(decode_thumbnail(name, ev))),
+        )
     }
 
     /// Spawns the hi-res decode behind the detail view when one is due.
@@ -1076,23 +1095,43 @@ fn flatten_bayer(samples: &[f32], width: usize, height: usize, cfa: &rawloader::
     }
     // Anchor onto the green class when present (best SNR, keeps magnitudes
     // close to true transmissions); otherwise the dimmest measurable class.
-    let reference = if class_samples[1].is_empty() {
-        class_samples
-            .iter()
-            .zip(anchored)
-            .filter(|(class, _)| !class.is_empty())
-            .map(|(_, base)| base)
-            .fold(f32::INFINITY, f32::min)
-    } else {
-        anchored[1]
-    };
+    let empty = std::array::from_fn(|class| class_samples[class].is_empty());
+    let gains = class_gains(anchored, empty);
 
-    let gains: [f32; 4] = std::array::from_fn(|class| reference / anchored[class]);
     samples[..pixels]
         .iter()
         .enumerate()
         .map(|(idx, value)| value * gains[cfa.color_at(idx / width, idx % width)])
         .collect()
+}
+
+/// Gains that rescale the four CFA classes onto one common base.
+///
+/// Anchors onto the green class when present (best SNR, keeps magnitudes close
+/// to true transmissions); otherwise the dimmest measurable class. A class
+/// with no samples at its measurement resolution is rescaled by its anchored
+/// base like any other. Mirrored by the fused thumbnail downscaler so the
+/// full-res detail path and the collapsed thumbnail path share one rule.
+///
+/// `anchored` and `empty` are indexed by CFA color (0=R, 1=G, 2=B, 3=fourth).
+fn class_gains(anchored: [f32; 4], empty: [bool; 4]) -> [f32; 4] {
+    let reference = if empty[1] {
+        let Some(dimmest) = anchored
+            .iter()
+            .zip(empty)
+            .filter(|(_, class_empty)| !*class_empty)
+            .map(|(base, _)| *base)
+            .reduce(f32::min)
+        else {
+            // No measurable class at all; keep every class unscaled.
+            return [1.0; 4];
+        };
+        dimmest
+    } else {
+        anchored[1]
+    };
+
+    std::array::from_fn(|class| reference / anchored[class])
 }
 
 /// Multiplies linear samples by `2^EV` in place, mirroring the detail
@@ -1127,6 +1166,264 @@ fn luma(rgb: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Start and length of the source range that output coordinate `out` covers,
+/// offset by `origin` (the cropped edge on that axis).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn block_span(out: u32, source: u32, out_total: u32, origin: usize) -> (usize, usize) {
+    let start = range(out, source, out_total) + origin;
+    let len = range_len(start, range(out + 1, source, out_total) + origin);
+    (start, len)
+}
+
+/// Rec.709 luminance of three per-block channel means.
+fn luma_of_means(r: f32, g: f32, b: f32) -> f32 {
+    0.212_6 * r + 0.715_2 * g + 0.072_2 * b
+}
+
+/// Fused normalization, cropping, and phase-preserving downscale.
+///
+/// Reads the raw sensor samples exactly once into per-output-pixel
+/// accumulators, bypassing the full-resolution linear buffer the separate
+/// [`normalize_samples`]/[`crop_samples`]/[`flatten_bayer`]/[`resize_area`]
+/// steps build. The size math and block mapping match [`resize_area`] (never
+/// upscales). Returns a small linear negative-space mono; inversion happens in
+/// the caller.
+///
+/// RGB sources collapse through the Rec.709 luminance of each block's channel
+/// means — exact, because luma is linear. Bayer mosaics keep each CFA class
+/// separate per block and rescale the class means onto one common base with
+/// the same [`class_gains`] rule the detail path uses, so a heavy downscale
+/// averages each site's cast independently (flatten-before-average tone
+/// accepted over the full-res invert-then-average ordering).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn downsample_thumbnail(
+    image: &rawloader::RawImage,
+    max_size: u32,
+) -> Option<(Vec<f32>, u32, u32)> {
+    let width = usize::max(image.width, 1);
+    let height = usize::max(image.height, 1);
+    let [top, right, bottom, left] = image.crops;
+    let cw = width.checked_sub(right.saturating_add(left))?;
+    let ch = height.checked_sub(top.saturating_add(bottom))?;
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+
+    let scale = f32::min(
+        1.0,
+        f32::min(max_size as f32 / cw as f32, max_size as f32 / ch as f32),
+    );
+    let out_w = u32::max((cw as f32 * scale) as u32, 1);
+    let out_h = u32::max((ch as f32 * scale) as u32, 1);
+
+    let mono = if image.cpp >= 3 {
+        downsample_rgb(image, out_w as usize, out_h as usize)?
+    } else {
+        downsample_bayer(image, out_w as usize, out_h as usize)?
+    };
+
+    Some((mono, out_w, out_h))
+}
+
+/// Fused RGB-source branch of [`downsample_thumbnail`]: block channel means
+/// collapsed through Rec.709 luminance.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn downsample_rgb(
+    image: &rawloader::RawImage,
+    out_w: usize,
+    out_h: usize,
+) -> Option<Vec<f32>> {
+    let width = usize::max(image.width, 1);
+    let height = usize::max(image.height, 1);
+    let cpp = usize::max(image.cpp, 1);
+    let [top, right, bottom, left] = image.crops;
+    let (cw, ch) = (width - right - left, height - top - bottom);
+
+    let mut mono = Vec::with_capacity(out_w * out_h);
+
+    match &image.data {
+        rawloader::RawImageData::Integer(values) => {
+            if values.len() < width * height * cpp {
+                return None;
+            }
+            for out_y in 0..out_h as u32 {
+                let (row_start, rows) = block_span(out_y, ch as u32, out_h as u32, top);
+                for out_x in 0..out_w as u32 {
+                    let (col_start, cols) = block_span(out_x, cw as u32, out_w as u32, left);
+                    let mut sums = [0.0_f32; 3];
+                    for y in row_start..row_start + rows {
+                        for x in col_start..col_start + cols {
+                            // Black/white levels are per-channel, looked up by
+                            // CFA position, matching normalize_samples.
+                            let color = image.cfa.color_at(y, x);
+                            let black = f32::from(image.blacklevels[color]);
+                            let span =
+                                (f32::from(image.whitelevels[color]) - black).max(f32::EPSILON);
+                            let offset = (y * width + x) * cpp;
+                            for (channel, sum) in sums.iter_mut().enumerate() {
+                                let value = f32::from(values[offset + channel]);
+                                *sum += (value - black).clamp(0.0, span) / span;
+                            }
+                        }
+                    }
+                    let count = (rows * cols) as f32;
+                    mono.push(luma_of_means(
+                        sums[0] / count,
+                        sums[1] / count,
+                        sums[2] / count,
+                    ));
+                }
+            }
+        }
+        rawloader::RawImageData::Float(values) => {
+            let max = values.iter().copied().fold(0.0_f32, f32::max);
+            let gain = if max > f32::EPSILON { 1.0 / max } else { 1.0 };
+            for out_y in 0..out_h as u32 {
+                let (row_start, rows) = block_span(out_y, ch as u32, out_h as u32, top);
+                for out_x in 0..out_w as u32 {
+                    let (col_start, cols) = block_span(out_x, cw as u32, out_w as u32, left);
+                    let mut sums = [0.0_f32; 3];
+                    for y in row_start..row_start + rows {
+                        for x in col_start..col_start + cols {
+                            let offset = (y * width + x) * cpp;
+                            for (channel, sum) in sums.iter_mut().enumerate() {
+                                *sum += (values[offset + channel] * gain).clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                    let count = (rows * cols) as f32;
+                    mono.push(luma_of_means(
+                        sums[0] / count,
+                        sums[1] / count,
+                        sums[2] / count,
+                    ));
+                }
+            }
+        }
+    }
+
+    Some(mono)
+}
+
+/// Fused bayer branch of [`downsample_thumbnail`]: per-CFA-class block means
+/// rescaled onto one common base.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn downsample_bayer(
+    image: &rawloader::RawImage,
+    out_w: usize,
+    out_h: usize,
+) -> Option<Vec<f32>> {
+    let width = usize::max(image.width, 1);
+    let height = usize::max(image.height, 1);
+    let [top, right, bottom, left] = image.crops;
+    let (cw, ch) = (width - right - left, height - top - bottom);
+    let out_pixels = out_w * out_h;
+
+    let mut sums = vec![[0.0_f32; 4]; out_pixels];
+    let mut counts = vec![[0_u32; 4]; out_pixels];
+
+    match &image.data {
+        rawloader::RawImageData::Integer(values) => {
+            if values.len() < width * height {
+                return None;
+            }
+            for out_y in 0..out_h as u32 {
+                let (row_start, rows) = block_span(out_y, ch as u32, out_h as u32, top);
+                for out_x in 0..out_w as u32 {
+                    let (col_start, cols) = block_span(out_x, cw as u32, out_w as u32, left);
+                    let slot = out_y as usize * out_w + out_x as usize;
+                    for y in row_start..row_start + rows {
+                        for x in col_start..col_start + cols {
+                            let color = image.cfa.color_at(y, x);
+                            let black = f32::from(image.blacklevels[color]);
+                            let span =
+                                (f32::from(image.whitelevels[color]) - black).max(f32::EPSILON);
+                            let value = f32::from(values[y * width + x]);
+                            sums[slot][color] += (value - black).clamp(0.0, span) / span;
+                            counts[slot][color] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        rawloader::RawImageData::Float(values) => {
+            let max = values.iter().copied().fold(0.0_f32, f32::max);
+            let gain = if max > f32::EPSILON { 1.0 / max } else { 1.0 };
+            for out_y in 0..out_h as u32 {
+                let (row_start, rows) = block_span(out_y, ch as u32, out_h as u32, top);
+                for out_x in 0..out_w as u32 {
+                    let (col_start, cols) = block_span(out_x, cw as u32, out_w as u32, left);
+                    let slot = out_y as usize * out_w + out_x as usize;
+                    for y in row_start..row_start + rows {
+                        for x in col_start..col_start + cols {
+                            let color = image.cfa.color_at(y, x);
+                            let value = values[y * width + x];
+                            sums[slot][color] += (value * gain).clamp(0.0, 1.0);
+                            counts[slot][color] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collapse each class to its block mean, measure a per-class base, and
+    // rescale onto one common base with the same anchoring the detail path
+    // uses. A class absent from a block simply does not contribute to that
+    // output pixel.
+    let mut class_values: [Vec<f32>; 4] = Default::default();
+    for (slot, sums) in sums.iter().enumerate() {
+        for class in 0..4 {
+            if counts[slot][class] != 0 {
+                class_values[class].push(sums[class] / counts[slot][class] as f32);
+            }
+        }
+    }
+
+    let mut anchored = [ACTIVE_STOCK.base; 4];
+    for (base, class) in anchored.iter_mut().zip(&class_values) {
+        if let Some(measured) =
+            measure_base(class).filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
+        {
+            *base = measured;
+        }
+    }
+    let empty = std::array::from_fn(|class| class_values[class].is_empty());
+    let gains = class_gains(anchored, empty);
+
+    let mut mono = Vec::with_capacity(out_pixels);
+    for (slot, sums) in sums.iter().enumerate() {
+        let mut sum = 0.0_f32;
+        let mut non_empty = 0_u32;
+        for class in 0..4 {
+            if counts[slot][class] != 0 {
+                sum += (sums[class] / counts[slot][class] as f32) * gains[class];
+                non_empty += 1;
+            }
+        }
+        let level = if non_empty == 0 {
+            ACTIVE_STOCK.base
+        } else {
+            sum / non_empty as f32
+        };
+        mono.push(level);
+    }
+
+    Some(mono)
+}
+
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
 /// dimension exceeds `max_size`, baking `exposure_ev` into the pixels.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1135,44 +1432,10 @@ fn convert_thumbnail(
     max_size: f32,
     exposure_ev: f32,
 ) -> Result<Handle, ()> {
-    let width = usize::max(image.width, 1);
-    let height = usize::max(image.height, 1);
-
-    let normalized = normalize_samples(image);
-
-    // Discard masked sensor borders before further processing.
-    let (samples, width, height) = match crop_samples(&normalized, width, height, image.crops) {
-        Some(cropped) => cropped,
-        None => (normalized, width, height),
-    };
-
-    // RGB sources collapse through luminance; bayer mosaics reconstruct into a
-    // full-resolution monochrome negative by rescaling CFA classes onto one
-    // common base.
-    let (mut mono, width, height) = if image.cpp >= 3 {
-        if samples.len() < width * height * 3 {
-            return Err(());
-        }
-
-        let mut rgb = Vec::with_capacity(width * height * 3);
-        for pixel in 0..width * height {
-            let base = pixel * image.cpp;
-            rgb.push(samples[base]);
-            rgb.push(samples[base + 1]);
-            rgb.push(samples[base + 2]);
-        }
-
-        (luma(&rgb), width, height)
-    } else {
-        if samples.len() < width * height {
-            return Err(());
-        }
-
-        // The usable area's origin shifts the CFA phase.
-        let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
-
-        (flatten_bayer(&samples, width, height, &cfa), width, height)
-    };
+    // One fused pass: normalize, discard masked borders, and phase-preserve
+    // downscale straight from the sensor samples into a small linear negative.
+    let (mut mono, width, height) =
+        downsample_thumbnail(image, max_size as u32).ok_or(())?;
 
     // Anchor the black point on the frame's clearest film, then invert the
     // negative in density space.
@@ -1180,11 +1443,6 @@ fn convert_thumbnail(
         .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
         .unwrap_or(ACTIVE_STOCK.base);
     invert_gray(&mut mono, &ACTIVE_STOCK, base);
-
-    // Downscale in linear light: averaging blocks of pixels suppresses sensor
-    // noise and film-grain aliasing far better than sampling after encoding.
-    let (mut mono, width, height) =
-        resize_area(&mono, width as u32, height as u32, max_size as u32, 1);
 
     // Restore edge punch lost to the heavy downscale, before tone encoding so
     // overshoot stays out of the perceptually amplified display range.
@@ -1664,5 +1922,187 @@ mod tests {
 
         assert_eq!((width, height), (1, 1));
         assert_eq!(out, vec![2.5]); // mean of {1, 2, 3, 4}
+    }
+
+    /// Builds an Integer RAW whose per-class normalization yields the supplied
+    /// per-site transmissions: raw = transmission × 1000, white = 1000,
+    /// black = 0, so cast compression happens exactly at sample time.
+    fn raw_with_transmissions(
+        width: usize,
+        height: usize,
+        pattern: &str,
+        transmissions: Vec<u16>, // raw codes, one per site
+        crops: [usize; 4],
+    ) -> rawloader::RawImage {
+        rawloader::RawImage {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width,
+            height,
+            cpp: 1,
+            wb_coeffs: [1.0; 4],
+            whitelevels: [1000; 4],
+            blacklevels: [0; 4],
+            xyz_to_cam: [[0.0; 3]; 4],
+            cfa: rawloader::CFA::new(pattern),
+            crops,
+            blackareas: Vec::new(),
+            orientation: rawloader::Orientation::Normal,
+            data: rawloader::RawImageData::Integer(transmissions),
+        }
+    }
+
+    #[test]
+    fn downsample_thumbnail_removes_casts_at_full_scale() {
+        // Neutral film at normalized transmission 0.5 with per-class captures
+        // (RGGB: one R, two G, one B site): the fused downscaler must rescale
+        // each class onto the green-anchored reference.
+        let image = raw_with_transmissions(
+            2,
+            2,
+            "RGGB",
+            vec![600, 500, 500, 400], // 0.6, 0.5, 0.5, 0.4 after normalization
+            [0, 0, 0, 0],
+        );
+
+        let (mono, width, height) = downsample_thumbnail(&image, 2).unwrap();
+
+        assert_eq!((width, height), (2, 2));
+        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-5));
+    }
+
+    #[test]
+    fn downsample_thumbnail_preserves_phase_after_averaging() {
+        // Same class casts compressed into one 1x1 output pixel: the per-class
+        // averages must be rescalled before combining, or the cast survives.
+        let image = raw_with_transmissions(
+            2,
+            2,
+            "RGGB",
+            vec![600, 500, 500, 400],
+            [0, 0, 0, 0],
+        );
+
+        let (mono, width, height) = downsample_thumbnail(&image, 1).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert!((mono[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn downsample_thumbnail_handles_fourth_color_sites() {
+        let image = raw_with_transmissions(
+            2,
+            2,
+            "RGBE",
+            vec![450, 500, 550, 500], // R, G, B, E sites
+            [0, 0, 0, 0],
+        );
+
+        let (mono, width, height) = downsample_thumbnail(&image, 1).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert!((mono[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn downsample_thumbnail_respects_crops_and_phase() {
+        // 4x4 RGGB with per-class captures, cropped off the left border. The
+        // surviving region must hit the absolute CFA (not rephase against the
+        // crop origin), so the class casts compress to uniform 0.5 as usual.
+        let image = raw_with_transmissions(
+            4,
+            4,
+            "RGGB",
+            vec![
+                600, 500, 600, 500, // R, G, R, G
+                500, 400, 500, 400, // G, B, G, B
+                600, 500, 600, 500, //
+                500, 400, 500, 400, //
+            ],
+            [0, 0, 0, 1],
+        );
+
+        let (mono, width, height) = downsample_thumbnail(&image, 2).unwrap();
+
+        assert_eq!((width, height), (1, 2));
+        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-5));
+    }
+
+    #[test]
+    fn downsample_thumbnail_rejects_degenerate_crops() {
+        let image = raw_with_transmissions(2, 2, "RGGB", vec![600, 500, 500, 400], [2, 0, 0, 0]);
+
+        assert!(downsample_thumbnail(&image, 1).is_none());
+    }
+
+    #[test]
+    fn downsample_rgb_is_luma_of_block_means() {
+        // Float data is normalized by the global maximum before luma collapse;
+        // the block mean of luma equals luma of the block means (linearity).
+        let values: Vec<f32> = vec![
+            0.5, 0.5, 0.5, //
+            0.6, 0.4, 0.2, //
+            0.2, 0.4, 0.6, //
+            0.8, 0.1, 0.1, //
+        ];
+        let image = rawloader::RawImage {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: 2,
+            height: 2,
+            cpp: 3,
+            wb_coeffs: [1.0; 4],
+            whitelevels: [0; 4],
+            blacklevels: [0; 4],
+            xyz_to_cam: [[0.0; 3]; 4],
+            cfa: rawloader::CFA::new("RGGB"),
+            crops: [0, 0, 0, 0],
+            blackareas: Vec::new(),
+            orientation: rawloader::Orientation::Normal,
+            data: rawloader::RawImageData::Float(values),
+        };
+
+        let (mono, width, height) = downsample_thumbnail(&image, 1).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        // Normalized by global max 0.8 → gain 1.25; then channel means and
+        // Rec.709 luma.
+        let expected = {
+            let r = (0.625 + 0.75 + 0.25 + 1.0) / 4.0;
+            let g = (0.625 + 0.5 + 0.5 + 0.125) / 4.0;
+            let b = (0.625 + 0.25 + 0.75 + 0.125) / 4.0;
+            0.212_6 * r + 0.715_2 * g + 0.072_2 * b
+        };
+        assert!((mono[0] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn class_gains_anchors_to_green_when_present() {
+        let gains = class_gains([0.6, 0.5, 0.4, 0.9], [false; 4]);
+
+        assert!((gains[0] - 0.5 / 0.6).abs() < 1e-6); // R pulled up to green
+        assert!((gains[1] - 1.0).abs() < 1e-6); // green is the reference
+        assert!((gains[2] - 0.5 / 0.4).abs() < 1e-6); // B pulled down to green
+        assert!((gains[3] - 0.5 / 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn class_gains_falls_back_to_dimmest_class() {
+        // Green absent: anchor onto the dimmest measurable class.
+        let gains = class_gains([0.6, 0.5, 0.4, 0.9], [false, true, false, true]);
+
+        assert!((gains[2] - 1.0).abs() < 1e-6); // dimmest (B) is the reference
+        assert!((gains[0] - 0.4 / 0.6).abs() < 1e-6);
+        assert!((gains[3] - 0.4 / 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn class_gains_keeps_defaults_without_measurable_class() {
+        assert_eq!(class_gains([0.1; 4], [true; 4]), [1.0; 4]);
     }
 }
