@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod detail_area;
 mod edit_manifest;
 mod exposure_shader;
 mod film;

@@ -23,6 +23,11 @@ toml = "0.8"
 [build-dependencies]
 xdgen = "0.1"
 
+[dev-dependencies]
+# Already in the tree via wgpu; enables validating the WGSL at test time
+# instead of at first launch (naga parses/validates it).
+naga = "28"
+
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
 # See https://github.com/pop-os/libcosmic/blob/master/Cargo.toml for available features.

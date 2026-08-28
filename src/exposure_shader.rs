@@ -22,6 +22,12 @@ pub struct ExposureProgram {
     /// Raw EV value in stops; converted to `2^EV` once on the GPU side per
     /// slider change so the WGSL shader sees a linear-light gain.
     exposure: f32,
+    /// Detail-view zoom in `log2` units: 1.0 = contain fit, each +1 doubles
+    /// the rendered scale (see [`ExposurePrimitive::prepare`]).
+    zoom: f32,
+    /// Pan offset of the image center from the widget center, in logical
+    /// points; converted to physical pixels on the GPU side.
+    pan: (f32, f32),
     /// Monotonic id bumped by the app model on each new detail decode. Used
     /// to detect image changes and rebuild the GPU texture/bind group.
     image_id: u64,
@@ -32,14 +38,24 @@ impl ExposureProgram {
     ///
     /// `mono` is linear, inverted-positive pre-sRGB data (one `f32` per pixel,
     /// row-major, top-to-bottom). `exposure` is the raw EV value; the gain
-    /// sent to the GPU is `2^EV`.
+    /// sent to the GPU is `2^EV`. The view starts at contain fit (zoom 1.0,
+    /// no pan).
     pub fn new(mono: Vec<f32>, width: u32, height: u32, exposure: f32, image_id: u64) -> Self {
-        Self { mono, width, height, exposure, image_id }
+        Self { mono, width, height, exposure, zoom: 1.0, pan: (0.0, 0.0), image_id }
     }
 
     /// Update the exposure value (called on slider drag).
     pub fn set_exposure(&mut self, ev: f32) {
         self.exposure = ev;
+    }
+
+    /// Update the zoom/pan transform (called on detail-view wheel/drag).
+    ///
+    /// `zoom` is in `log2` units (1.0 = contain fit). `pan` is in logical
+    /// points relative to the widget center.
+    pub fn set_view(&mut self, zoom: f32, pan: (f32, f32)) {
+        self.zoom = zoom;
+        self.pan = pan;
     }
 
     /// Wrap in a `Shader` widget sized to fill the parent.
@@ -57,6 +73,8 @@ impl Clone for ExposureProgram {
             width: self.width,
             height: self.height,
             exposure: self.exposure,
+            zoom: self.zoom,
+            pan: self.pan,
             image_id: self.image_id,
         }
     }
@@ -68,6 +86,8 @@ impl std::fmt::Debug for ExposureProgram {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("exposure", &self.exposure)
+            .field("zoom", &self.zoom)
+            .field("pan", &self.pan)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
             .finish()
@@ -91,6 +111,8 @@ impl<M> Program<M> for ExposureProgram {
         ExposurePrimitive {
             mono: self.mono.clone(),
             exposure: self.exposure,
+            zoom: self.zoom,
+            pan: self.pan,
             width: self.width,
             height: self.height,
             image_id: self.image_id,
@@ -112,6 +134,10 @@ impl<M> Program<M> for ExposureProgram {
 pub struct ExposurePrimitive {
     mono: Vec<f32>,
     exposure: f32,
+    /// Detail-view zoom in `log2` units; 1.0 = contain fit.
+    zoom: f32,
+    /// Pan offset of the image center from the widget center (logical points).
+    pan: (f32, f32),
     width: u32,
     height: u32,
     image_id: u64,
@@ -216,7 +242,7 @@ impl Primitive for ExposurePrimitive {
             // Convert raw EV (slider value) to linear-light gain once per
             // frame; the WGSL shader reads this as a direct multiplier.
             exposure: self.exposure.exp2(),
-            // Texture dimensions feed the WGSL's `contained_uv` math so the
+            // Texture dimensions feed the WGSL's contained-fit math so the
             // shader mirrors `widget::image.content_fit(ContentFit::Contain)`.
             tex_w,
             tex_h,
@@ -224,7 +250,14 @@ impl Primitive for ExposurePrimitive {
             sc_y: bounds.y * sf,
             sc_w: bounds.width * sf,
             sc_h: bounds.height * sf,
-            _pad: 0.0,
+            // Detail-view transform: zoom in log2 units (1.0 = contain fit);
+            // pan in logical points converted to physical pixels, same
+            // convention as the scissor rect above.
+            zoom: self.zoom,
+            pan_x: self.pan.0 * sf,
+            pan_y: self.pan.1 * sf,
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         queue.write_buffer(&pipeline.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -457,7 +490,7 @@ fn build_render_pipeline(
 #[derive(Default, Clone, Copy)]
 struct Uniforms {
     exposure: f32,
-    /// Texture width in pixels — drives the WGSL contained-sub-rect math.
+    /// Texture width in pixels — drives the WGSL contained-fit math.
     tex_w: f32,
     /// Texture height in pixels.
     tex_h: f32,
@@ -465,7 +498,13 @@ struct Uniforms {
     sc_y: f32,
     sc_w: f32,
     sc_h: f32,
-    _pad: f32,
+    /// Detail-view zoom: 1.0 = contain fit, each +1 doubles scale.
+    zoom: f32,
+    /// Pan offset in physical pixels (logical points × scale factor).
+    pan_x: f32,
+    pan_y: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 // SAFETY: Uniforms is repr(C) with all f32 fields.
@@ -593,6 +632,24 @@ mod tests {
         // For 1.0 we expect two bytes: 0x00 0x3C (little-endian u16 0x3C00).
         let bytes = mono_to_half_bytes(&[1.0]);
         assert_eq!(bytes, [0x00, 0x3c]);
+    }
+
+    #[test]
+    fn wgsl_source_parses_and_validates() {
+        // The shader is compiled by wgpu at first launch, so a parse error
+        // would only surface at runtime. Validate the source we embed every
+        // test run instead.
+        let source = include_str!("shader/exposure.wgsl");
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|err| panic!("WGSL failed to parse: {err}"));
+
+        let stages: Vec<_> = module
+            .entry_points
+            .iter()
+            .map(|ep| ep.stage)
+            .collect();
+        assert!(stages.contains(&naga::ShaderStage::Vertex));
+        assert!(stages.contains(&naga::ShaderStage::Fragment));
     }
 }
 

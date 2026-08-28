@@ -22,7 +22,11 @@ struct Uniforms {
     sc_y: f32,       // scissor rect origin y (physical pixels)
     sc_w: f32,       // scissor rect width
     sc_h: f32,       // scissor rect height
-    _pad: f32,
+    zoom: f32,       // detail-view zoom, 1.0 = contain fit, each +1 doubles scale
+    pan_x: f32,      // pan offset of the image center, physical pixels
+    pan_y: f32,
+    _pad0: f32,
+    _pad1: f32,
 };
 
 @group(0) @binding(0) var t_mono: texture_2d<f32>;
@@ -53,40 +57,33 @@ fn in_bounds(uv: vec2<f32>) -> bool {
     return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
 }
 
-/// Mirrors `widget::image(...).content_fit(ContentFit::Contain)` for the
-/// shader widget (which has no built-in `.content_fit()` setter).  Compute
-/// the contained sub-rect inside the cell bounds; outside this sub-rect
-/// render the constant `bar_color` (black) so letterbox/pillarbox areas
-/// stay opaque against the COSMIC panel background.
-fn contained_uv(frag: vec2<f32>) -> vec2<f32> {
-    let cell_aspect = uniforms.sc_w / uniforms.sc_h;
-    let tex_aspect = uniforms.tex_w / uniforms.tex_h;
-
-    var contained_x = uniforms.sc_x;
-    var contained_y = uniforms.sc_y;
-    var contained_w = uniforms.sc_w;
-    var contained_h = uniforms.sc_h;
-
-    if cell_aspect > tex_aspect {
-        // Cell is wider than image: pillarbox (fits height, image narrow).
-        contained_w = uniforms.sc_h * tex_aspect;
-        contained_x = uniforms.sc_x + (uniforms.sc_w - contained_w) * 0.5;
-    } else {
-        // Cell is taller than image: letterbox (fits width, image short).
-        contained_h = uniforms.sc_w / tex_aspect;
-        contained_y = uniforms.sc_y + (uniforms.sc_h - contained_h) * 0.5;
-    }
-
+/// Maps a fragment position (physical pixels) to the texture UV to sample,
+/// applying the detail view's zoom/pan transform.
+///
+/// The rendered image is scaled relative to the contain-fit base:
+/// `scale = min(sc_w/tex_w, sc_h/tex_h) * 2^(zoom - 1)`. At `zoom == 1` this
+/// reproduces `ContentFit::Contain` exactly (whole frame visible, letterbox
+/// bars). Each +1 zoom unit doubles the scale, so the frame crosses cover
+/// (image fills the widget, bars gone) at `1 + log2(cover/contain)` and
+/// overflows beyond that — zooming is never confined to the letterbox band.
+/// The image stays centered in the widget, displaced by `pan` physical px.
+fn view_uv(frag: vec2<f32>) -> vec2<f32> {
+    let contain = min(uniforms.sc_w / uniforms.tex_w, uniforms.sc_h / uniforms.tex_h);
+    let scale = contain * exp2(uniforms.zoom - 1.0);
+    let rw = uniforms.tex_w * scale;
+    let rh = uniforms.tex_h * scale;
+    let box_x = uniforms.sc_x + (uniforms.sc_w - rw) * 0.5 + uniforms.pan_x;
+    let box_y = uniforms.sc_y + (uniforms.sc_h - rh) * 0.5 + uniforms.pan_y;
     return vec2<f32>(
-        (frag.x - contained_x) / contained_w,
-        (frag.y - contained_y) / contained_h,
+        (frag.x - box_x) / rw,
+        (frag.y - box_y) / rh,
     );
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let frag = input.position.xy;
-    let uv = contained_uv(frag);
+    let uv = view_uv(frag);
 
     // Sample within [0, 1] (clamped to avoid sampler wrap reads at sub-rect
     // edges when rasterizing across the contained boundary).
@@ -97,7 +94,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let clamped = clamp(exposed, 0.0, 1.0);
     let srgb = linear_to_srgb(clamped);
 
-    // Letterbox/pillarbox bars: outside the contained sub-rect, output
+    // Outside the image rect (letterbox/pillarbox bars at low zoom, or the
+    // edges revealed while panning past the frame at high zoom), output
     // transparent (alpha=0) so the COSMIC panel background shows through.
     // The render pipeline is `BlendState::ALPHA_BLENDING`, so alpha=0 lets
     // the prior framebuffer contents pass through.

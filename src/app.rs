@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
+use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
 use crate::exposure_shader;
 use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
@@ -10,7 +11,7 @@ use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
-use cosmic::iced::{Alignment, ContentFit, Length, Subscription};
+use cosmic::iced::{Alignment, ContentFit, Length, Point, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, nav_bar};
 use std::collections::HashMap;
@@ -39,6 +40,10 @@ const TILE_ASPECT: f32 = 1.0;
 /// decode holds one full-resolution RAW buffer until it finishes downscaling)
 /// to a few dozen hundred MB, not the whole roll.
 const MAX_CONCURRENT_THUMBS: usize = 4;
+
+/// Maximum detail-view zoom in `log2` units: 1.0 = contain fit, each +1
+/// doubles the rendered scale, so this caps at 2^6 = 64× the fit scale.
+const MAX_DETAIL_ZOOM: f32 = 7.0;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -77,6 +82,16 @@ pub struct AppModel {
     detail_last_frame: Option<Instant>,
     /// Cached thumbnail kept visible over the shader during crossfade.
     detail_thumb: Option<Handle>,
+    /// Detail-view zoom in `log2` units: 1.0 = contain fit (whole frame),
+    /// each +1 doubles the rendered scale.
+    detail_zoom: f32,
+    /// Pan offset of the image center from the widget center (logical points).
+    detail_pan: (f32, f32),
+    /// True while the user is pressing/dragging the detail preview (grab-pan).
+    detail_panning: bool,
+    /// Most recent cursor position over the detail preview, widget-relative
+    /// logical points; anchors wheel-zoom at the cursor.
+    detail_cursor: Option<Point>,
     /// Exposure compensation in EV (−3.00 to +3.00).
     exposure_ev: f32,
     /// Monotonic counter incremented each time a new detail decode finishes;
@@ -120,6 +135,16 @@ pub enum Message {
     DetailFadeTick,
     /// The user moved the exposure slider.
     ExposureChanged(f32),
+    /// Wheel-scroll zoom in the detail view; payload is the change in zoom
+    /// units (log2 of the scale ratio), positive = zoom in, negative = out.
+    DetailZoom(f32),
+    /// The user pressed the mouse on the detail preview — grab-pan begins.
+    DetailPanPress,
+    /// The cursor moved over the detail preview; while panning this shifts
+    /// the image. Carries the widget-relative cursor position (logical points).
+    DetailPanMove(Point),
+    /// The mouse was released or left the preview — grab-pan ends.
+    DetailPanRelease,
     /// Flush the in-memory roll edits to the manifest file on disk.
     EditSave,
     /// Consume an input event without acting on it, blocking the grid
@@ -216,6 +241,10 @@ impl cosmic::Application for AppModel {
             detail_thumb_opacity: 1.0,
             detail_last_frame: None,
             detail_thumb: None,
+            detail_zoom: 1.0,
+            detail_pan: (0.0, 0.0),
+            detail_panning: false,
+            detail_cursor: None,
             exposure_ev: 0.0,
             next_image_id: 0,
         };
@@ -436,6 +465,7 @@ impl cosmic::Application for AppModel {
     ///
     /// Tasks may be returned for asynchronous execution of code in the background
     /// on the application's async runtime.
+    #[allow(clippy::too_many_lines)] // Message dispatch; arms stay inline for readability.
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::DetailClosed => {
@@ -489,6 +519,44 @@ impl cosmic::Application for AppModel {
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_exposure(ev);
                 }
+                Task::none()
+            }
+
+            Message::DetailZoom(delta) => {
+                let (new_zoom, new_pan) =
+                    apply_detail_zoom(self.detail_zoom, self.detail_pan, self.detail_cursor, delta);
+                self.detail_zoom = new_zoom;
+                self.detail_pan = new_pan;
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_view(new_zoom, new_pan);
+                }
+                Task::none()
+            }
+
+            Message::DetailPanPress => {
+                self.detail_panning = true;
+                Task::none()
+            }
+
+            Message::DetailPanMove(pt) => {
+                let prev = self.detail_cursor;
+                self.detail_cursor = Some(pt);
+                if self.detail_panning
+                    && let Some(prev) = prev
+                {
+                    // Grab-pan: the image follows the cursor 1:1 in logical
+                    // points, independent of zoom.
+                    self.detail_pan.0 += pt.x - prev.x;
+                    self.detail_pan.1 += pt.y - prev.y;
+                    if let Some(shader) = &mut self.detail_shader {
+                        shader.set_view(self.detail_zoom, self.detail_pan);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::DetailPanRelease => {
+                self.detail_panning = false;
                 Task::none()
             }
 
@@ -662,12 +730,16 @@ impl AppModel {
         cosmic::task::future(decode_detail(name))
     }
 
-    /// Reset all detail-view buffers and crossfade state.
+    /// Reset all detail-view buffers, crossfade state, and view transform.
     fn clear_detail(&mut self) {
         self.detail_shader = None;
         self.detail_thumb_opacity = 1.0;
         self.detail_last_frame = None;
         self.detail_thumb = None;
+        self.detail_zoom = 1.0;
+        self.detail_pan = (0.0, 0.0);
+        self.detail_panning = false;
+        self.detail_cursor = None;
         self.exposure_ev = 0.0;
     }
 
@@ -716,6 +788,11 @@ impl AppModel {
                     self.exposure_ev,
                     image_id,
                 ));
+                // Carry over any zoom/pan the user applied while the decode
+                // was in flight (the program starts at contain fit).
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_view(self.detail_zoom, self.detail_pan);
+                }
             }
             self.detail_thumb_opacity = 1.0;
             self.detail_last_frame = None;
@@ -892,14 +969,82 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     Some(
         widget::column::with_capacity(2)
             .push(
-                widget::container(preview)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
+                // Interactive surface for the preview: wheel zooms, press+drag
+                // pans. The outer full-surface `MouseArea` in `view` still
+                // swallows events over the caption/bars and blocks the grid
+                // behind; iced delivers to the inner widget first, so its
+                // `capture_event()` wins and the outer handlers are skipped.
+                // `DetailArea.on_move` reports cursor positions relative to
+                // the widget center, matching the center-relative pan offset
+                // the zoom-anchor math compares against.
+                DetailArea::new(
+                    widget::container(preview)
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .on_scroll(|delta| Message::DetailZoom(detail_zoom_delta(delta)))
+                .on_press(Message::DetailPanPress)
+                .on_move(Message::DetailPanMove)
+                .on_release(Message::DetailPanRelease),
             )
             .push(widget::text(name))
             .spacing(space_s)
             .align_x(Horizontal::Center)
             .into(),
+    )
+}
+
+/// Converts a wheel scroll delta into a detail-view zoom change (in `log2`
+/// units, so +1 = double the rendered scale, −1 = halve it).
+///
+/// A single wheel notch (one line) zooms half a unit; trackpad pixel deltas
+/// treat a ~400 px swipe as one full unit.
+fn detail_zoom_delta(delta: cosmic::iced::mouse::ScrollDelta) -> f32 {
+    match delta {
+        cosmic::iced::mouse::ScrollDelta::Lines { y, .. } => y * 0.5,
+        cosmic::iced::mouse::ScrollDelta::Pixels { y, .. } => y / 400.0,
+    }
+}
+
+/// Applies a wheel zoom `delta` (log2 units) to the detail view, clamping to
+/// `[1.0, MAX_DETAIL_ZOOM]`. Zooming all the way back out to contain fit
+/// re-centers the image. Returns the new `(zoom, pan)`.
+fn apply_detail_zoom(
+    zoom: f32,
+    pan: (f32, f32),
+    cursor: Option<Point>,
+    delta: f32,
+) -> (f32, (f32, f32)) {
+    let new_zoom = (zoom + delta).clamp(1.0, MAX_DETAIL_ZOOM);
+    // At contain fit the whole frame must be centered. `zoom + delta <= 1.0`
+    // is equivalent to `new_zoom == 1.0` because of the clamp above.
+    let new_pan = if zoom + delta <= 1.0 {
+        (0.0, 0.0)
+    } else {
+        cursor.map_or(pan, |cursor| zoom_about_anchor(zoom, new_zoom, pan, cursor))
+    };
+    (new_zoom, new_pan)
+}
+
+/// Computes the pan that keeps the image point under `cursor` fixed on
+/// screen while the zoom changes from `zoom_old` to `zoom_new` (log2 units).
+///
+/// The rendered size is proportional to `2^(zoom-1)`, so the unknown
+/// contain-fit scale cancels:
+/// `off1 = off0 + (1 - 2^(z1-z0)) * (cursor - off0)`.
+/// Both `pan` and `cursor` are relative to the widget center; the widget
+/// center itself never enters the formula.
+fn zoom_about_anchor(
+    zoom_old: f32,
+    zoom_new: f32,
+    pan: (f32, f32),
+    cursor: Point,
+) -> (f32, f32) {
+    let ratio = (zoom_new - zoom_old).exp2();
+    let k = 1.0 - ratio;
+    (
+        pan.0 + k * (cursor.x - pan.0),
+        pan.1 + k * (cursor.y - pan.1),
     )
 }
 
@@ -2104,5 +2249,68 @@ mod tests {
     #[test]
     fn class_gains_keeps_defaults_without_measurable_class() {
         assert_eq!(class_gains([0.1; 4], [true; 4]), [1.0; 4]);
+    }
+
+    #[test]
+    fn apply_detail_zoom_clamps_at_both_ends() {
+        let (zoom, _) = apply_detail_zoom(1.0, (0.0, 0.0), None, -1.0);
+        assert_eq!(zoom, 1.0);
+        let (zoom, _) = apply_detail_zoom(MAX_DETAIL_ZOOM, (0.0, 0.0), None, 9.0);
+        assert_eq!(zoom, MAX_DETAIL_ZOOM);
+    }
+
+    #[test]
+    fn apply_detail_zoom_returns_unchanged_pan_without_cursor() {
+        let (zoom, pan) = apply_detail_zoom(2.0, (13.0, -7.0), None, 0.5);
+        assert!((zoom - 2.5).abs() < 1e-6);
+        assert_eq!(pan, (13.0, -7.0));
+    }
+
+    #[test]
+    fn apply_detail_zoom_recenters_when_back_to_contain_fit() {
+        // Zooming all the way out must give the centered contain view.
+        let (zoom, pan) = apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0);
+        assert_eq!(zoom, 1.0);
+        assert_eq!(pan, (0.0, 0.0));
+    }
+
+    #[test]
+    fn zoom_about_anchor_round_trips() {
+        // Zooming in then back out at the same cursor must return the exact
+        // original pan (the anchored image point is pinned in both steps).
+        let pan = (5.0, 6.0);
+        let cursor = Point::new(-9.0, 4.0);
+        let zoomed = zoom_about_anchor(2.0, 3.0, pan, cursor);
+        let back = zoom_about_anchor(3.0, 2.0, zoomed, cursor);
+        assert!((back.0 - pan.0).abs() < 1e-5);
+        assert!((back.1 - pan.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zoom_about_anchor_keeps_center_pinned_when_cursor_is_center() {
+        // Zooming about the image center (cursor == pan) leaves the pan
+        // unchanged: center of the frame stays center of the widget.
+        let pan = (12.0, -8.0);
+        let out = zoom_about_anchor(2.0, 4.0, pan, Point::new(12.0, -8.0));
+        assert!((out.0 - pan.0).abs() < 1e-5);
+        assert!((out.1 - pan.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zoom_about_anchor_is_identity_at_delta_zero() {
+        let pan = (5.0, 6.0);
+        let out = zoom_about_anchor(2.0, 2.0, pan, Point::new(-9.0, 4.0));
+        assert!((out.0 - pan.0).abs() < 1e-6);
+        assert!((out.1 - pan.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn detail_zoom_delta_converts_scroll_units() {
+        let lines = cosmic::iced::mouse::ScrollDelta::Lines { x: 0.0, y: 2.0 };
+        assert!((detail_zoom_delta(lines) - 1.0).abs() < 1e-6);
+        let pixels = cosmic::iced::mouse::ScrollDelta::Pixels { x: 0.0, y: 400.0 };
+        assert!((detail_zoom_delta(pixels) - 1.0).abs() < 1e-6);
+        let up = cosmic::iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 };
+        assert!((detail_zoom_delta(up) + 0.5).abs() < 1e-6);
     }
 }
