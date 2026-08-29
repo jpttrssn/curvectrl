@@ -27,7 +27,7 @@ const THUMB_SIZE: f32 = 384.0;
 ///
 /// Sharp at typical window sizes while keeping the decoded buffer a fraction
 /// of a full sensor frame.
-const HI_RES_SIZE: f32 = 2048.0;
+const HI_RES_SIZE: u32 = 2048;
 /// Opacity units per second for the hi-res crossfade (~0.2 s full ramp).
 const FADE_SPEED: f32 = 5.0;
 /// Aspect ratio (width / height) of the image area of a Page 1 tile.
@@ -44,6 +44,16 @@ const MAX_CONCURRENT_THUMBS: usize = 4;
 /// Maximum detail-view zoom in `log2` units: 1.0 = contain fit, each +1
 /// doubles the rendered scale, so this caps at 2^6 = 64× the fit scale.
 const MAX_DETAIL_ZOOM: f32 = 7.0;
+
+/// Detail-view zoom (log2 units) at which the native hi-res decode is
+/// triggered. 2.0 = 2× contain: safely past the 2048 overview's own 1:1 on
+/// typical widgets, before the view has upscaled 2048 pixels far enough to
+/// look soft.
+const NATIVE_ZOOM_THRESHOLD: f32 = 2.0;
+
+/// wgpu's typical `max_texture_dimension_2d` ceiling. The native level-up
+/// caps its target at this so a >8K sensor never asks for an oversized upload.
+const MAX_TEXTURE_EDGE: u32 = 8192;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -76,6 +86,10 @@ pub struct AppModel {
     detail_shader: Option<exposure_shader::ExposureProgram>,
     /// File handed to the one permitted in-flight hi-res detail decode.
     detail_inflight: Option<String>,
+    /// True once the native-resolution decode has been requested or found
+    /// unnecessary (sensor already ≤ the overview size); guards the zoom
+    /// trigger against re-spawning a level-up on every wheel event.
+    detail_native_queued: bool,
     /// Current opacity of the thumbnail layer during crossfade (1.0→0.0).
     detail_thumb_opacity: f32,
     /// Timestamp of the last animation frame for framerate-independent fading.
@@ -134,7 +148,7 @@ pub enum Message {
     DetailClosed,
     /// A hi-res decode for the detail view finished, returning the linear
     /// pre-sRGB mono buffer for the GPU shader.
-    DetailReady(String, Result<(Vec<f32>, u32, u32), ()>),
+    DetailReady(String, Result<(Vec<f32>, u32, u32, u32), ()>),
     FilesLoaded(Vec<String>),
     LaunchUrl(String),
     ThumbReady(String, Result<Handle, ()>),
@@ -252,6 +266,7 @@ impl cosmic::Application for AppModel {
             roll: RollManifest::default(),
             detail_shader: None,
             detail_inflight: None,
+            detail_native_queued: false,
             detail_thumb_opacity: 1.0,
             detail_last_frame: None,
             detail_thumb: None,
@@ -546,6 +561,10 @@ detail_pan: (0.0, 0.0),
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_view(new_zoom, new_pan);
                 }
+                // Level up to native once the view crosses the threshold.
+                if self.detail_zoom >= NATIVE_ZOOM_THRESHOLD && !self.detail_native_queued {
+                    return self.decode_detail_next();
+                }
                 Task::none()
             }
 
@@ -746,14 +765,41 @@ impl AppModel {
 
     /// Spawns the hi-res decode behind the detail view when one is due.
     ///
-    /// Only one detail decode is ever in flight: a newer selection simply
-    /// waits for the older request to land, and [`Message::DetailReady`]
-    /// frees the slot before pumping again.
+    /// Two progressive levels share the single in-flight slot: the 2048
+    /// overview while the shader is absent, then a native-resolution re-decode
+    /// once the zoom crosses [`NATIVE_ZOOM_THRESHOLD`] — the flag makes the
+    /// level-up one-shot, and the inflight slot makes extra wheels no-ops.
     fn decode_detail_next(&mut self) -> Task<cosmic::Action<Message>> {
-        if self.detail_inflight.is_some() || self.selected.is_none() || self.detail_shader.is_some()
-        {
+        if self.detail_inflight.is_some() || self.selected.is_none() {
+            if self.detail_inflight.is_some() {
+                detail_trace(format_args!(
+                    "trigger swallowed: inflight slot busy (zoom={:.3})",
+                    self.detail_zoom
+                ));
+            }
             return Task::none();
         }
+
+        // Level 1 is native unless the sensor's long edge exceeds the wgpu
+        // texture ceiling; `resize_area` treats a cap ≥ the source edge as
+        // identity, so ≤8K scans decode at true full resolution.
+        let cap: u32 = if self.detail_shader.is_none() {
+            HI_RES_SIZE
+        } else if !self.detail_native_queued {
+            MAX_TEXTURE_EDGE
+        } else {
+            detail_trace(format_args!(
+                "trigger swallowed: native already queued (zoom={:.3})",
+                self.detail_zoom
+            ));
+            return Task::none();
+        };
+
+        detail_trace(format_args!(
+            "trigger fire: cap={cap}, shader={}, zoom={:.3}",
+            self.detail_shader.is_some(),
+            self.detail_zoom
+        ));
 
         let name = self
             .selected
@@ -761,7 +807,7 @@ impl AppModel {
             .expect("selected when a decode is due");
         self.detail_inflight = Some(name.clone());
 
-        cosmic::task::future(decode_detail(name))
+        cosmic::task::future(decode_detail(name, cap))
     }
 
     /// Reset all detail-view buffers, crossfade state, the view transform, and
@@ -772,6 +818,7 @@ impl AppModel {
         self.detail_last_frame = None;
         self.detail_thumb = None;
         self.detail_zoom = 1.0;
+        self.detail_native_queued = false;
         self.detail_pan = (0.0, 0.0);
         self.detail_panning = false;
         self.detail_cursor = None;
@@ -795,47 +842,98 @@ impl AppModel {
     fn handle_detail_ready(
         &mut self,
         name: &str,
-        result: Result<(Vec<f32>, u32, u32), ()>,
+        result: Result<(Vec<f32>, u32, u32, u32), ()>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
             self.selected.as_deref(),
             self.detail_inflight.as_deref(),
             name,
         ) {
-            if let Ok((mono, width, height)) = result {
-                // Cache the current thumbnail so it stays visible
-                // over the shader during the crossfade.
-                if let Some(tile) =
-                    self.tiles
-                        .iter()
-                        .find(|t| t.name == name)
-                        .and_then(|t| match &t.thumb {
-                            Thumb::Ready(h) => Some(h.clone()),
-                            _ => None,
-                        })
-                {
-                    self.detail_thumb = Some(tile);
+            // Only the first load of an image restarts the thumbnail
+            // crossfade; a native level-up swap must not re-flash the
+            // (normally faded) thumb over the fresh hi-res texture.
+            let fresh_open = self.detail_shader.is_none();
+            let mut landed = false;
+            match result {
+                Ok((mono, width, height, src_long_edge)) => {
+                    landed = true;
+                    detail_trace(format_args!(
+                        "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
+                        width,
+                        height,
+                        self.detail_zoom
+                    ));
+                    // Cache the current thumbnail so it stays visible over the
+                    // shader during the crossfade (first load only — a level-up
+                    // swap must not re-insert the faded thumb).
+                    if fresh_open
+                        && let Some(tile) = self
+                            .tiles
+                            .iter()
+                            .find(|t| t.name == name)
+                            .and_then(|t| match &t.thumb {
+                                Thumb::Ready(h) => Some(h.clone()),
+                                _ => None,
+                            })
+                    {
+                        self.detail_thumb = Some(tile);
+                    }
+                    let image_id = self.next_image_id;
+                    self.next_image_id = self.next_image_id.wrapping_add(1);
+                    self.detail_shader = Some(exposure_shader::ExposureProgram::new(
+                        mono,
+                        width,
+                        height,
+                        self.exposure_ev,
+                        image_id,
+                    ));
+                    // Carry over any zoom/pan the user applied while the decode
+                    // was in flight (the program starts at contain fit).
+                    if let Some(shader) = &mut self.detail_shader {
+                        shader.set_view(self.detail_zoom, self.detail_pan);
+                        shader.set_curve(self.curve_contrast, self.curve_rolloff);
+                    }
+                    // The level-up is one-shot: a decode that lands after the
+                    // first shader IS the native one, and an overview that was
+                    // decoded at its native resolution (sensor long edge ≤
+                    // `HI_RES_SIZE`) is already full-res — in both cases there
+                    // is nothing more to decode. The sensor's true long edge
+                    // (post-crop, pre-downscale) is the source of truth here,
+                    // NOT the capped overview width: a large sensor downscaled
+                    // just under 2048 must still level up to native.
+                    if !fresh_open || src_long_edge <= HI_RES_SIZE {
+                        self.detail_native_queued = true;
+                    }
                 }
-                let image_id = self.next_image_id;
-                self.next_image_id = self.next_image_id.wrapping_add(1);
-                self.detail_shader = Some(exposure_shader::ExposureProgram::new(
-                    mono,
-                    width,
-                    height,
-                    self.exposure_ev,
-                    image_id,
-                ));
-                // Carry over any zoom/pan the user applied while the decode
-                // was in flight (the program starts at contain fit).
-                if let Some(shader) = &mut self.detail_shader {
-                    shader.set_view(self.detail_zoom, self.detail_pan);
-                    shader.set_curve(self.curve_contrast, self.curve_rolloff);
+                Err(()) => {
+                    detail_trace(format_args!(
+                        "arrived err: {name}, fresh={fresh_open}, zoom={:.3}",
+                        self.detail_zoom
+                    ));
                 }
             }
-            self.detail_thumb_opacity = 1.0;
-            self.detail_last_frame = None;
+            if fresh_open {
+                self.detail_thumb_opacity = 1.0;
+                self.detail_last_frame = None;
+            }
             self.detail_inflight = None;
+
+            // Landing-time re-pump: a wheel taken while a decode was running
+            // fired the trigger into an occupied slot and it was swallowed.
+            // If the user is already past the threshold once a decode lands,
+            // start the next level onto the just-freed slot — so zooming
+            // during the overview load still reaches native. Gated on the
+            // landing having succeeded: an error must not spin the slot.
+            if landed && !self.detail_native_queued && self.detail_zoom >= NATIVE_ZOOM_THRESHOLD {
+                detail_trace(format_args!(
+                    "landing re-pump: zoom {:.3} >= {NATIVE_ZOOM_THRESHOLD}",
+                    self.detail_zoom
+                ));
+                return self.decode_detail_next();
+            }
         } else {
+            detail_trace(format_args!("arrived superseded: {name}"));
+
             // A superseded decode finished and freed the single slot;
             // start the current selection's queued request, if any.
             self.detail_inflight = None;
@@ -844,6 +942,18 @@ impl AppModel {
         }
 
         Task::none()
+    }
+}
+
+/// Logs a detail-pump trace line while `EXPOSURE_TRACE_DETAIL` is set.
+///
+/// Gated on the env var (read per call, so the default build pays nothing)
+/// and allocation-free via [`std::fmt::Arguments`]; used to diagnose the
+/// progressive two-level detail decode — trigger fire/swallow, arrival, and
+/// landing re-pump.
+fn detail_trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var("EXPOSURE_TRACE_DETAIL").is_ok() {
+        eprintln!("[detail] {args}");
     }
 }
 
@@ -1132,17 +1242,27 @@ async fn decode_thumbnail(name: String, exposure_ev: f32) -> Message {
 
 /// Decodes a RAW file from the pictures directory into a hi-res message for
 /// the detail view, returning the oriented linear mono data that the GPU
-/// shader uploads and applies exposure to.
-async fn decode_detail(name: String) -> Message {
-    let result = decode_raw_detail(name.clone()).await;
+/// shader uploads and applies exposure to.  `max_edge` caps the long edge in
+/// pixels; the overview level uses [`HI_RES_SIZE`], the native level-up
+/// [`MAX_TEXTURE_EDGE`].
+async fn decode_detail(name: String, max_edge: u32) -> Message {
+    let result = decode_raw_detail(name.clone(), max_edge).await;
     Message::DetailReady(name, result)
 }
 
 /// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
 /// returning linear `mono` (post-downscale, post-unsharp) oriented to display
 /// upright.  The GPU shader applies exposure and sRGB encoding per frame.
+/// `max_edge` is the downscale target for the long edge before unsharp.
+///
+/// The last tuple field is the sensor's true long edge AFTER cropping but
+/// BEFORE the downscale — i.e. the real native long edge the overview was
+/// scaled down from (< `max_edge` means the overview is already full-res).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-async fn decode_raw_detail(name: String) -> Result<(Vec<f32>, u32, u32), ()> {
+async fn decode_raw_detail(
+    name: String,
+    max_edge: u32,
+) -> Result<(Vec<f32>, u32, u32, u32), ()> {
     let Ok(home) = std::env::var("HOME") else {
         return Err(());
     };
@@ -1164,6 +1284,8 @@ async fn decode_raw_detail(name: String) -> Result<(Vec<f32>, u32, u32), ()> {
             Some(cropped) => cropped,
             None => (normalized, width, height),
         };
+
+        let src_long_edge = u32::max(width as u32, height as u32);
 
         let (mut mono, width, height) = if image.cpp >= 3 {
             if samples.len() < width * height * 3 {
@@ -1194,14 +1316,14 @@ async fn decode_raw_detail(name: String) -> Result<(Vec<f32>, u32, u32), ()> {
         invert_gray(&mut mono, &ACTIVE_STOCK, base);
 
         let (mono, width, height) =
-            resize_area(&mono, width as u32, height as u32, HI_RES_SIZE as u32, 1);
+            resize_area(&mono, width as u32, height as u32, max_edge, 1);
 
         let mut mono = mono;
         unsharp_mask(&mut mono, width as usize, height as usize);
 
         let (oriented, width, height) = orient_mono(&mono, width, height, image.orientation);
 
-        Ok((oriented, width, height))
+        Ok((oriented, width, height, src_long_edge))
     })
     .await
     .unwrap_or(Err(()))
