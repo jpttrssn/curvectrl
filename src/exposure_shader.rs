@@ -35,12 +35,18 @@ pub struct ExposureProgram {
     /// 98th percentile of the uploaded positive: the white point the
     /// highlight-rolloff curve pivots around.
     white: f32,
+    /// 10th percentile of the uploaded positive: the shadow anchor the
+    /// shadows curve pivots around. Measured once at construction from `mono`.
+    shadow: f32,
     /// Contrast power `kc`: the live tone curve pivots at `mid`,
     /// `C(p) = mid^(1-kc) * p^kc`. `1.0` = identity (no contrast change).
     contrast: f32,
     /// Highlight-rolloff power `kr`: the live tone curve pivots at `white`,
     /// `R(p) = white^(1-kr) * p^kr`. `1.0` = identity.
     rolloff: f32,
+    /// Shadows power `ks`: the live tone curve pivots at `shadow`,
+    /// `S(p) = shadow^(1-ks) * p^ks`. `1.0` = identity.
+    shadows: f32,
     /// Monotonic id bumped by the app model on each new detail decode. Used
     /// to detect image changes and rebuild the GPU texture/bind group.
     image_id: u64,
@@ -52,10 +58,10 @@ impl ExposureProgram {
     /// `mono` is linear, inverted-positive pre-sRGB data (one `f32` per pixel,
     /// row-major, top-to-bottom). `exposure` is the raw EV value; the gain
     /// sent to the GPU is `2^EV`. The view starts at contain fit (zoom 1.0,
-    /// no pan) with an identity tone curve. The mid-gray and white-point
-    /// pivots are measured from `mono` once here.
+    /// no pan) with an identity tone curve. The
+    /// shadow/mid-gray/white-point pivots are measured from `mono` once here.
     pub fn new(mono: Vec<f32>, width: u32, height: u32, exposure: f32, image_id: u64) -> Self {
-        let (mid, white) = tone_anchors(&mono);
+        let (shadow, mid, white) = tone_anchors(&mono);
         Self {
             mono,
             width,
@@ -65,8 +71,10 @@ impl ExposureProgram {
             pan: (0.0, 0.0),
             mid,
             white,
+            shadow,
             contrast: 1.0,
             rolloff: 1.0,
+            shadows: 1.0,
             image_id,
         }
     }
@@ -85,16 +93,18 @@ impl ExposureProgram {
         self.pan = pan;
     }
 
-    /// Update the contrast/rolloff tone curve (called on editing drawer
-    /// sliders). Only the two remap uniforms change — the uploaded texture
-    /// stays the fixed render, re-curved per pixel in WGSL.
+    /// Update the contrast/rolloff/shadows tone curve (called on editing
+    /// drawer sliders). Only the two remap uniforms change — the uploaded
+    /// texture stays the fixed render, re-curved per pixel in WGSL.
     ///
-    /// `contrast` pivots the curve at the image's measured mid-gray (`1.0` =
-    /// identity); `rolloff` pivots at the measured white point (`1.0` =
-    /// identity).
-    pub fn set_curve(&mut self, contrast: f32, rolloff: f32) {
+    /// `contrast` pivots at the image's measured mid-gray, `rolloff` at the
+    /// measured white point, `shadows` at the measured 10th-percentile shadow
+    /// anchor (`1.0` = identity for each); all three compose into the single
+    /// `ratio * p^exp` remap the shader applies.
+    pub fn set_curve(&mut self, contrast: f32, rolloff: f32, shadows: f32) {
         self.contrast = contrast;
         self.rolloff = rolloff;
+        self.shadows = shadows;
     }
 
     /// Wrap in a `Shader` widget sized to fill the parent.
@@ -116,8 +126,10 @@ impl Clone for ExposureProgram {
             pan: self.pan,
             mid: self.mid,
             white: self.white,
+            shadow: self.shadow,
             contrast: self.contrast,
             rolloff: self.rolloff,
+            shadows: self.shadows,
             image_id: self.image_id,
         }
     }
@@ -133,8 +145,10 @@ impl std::fmt::Debug for ExposureProgram {
             .field("pan", &self.pan)
             .field("mid", &self.mid)
             .field("white", &self.white)
+            .field("shadow", &self.shadow)
             .field("contrast", &self.contrast)
             .field("rolloff", &self.rolloff)
+            .field("shadows", &self.shadows)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
             .finish()
@@ -162,8 +176,10 @@ impl<M> Program<M> for ExposureProgram {
             pan: self.pan,
             mid: self.mid,
             white: self.white,
+            shadow: self.shadow,
             contrast: self.contrast,
             rolloff: self.rolloff,
+            shadows: self.shadows,
             width: self.width,
             height: self.height,
             image_id: self.image_id,
@@ -185,9 +201,10 @@ const ANCHOR_BINS: usize = 4096;
 pub(crate) const MIN_ANCHOR: f32 = 1e-3;
 
 /// Measure the tone anchors a pivoted curve needs, from the uploaded positive
-/// (`p` in [0,1]): the median (a stable mid-gray) and the 98th percentile
-/// (a robust white point, insensitive to a few hot specular pixels). Single
-/// pass over the mono, O(n) — no sort of a 2048² buffer.
+/// (`p` in [0,1]): the 10th percentile (the shadow anchor, robust against a
+/// few pure-black pixels), the median (a stable mid-gray), and the 98th
+/// percentile (a robust white point, insensitive to a few hot specular
+/// pixels). Single pass over the mono, O(n) — no sort of a 2048² buffer.
 ///
 /// `pub(crate)` so the CPU thumbnail bake reuses the same anchor machinery the
 /// detail shader does, keeping grid and detail measurements aligned.
@@ -196,7 +213,7 @@ pub(crate) const MIN_ANCHOR: f32 = 1e-3;
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-pub(crate) fn tone_anchors(mono: &[f32]) -> (f32, f32) {
+pub(crate) fn tone_anchors(mono: &[f32]) -> (f32, f32, f32) {
     // Heap-allocated (4096 × u64 ≈ 32 KB would trip `large_stack_arrays`).
     let mut bins = vec![0_u64; ANCHOR_BINS];
     for &v in mono {
@@ -208,13 +225,18 @@ pub(crate) fn tone_anchors(mono: &[f32]) -> (f32, f32) {
     }
 
     if mono.is_empty() {
-        return (MIN_ANCHOR, MIN_ANCHOR);
+        return (MIN_ANCHOR, MIN_ANCHOR, MIN_ANCHOR);
     }
 
     let total = mono.len();
+    let shadow = percentile(&bins, total, 0.10);
     let mid = percentile(&bins, total, 0.5);
     let white = percentile(&bins, total, 0.98);
-    (mid.max(MIN_ANCHOR), white.max(MIN_ANCHOR))
+    (
+        shadow.max(MIN_ANCHOR),
+        mid.max(MIN_ANCHOR),
+        white.max(MIN_ANCHOR),
+    )
 }
 
 /// The value of the `q`-quantile (0..=1) of the bin counts, as a coordinate
@@ -240,22 +262,36 @@ fn percentile(bins: &[u64], total: usize, q: f32) -> f32 {
 
 /// Precompute the per-frame tone remap `T(p) = clamp(ratio * p^exp, 0, 1)`.
 ///
-/// Contrast and rolloff are power curves pivoted at the image's measured
-/// mid-gray (`mid`) and white point (`white`):
+/// Contrast, rolloff, and shadows are power curves pivoted at the image's
+/// measured mid-gray (`mid`), white point (`white`), and shadow anchor
+/// (`shadow`):
 ///
-/// `C(p) = mid^(1-kc) · p^kc`  (pivot at `mid`: `C(mid) = mid`)
-/// `R(p) = white^(1-kr) · p^kr` (pivot at `white`: `R(white) = white`)
+/// `C(p) = mid^(1-kc) · p^kc`          (pivot at `mid`: `C(mid) = mid`)
+/// `R(p) = white^(1-kr) · p^kr`         (pivot at `white`: `R(white) = white`)
+/// `S(p) = shadow^(1-ks) · p^ks`        (pivot at `shadow`: `S(shadow) =
+///                                                    shadow`)
 ///
-/// Two monotone powers compose exactly into one power, so both fit a single
-/// `(ratio, exp)` pair the WGSL shader applies as `ratio·p^exp`. At
-/// `kc = kr = 1` the remap is the identity (`ratio^... = 1`, `exp = 1`), so
-/// untouched renders stay byte-identical.
+/// Three monotone powers compose exactly into one power, so all three fit a
+/// single `(ratio, exp)` pair the WGSL shader applies as `ratio·p^exp`:
+/// `S∘R∘C(p) = (shadow^(1-ks) · white^(ks(1-kr)) · mid^(ks·kr(1-kc))) · p^(kc·kr·ks)`.
+/// At `kc = kr = ks = 1` the remap is the identity (`ratio = 1`, `exp = 1`),
+/// so untouched renders stay byte-identical.
 ///
 /// `pub(crate)` — the shared helper the CPU thumbnail bake reuses so grid and
 /// detail agree, alongside the GPU `prepare()` fold.
-pub(crate) fn curve_remap(contrast: f32, rolloff: f32, mid: f32, white: f32) -> (f32, f32) {
-    let ratio = white.powf(1.0 - rolloff) * mid.powf(rolloff * (1.0 - contrast));
-    let exponent = contrast * rolloff;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn curve_remap(
+    contrast: f32,
+    rolloff: f32,
+    shadows: f32,
+    shadow: f32,
+    mid: f32,
+    white: f32,
+) -> (f32, f32) {
+    let ratio = shadow.powf(1.0 - shadows)
+        * white.powf(shadows * (1.0 - rolloff))
+        * mid.powf(shadows * rolloff * (1.0 - contrast));
+    let exponent = contrast * rolloff * shadows;
     (ratio, exponent)
 }
 
@@ -265,17 +301,21 @@ pub(crate) fn curve_remap(contrast: f32, rolloff: f32, mid: f32, white: f32) -> 
 /// This is the CPU twin of the WGSL's `clamp(curve_ratio * pow(p, curve_exp),
 /// 0, 1)` — the exact expression the grid thumbnail bake must match so a
 /// baked tile and the detail shader produce identical tones. Identity at the
-/// `(1.0, 1.0)` defaults; `mid`/`white` are the same anchors [`tone_anchors`]
-/// measures. A separate op from exposure (which the shader applies after), so
-/// callers must apply this *before* the `2^EV` gain to mirror the shader.
+/// `(1.0, 1.0, 1.0)` defaults; `shadow`/`mid`/`white` are the same anchors
+/// [`tone_anchors`] measures. A separate op from exposure (which the shader
+/// applies after), so callers must apply this *before* the `2^EV` gain to
+/// mirror the shader.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_curve(
     mono: &mut [f32],
     contrast: f32,
     rolloff: f32,
+    shadows: f32,
+    shadow: f32,
     mid: f32,
     white: f32,
 ) {
-    let (ratio, exponent) = curve_remap(contrast, rolloff, mid, white);
+    let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
     for value in mono.iter_mut() {
         *value = (ratio * value.powf(exponent)).clamp(0.0, 1.0);
     }
@@ -303,10 +343,14 @@ pub struct ExposurePrimitive {
     mid: f32,
     /// White-point pivot (98th percentile of the positive).
     white: f32,
+    /// Shadow anchor (10th percentile of the positive).
+    shadow: f32,
     /// Contrast power (pivots at `mid`; 1.0 = identity).
     contrast: f32,
     /// Highlight-rolloff power (pivots at `white`; 1.0 = identity).
     rolloff: f32,
+    /// Shadows power (pivots at `shadow`; 1.0 = identity).
+    shadows: f32,
     width: u32,
     height: u32,
     image_id: u64,
@@ -408,10 +452,12 @@ impl Primitive for ExposurePrimitive {
         #[allow(clippy::cast_precision_loss)]
         let tex_h = self.height as f32;
         // Live tone remap: contrast pivots at the measured mid-gray, highlight
-        // rolloff at the measured white point. Composed on the CPU into one
-        // `ratio · p^exp`; identity at the 1.0 defaults, so untouched renders
-        // stay byte-identical to the pre-curve pass.
-        let (curve_ratio, curve_exp) = curve_remap(self.contrast, self.rolloff, self.mid, self.white);
+        // rolloff at the measured white point, shadows at the measured shadow
+        // anchor. Composed on the CPU into one `ratio · p^exp`; identity at
+        // the 1.0 defaults, so untouched renders stay byte-identical to the
+        // pre-curve pass.
+        let (curve_ratio, curve_exp) =
+            curve_remap(self.contrast, self.rolloff, self.shadows, self.shadow, self.mid, self.white);
         let uniforms = Uniforms {
             // Convert raw EV (slider value) to linear-light gain once per
             // frame; the WGSL shader reads this as a direct multiplier.
@@ -679,11 +725,12 @@ struct Uniforms {
     /// Pan offset in physical pixels (logical points × scale factor).
     pan_x: f32,
     pan_y: f32,
-    /// Tone-curve ratio: contrast/rolloff power curves (pivoted at the image's
-    /// measured mid-gray and white point) composed into a single `ratio·p^exp`
-    /// pair. `(1.0, 1.0)` is the identity — untouched renders are unchanged.
+    /// Tone-curve ratio: contrast/rolloff/shadows power curves (pivoted at the
+    /// image's measured mid-gray, white point, and shadow anchor) composed
+    /// into a single `ratio·p^exp` pair. `(1.0, 1.0)` is the identity —
+    /// untouched renders are unchanged.
     curve_ratio: f32,
-    /// Tone-curve exponent; `exp = contrast · rolloff`.
+    /// Tone-curve exponent; `exp = contrast · rolloff · shadows`.
     curve_exp: f32,
 }
 
@@ -816,16 +863,16 @@ mod tests {
 
     #[test]
     fn curve_remap_is_identity_at_defaults() {
-        let (ratio, exponent) = curve_remap(1.0, 1.0, 0.4, 0.92);
+        let (ratio, exponent) = curve_remap(1.0, 1.0, 1.0, 0.2, 0.4, 0.92);
         assert!((ratio - 1.0).abs() < 1e-6);
         assert!((exponent - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn contrast_pivots_around_the_image_midgray() {
-        let (mid, white) = (0.4_f32, 0.92_f32);
+        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
         for kc in [0.6_f32, 1.3] {
-            let (ratio, exponent) = curve_remap(kc, 1.0, mid, white);
+            let (ratio, exponent) = curve_remap(kc, 1.0, 1.0, shadow, mid, white);
             let t_mid = (ratio * mid.powf(exponent)).clamp(0.0, 1.0);
             assert!((t_mid - mid).abs() < 1e-5, "contrast {kc}: T(mid) = {t_mid}");
         }
@@ -833,26 +880,41 @@ mod tests {
 
     #[test]
     fn rolloff_pivots_around_the_image_white_point() {
-        let (mid, white) = (0.4_f32, 0.92_f32);
+        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
         for kr in [0.6_f32, 1.3] {
-            let (ratio, exponent) = curve_remap(1.0, kr, mid, white);
+            let (ratio, exponent) = curve_remap(1.0, kr, 1.0, shadow, mid, white);
             let t_white = (ratio * white.powf(exponent)).clamp(0.0, 1.0);
             assert!((t_white - white).abs() < 1e-5, "rolloff {kr}: T(white) = {t_white}");
         }
     }
 
     #[test]
-    fn curve_remap_composes_the_two_pivots_exactly() {
-        // Applying the rolloff power after the contrast power must equal the
-        // single (ratio, exp) the shader applies — the composition is exact
-        // for the underlying power functions. The shader applies one final
-        // clamp (never an intermediate one), so compare raw then both-clamped.
-        let (mid, white) = (0.4_f32, 0.92_f32);
-        let (kc, kr) = (1.25_f32, 0.75_f32);
-        let (ratio, exponent) = curve_remap(kc, kr, mid, white);
-        for p in [0.0_f32, 0.12, 0.4, 0.6, 0.92, 1.0] {
+    fn shadows_pivots_around_the_image_shadow_anchor() {
+        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
+        for ks in [0.6_f32, 1.3] {
+            let (ratio, exponent) = curve_remap(1.0, 1.0, ks, shadow, mid, white);
+            let t_shadow = (ratio * shadow.powf(exponent)).clamp(0.0, 1.0);
+            assert!(
+                (t_shadow - shadow).abs() < 1e-5,
+                "shadows {ks}: T(shadow) = {t_shadow}"
+            );
+        }
+    }
+
+    #[test]
+    fn curve_remap_composes_the_three_pivots_exactly() {
+        // Applying the rolloff and shadows powers after the contrast power must
+        // equal the single (ratio, exp) the shader applies — the composition is
+        // exact for the underlying power functions. The shader applies one
+        // final clamp (never an intermediate one), so compare raw then
+        // both-clamped.
+        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
+        let (kc, kr, ks) = (1.25_f32, 0.75_f32, 1.4_f32);
+        let (ratio, exponent) = curve_remap(kc, kr, ks, shadow, mid, white);
+        for p in [0.0_f32, 0.05, 0.15, 0.4, 0.6, 0.92, 1.0] {
             let c = mid.powf(1.0 - kc) * p.powf(kc);
-            let sequential = white.powf(1.0 - kr) * c.powf(kr);
+            let r = white.powf(1.0 - kr) * c.powf(kr);
+            let sequential = shadow.powf(1.0 - ks) * r.powf(ks);
             let composed = ratio * p.powf(exponent);
             assert!(
                 (sequential - composed).abs() < 1e-4,
@@ -867,16 +929,18 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn tone_anchors_find_median_and_white_on_a_known_ramp() {
+    fn tone_anchors_find_shadow_mid_and_white_on_a_known_ramp() {
         let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
-        let (mid, white) = tone_anchors(&mono);
+        let (shadow, mid, white) = tone_anchors(&mono);
+        assert!((shadow - 0.1).abs() < 0.02, "shadow {shadow}");
         assert!((mid - 0.5).abs() < 0.01, "median {mid}");
         assert!((white - 0.98).abs() < 0.02, "white {white}");
     }
 
     #[test]
     fn tone_anchors_guard_degenerate_black_frames() {
-        let (mid, white) = tone_anchors(&[0.0; 256]);
+        let (shadow, mid, white) = tone_anchors(&[0.0; 256]);
+        assert_eq!(shadow, MIN_ANCHOR);
         assert_eq!(mid, MIN_ANCHOR);
         assert_eq!(white, MIN_ANCHOR);
     }
@@ -887,7 +951,7 @@ mod tests {
         // so untouched renders must be byte-identical (no phantom tone shift).
         let mut values = vec![0.0_f32, 0.13, 0.5, 0.84, 1.0];
         let original = values.clone();
-        apply_curve(&mut values, 1.0, 1.0, 0.45, 0.92);
+        apply_curve(&mut values, 1.0, 1.0, 1.0, 0.15, 0.45, 0.92);
         assert!(
             values
                 .iter()
@@ -902,14 +966,14 @@ mod tests {
         // `apply_curve` is the CPU twin of the WGSL's
         // `clamp(curve_ratio * pow(p, curve_exp), 0, 1)` — re-derive the same
         // expression independently and confirm they agree on a range of inputs.
-        let (mid, white) = (0.42_f32, 0.93_f32);
-        let (contrast, rolloff) = (1.25_f32, 0.7_f32);
-        let (ratio, exponent) = curve_remap(contrast, rolloff, mid, white);
+        let (shadow, mid, white) = (0.18_f32, 0.42_f32, 0.93_f32);
+        let (contrast, rolloff, shadows) = (1.25_f32, 0.7_f32, 1.3_f32);
+        let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
 
-        for p in [0.0_f32, 0.05, 0.25, 0.42, 0.7, 0.93, 1.0, 3.0] {
+        for p in [0.0_f32, 0.05, 0.18, 0.25, 0.42, 0.7, 0.93, 1.0, 3.0] {
             let expected = (ratio * p.powf(exponent)).clamp(0.0, 1.0);
             let mut v = [p];
-            apply_curve(&mut v, contrast, rolloff, mid, white);
+            apply_curve(&mut v, contrast, rolloff, shadows, shadow, mid, white);
             assert!((v[0] - expected).abs() < 1e-6, "p {p}: {v:?} vs {expected}");
         }
     }

@@ -26,9 +26,9 @@ struct Uniforms {
     pan_x: f32,      // pan offset of the image center, physical pixels
     pan_y: f32,
     // Live tone curve applied to the sampled positive: `clamp(ratio * p^exp, 0, 1)`.
-    // The CPU folds the contrast/rolloff power curves (pivoted at the image's
-    // measured mid-gray and white point) into this single pair; both are 1.0 at
-    // the defaults, making the remap the identity.
+    // The CPU folds the contrast/rolloff/shadows power curves (pivoted at the
+    // image's measured mid-gray, white point, and shadow anchor) into this
+    // single pair; all are identity at the defaults, making the remap a no-op.
     curve_ratio: f32,
     curve_exp: f32,
 };
@@ -94,8 +94,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let mono_linear = textureSample(t_mono, s_mono, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0))).r;
 
     // Live tone curve re-shapes the baked positive's values: the CPU folds
-    // the contrast power (pivot at the image's measured mid-gray) and the
-    // highlight-rolloff power (pivot at the measured white point) into one
+    // the contrast power (pivot at the image's measured mid-gray), the
+    // highlight-rolloff power (pivot at the measured white point), and the
+    // shadows power (pivot at the measured shadow anchor) into one
     // `ratio * p^exp`. Identity at the defaults (byte-identical render).
     let remapped = clamp(uniforms.curve_ratio * pow(mono_linear, uniforms.curve_exp), 0.0, 1.0);
 

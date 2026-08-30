@@ -20,6 +20,10 @@ pub const DEFAULT_CURVE_CONTRAST: f32 = 1.0;
 /// `1.0`).
 pub const DEFAULT_CURVE_ROLLOFF: f32 = 1.0;
 
+/// Shadows power (pivoted at the image's measured shadow anchor) applied
+/// until an edit records otherwise (identity `1.0`).
+pub const DEFAULT_CURVE_SHADOWS: f32 = 1.0;
+
 /// Serializable per-file edits.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EditData {
@@ -34,6 +38,10 @@ pub struct EditData {
     /// white point), `1.0` = identity. Missing in older manifests stays `1.0`.
     #[serde(default = "default_curve_identity")]
     pub curve_rolloff: f32,
+    /// Tone-curve shadows power (pivoted at the image's measured shadow
+    /// anchor), `1.0` = identity. Missing in older manifests stays `1.0`.
+    #[serde(default = "default_curve_identity")]
+    pub curve_shadows: f32,
 }
 
 impl Default for EditData {
@@ -43,6 +51,7 @@ impl Default for EditData {
             exposure_ev: DEFAULT_EXPOSURE_EV,
             curve_contrast: DEFAULT_CURVE_CONTRAST,
             curve_rolloff: DEFAULT_CURVE_ROLLOFF,
+            curve_shadows: DEFAULT_CURVE_SHADOWS,
         }
     }
 }
@@ -52,6 +61,39 @@ impl Default for EditData {
 #[allow(clippy::unnecessary_wraps)]
 fn default_curve_identity() -> f32 {
     1.0
+}
+
+/// A per-file edit aggregated into one value the decode/thumbnail pipelines
+/// can thread through without a 5-tuple or per-field reads.
+///
+/// All fields are identities at `Default`: zero exposure, identity powers.
+/// `Default` must match the un-edited rendering exactly so a manifest entry
+/// without an edit paints identical to `EditData::default()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToneEdit {
+    pub exposure_ev: f32,
+    pub curve_contrast: f32,
+    pub curve_rolloff: f32,
+    pub curve_shadows: f32,
+}
+
+impl Default for ToneEdit {
+    fn default() -> Self {
+        Self {
+            exposure_ev: DEFAULT_EXPOSURE_EV,
+            curve_contrast: DEFAULT_CURVE_CONTRAST,
+            curve_rolloff: DEFAULT_CURVE_ROLLOFF,
+            curve_shadows: DEFAULT_CURVE_SHADOWS,
+        }
+    }
+}
+
+impl ToneEdit {
+    /// The value stored for a file carrying no edits.
+    #[must_use]
+    pub fn identity() -> Self {
+        Self::default()
+    }
 }
 
 /// A film roll directory's app-owned manifest: roll metadata plus per-file
@@ -72,7 +114,7 @@ pub struct RollManifest {
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             name: None,
             edits: HashMap::new(),
         }
@@ -92,23 +134,16 @@ impl RollManifest {
         }
     }
 
-    /// The stored exposure for `name`, or [`DEFAULT_EXPOSURE_EV`] when the
-    /// file carries no edit.
-    #[must_use]
-    pub fn exposure_ev(&self, name: &str) -> f32 {
-        self.edits
-            .get(name)
-            .map_or(DEFAULT_EXPOSURE_EV, |edit| edit.exposure_ev)
-    }
-
-    /// Records the tone curve for `name` (contrast + highlight rolloff),
-    /// updating an existing entry in place. `(1.0, 1.0)` is the identity.
+    /// Records the tone curve for `name` (contrast + highlight rolloff +
+    /// shadows), updating an existing entry in place. All identities are
+    /// `1.0`.
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
-    pub fn set_curve(&mut self, name: &str, contrast: f32, rolloff: f32) {
+    pub fn set_curve(&mut self, name: &str, contrast: f32, rolloff: f32, shadows: f32) {
         if let Some(edit) = self.edits.get_mut(name) {
             edit.curve_contrast = contrast;
             edit.curve_rolloff = rolloff;
+            edit.curve_shadows = shadows;
         } else {
             self.edits.insert(
                 name.to_owned(),
@@ -116,19 +151,23 @@ impl RollManifest {
                     exposure_ev: DEFAULT_EXPOSURE_EV,
                     curve_contrast: contrast,
                     curve_rolloff: rolloff,
+                    curve_shadows: shadows,
                 },
             );
         }
     }
 
-    /// The stored tone curve for `name`, or the identity `(1.0, 1.0)` when the
-    /// file carries no edit (or a legacy manifest that predates the curve).
+    /// The full edit for `name` as a single [`ToneEdit`], merging exposure
+    /// and the curve powers. Files (or manifest fields) never touched fall
+    /// back to their identities.
     #[must_use]
-    pub fn curve(&self, name: &str) -> (f32, f32) {
-        self.edits.get(name).map_or_else(
-            || (DEFAULT_CURVE_CONTRAST, DEFAULT_CURVE_ROLLOFF),
-            |edit| (edit.curve_contrast, edit.curve_rolloff),
-        )
+    pub fn tone(&self, name: &str) -> ToneEdit {
+        self.edits.get(name).map_or_else(ToneEdit::identity, |edit| ToneEdit {
+            exposure_ev: edit.exposure_ev,
+            curve_contrast: edit.curve_contrast,
+            curve_rolloff: edit.curve_rolloff,
+            curve_shadows: edit.curve_shadows,
+        })
     }
 }
 
@@ -208,11 +247,10 @@ mod tests {
     fn round_trip_preserves_edits_and_name() {
         let dir = temp_dir("roundtrip");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut manifest = RollManifest::default();
-        manifest.name = Some("Berlin".to_owned());
+let mut manifest = RollManifest::default();
         manifest.set_exposure("IMG_0001.DNG", 0.42);
         manifest.set_exposure("IMG_0002.RAW", -0.75);
-        manifest.set_curve("IMG_0001.DNG", 0.85, 1.15);
+        manifest.set_curve("IMG_0001.DNG", 0.85, 1.15, 1.1);
 
         save_roll_manifest(&dir, &manifest).unwrap();
 
@@ -220,11 +258,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, manifest);
-        assert_eq!(loaded.exposure_ev("IMG_0001.DNG"), 0.42);
-        assert_eq!(loaded.exposure_ev("IMG_0002.RAW"), -0.75);
-        assert_eq!(loaded.curve("IMG_0001.DNG"), (0.85, 1.15));
-        // The second image carried no curve → identity.
-        assert_eq!(loaded.curve("IMG_0002.RAW"), (1.0, 1.0));
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
+        assert_eq!(loaded.tone("IMG_0002.RAW").exposure_ev, -0.75);
+        let tone_one = loaded.tone("IMG_0001.DNG");
+        assert_eq!(tone_one.curve_contrast, 0.85);
+        assert_eq!(tone_one.curve_rolloff, 1.15);
+        assert_eq!(tone_one.curve_shadows, 1.1);
+        // The second image carried only an exposure edit → curve identity.
+        assert_eq!(
+            loaded.tone("IMG_0002.RAW"),
+            ToneEdit {
+                exposure_ev: -0.75,
+                ..ToneEdit::identity()
+            }
+        );
     }
 
     #[test]
@@ -236,7 +283,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.version, 3);
     }
 
     #[test]
@@ -263,7 +310,7 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.exposure_ev("Rolle 1 IMG_10.DNG"), 0.3);
+        assert_eq!(loaded.tone("Rolle 1 IMG_10.DNG").exposure_ev, 0.3);
     }
 
     #[test]
@@ -279,7 +326,7 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.exposure_ev("a.DNG"), 1.5);
+        assert_eq!(loaded.tone("a.DNG").exposure_ev, 1.5);
         // The on-disk version (`version = 1`) is preserved: loading tolerates
         // unknown fields AND older schema versions, so a v1 manifest is read
         // as a v1 manifest.
@@ -295,7 +342,7 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.exposure_ev("a.DNG"), DEFAULT_EXPOSURE_EV);
+        assert_eq!(loaded.tone("a.DNG").exposure_ev, DEFAULT_EXPOSURE_EV);
     }
 
     #[test]
@@ -314,8 +361,11 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.exposure_ev("a.DNG"), 0.75);
-        assert_eq!(loaded.curve("a.DNG"), (DEFAULT_CURVE_CONTRAST, DEFAULT_CURVE_ROLLOFF));
+        let tone = loaded.tone("a.DNG");
+        assert_eq!(tone.exposure_ev, 0.75);
+        assert_eq!(tone.curve_contrast, DEFAULT_CURVE_CONTRAST);
+        assert_eq!(tone.curve_rolloff, DEFAULT_CURVE_ROLLOFF);
+        assert_eq!(tone.curve_shadows, DEFAULT_CURVE_SHADOWS);
     }
 
     #[test]
@@ -324,7 +374,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
         manifest.set_exposure("IMG_0001.DNG", 0.42);
-        manifest.set_curve("IMG_0001.DNG", 0.8, 1.2);
+        manifest.set_curve("IMG_0001.DNG", 0.8, 1.2, 1.05);
 
         save_roll_manifest(&dir, &manifest).unwrap();
 
@@ -332,25 +382,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, manifest);
-        assert_eq!(loaded.curve("IMG_0001.DNG"), (0.8, 1.2));
+        let tone = loaded.tone("IMG_0001.DNG");
+        assert_eq!(tone.curve_contrast, 0.8);
+        assert_eq!(tone.curve_rolloff, 1.2);
+        assert_eq!(tone.curve_shadows, 1.05);
         // Exposure survives alongside the curve on the same edit.
-        assert_eq!(loaded.exposure_ev("IMG_0001.DNG"), 0.42);
+        assert_eq!(tone.exposure_ev, 0.42);
     }
 
     #[test]
     fn set_curve_updates_in_place() {
         let mut manifest = RollManifest::default();
-        manifest.set_curve("a.DNG", 0.9, 1.1);
-        manifest.set_curve("a.DNG", 1.0, 1.0);
+        manifest.set_curve("a.DNG", 0.9, 1.1, 1.0);
+        manifest.set_curve("a.DNG", 1.0, 1.0, 1.0);
 
         assert_eq!(manifest.edits.len(), 1);
-        assert_eq!(manifest.curve("a.DNG"), (1.0, 1.0));
+        let tone = manifest.tone("a.DNG");
+        assert_eq!(tone.curve_contrast, 1.0);
+        assert_eq!(tone.curve_rolloff, 1.0);
+        assert_eq!(tone.curve_shadows, 1.0);
+    }
+
+    #[test]
+    fn curve_and_exposure_coexist_on_one_edit() {
+        // A file edited through both APIs keeps all values on one entry, and
+        // a bare exposure edit never disturbs the curve defaults (or vice
+        // versa).
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", 0.3);
+        assert_eq!(manifest.tone("a.DNG").curve_contrast, 1.0);
+
+        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        let tone = manifest.tone("a.DNG");
+        assert_eq!(tone.exposure_ev, 0.3);
+        assert_eq!(manifest.edits.len(), 1);
+    }
+
+    #[test]
+    fn tone_merges_exposure_and_curve() {
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", -0.5);
+        manifest.set_curve("a.DNG", 1.2, 0.8, 0.9);
+
+        let tone = manifest.tone("a.DNG");
+        assert_eq!(tone.exposure_ev, -0.5);
+        assert_eq!(tone.curve_contrast, 1.2);
+        assert_eq!(tone.curve_rolloff, 0.8);
+        assert_eq!(tone.curve_shadows, 0.9);
     }
 
     #[test]
     fn curve_of_unknown_file_is_identity() {
         let manifest = RollManifest::default();
-        assert_eq!(manifest.curve("missing.DNG"), (1.0, 1.0));
+        assert_eq!(manifest.tone("missing.DNG"), ToneEdit::identity());
     }
 
     #[test]
@@ -361,8 +445,8 @@ mod tests {
 
         reconcile(&mut manifest, &["kept.DNG".to_owned()]);
 
-        assert_eq!(manifest.exposure_ev("gone.DNG"), DEFAULT_EXPOSURE_EV);
-        assert_eq!(manifest.exposure_ev("kept.DNG"), -0.4);
+        assert_eq!(manifest.tone("gone.DNG").exposure_ev, DEFAULT_EXPOSURE_EV);
+        assert_eq!(manifest.tone("kept.DNG").exposure_ev, -0.4);
         assert!(!manifest.edits.contains_key("gone.DNG"));
     }
 
@@ -373,6 +457,6 @@ mod tests {
         manifest.set_exposure("a.DNG", -1.25);
 
         assert_eq!(manifest.edits.len(), 1);
-        assert_eq!(manifest.exposure_ev("a.DNG"), -1.25);
+        assert_eq!(manifest.tone("a.DNG").exposure_ev, -1.25);
     }
 }
