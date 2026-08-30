@@ -81,6 +81,11 @@ pub struct AppModel {
     /// (initial state) until the user selects a roll; drives the selected-tile
     /// highlight, the `Ctrl+Space` metadata drawer, and Enter/arrow navigation.
     selected_roll: Option<PathBuf>,
+    /// Frame-grid highlight: the tile single-clicked (or last opened / paged
+    /// to) inside an open roll. Distinct from `selected` (the opened detail
+    /// frame) so the highlight survives closing the detail view and drives the
+    /// accent ring, Enter, and arrow-key navigation.
+    frame_selected: Option<String>,
     /// Number of columns the library grid last laid out (tracked from window
     /// resizes, matching iced's `Grid::fluid` math), so Up/Down keyboard
     /// navigation can jump by exactly one row.
@@ -214,12 +219,18 @@ pub enum Message {
     /// drawer target). Does not drill in.
     RollSelected(PathBuf),
     /// Open the roll currently selected by a single click (`selected_roll`),
-    /// from Enter or a double click.
-    OpenSelectedRoll,
+    /// from Enter or a double click; on the frame page it opens the frame
+    /// currently highlighted by `frame_selected`.
+    OpenSelected,
     /// A roll tile was double-clicked — drill into its frame grid.
     RollActivated(PathBuf),
-    /// Arrow-key navigation of the library grid selection.
-    RollNav(MoveDir),
+    /// Arrow-key navigation. On the library page it moves the roll selection;
+    /// inside an open roll it moves the frame highlight, or pages the detail
+    /// view left/right when one is open.
+    Nav(MoveDir),
+    /// A frame tile was single-clicked — highlight it (accent ring) without
+    /// opening the detail view.
+    FrameSelected(String),
     /// The frame scan for an opened roll finished.
     RollOpened(PathBuf, Vec<String>),
     /// Return from the frame grid to the library (roll grid).
@@ -259,7 +270,8 @@ pub enum Message {
     UpdateConfig(Config),
 }
 
-/// A direction for arrow-key navigation of the library grid selection.
+/// A direction for arrow-key navigation of a grid selection (library rolls or
+/// open-roll frames), and for paging the detail view left/right.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MoveDir {
     Left,
@@ -335,6 +347,7 @@ impl cosmic::Application for AppModel {
             rolls: Vec::new(),
             active: None,
             selected_roll: None,
+            frame_selected: None,
             // A 3-wide grid is a safe initial guess until the first resize.
             grid_cols: 3,
             cover_inflight: Vec::new(),
@@ -517,11 +530,11 @@ detail_pan: (0.0, 0.0),
                     ..
                 } => match named {
                     keyboard::key::Named::Escape => Some(Message::DetailClosed),
-                    keyboard::key::Named::Enter => Some(Message::OpenSelectedRoll),
-                    keyboard::key::Named::ArrowLeft => Some(Message::RollNav(MoveDir::Left)),
-                    keyboard::key::Named::ArrowRight => Some(Message::RollNav(MoveDir::Right)),
-                    keyboard::key::Named::ArrowUp => Some(Message::RollNav(MoveDir::Up)),
-                    keyboard::key::Named::ArrowDown => Some(Message::RollNav(MoveDir::Down)),
+                    keyboard::key::Named::Enter => Some(Message::OpenSelected),
+                    keyboard::key::Named::ArrowLeft => Some(Message::Nav(MoveDir::Left)),
+                    keyboard::key::Named::ArrowRight => Some(Message::Nav(MoveDir::Right)),
+                    keyboard::key::Named::ArrowUp => Some(Message::Nav(MoveDir::Up)),
+                    keyboard::key::Named::ArrowDown => Some(Message::Nav(MoveDir::Down)),
                     _ => None,
                 },
                 // The spacebar carries no Named variant in this iced fork, so
@@ -574,22 +587,27 @@ detail_pan: (0.0, 0.0),
                 // On the library page, Escape first closes an open context
                 // drawer (roll info / about); only falls through when there is
                 // nothing open to close.
-                if self.active.is_none()
-                    && self.selected.is_none()
-                    && self.core.window.show_context
-                {
-                    self.core_mut().set_show_context(false);
+                if self.active.is_none() {
+                    if self.selected.is_none() && self.core.window.show_context {
+                        self.core_mut().set_show_context(false);
+                    }
                     return Task::none();
                 }
                 if self.selected.is_some() {
+                    // Close the detail view; the frame highlight survives so
+                    // the grid still shows where you were.
                     self.selected = None;
                     self.clear_detail();
                     // Without a selection the editing drawer has nothing to
                     // show; close it so it does not linger empty.
                     self.close_editing();
-                } else if self.active.is_some() {
-                    // No detail open: Escape backs out of the roll entirely.
+                } else if self.frame_selected.is_some() {
+                    // No detail open: Escape first clears the grid highlight...
+                    self.frame_selected = None;
+                } else {
+                    // ...then backs out of the roll entirely.
                     self.active = None;
+                    self.frame_selected = None;
                     self.tiles = Vec::new();
                     self.thumb_inflight.clear();
                     self.clear_detail();
@@ -600,31 +618,7 @@ detail_pan: (0.0, 0.0),
 
             Message::DetailReady(name, result) => self.handle_detail_ready(&name, result),
 
-            Message::ThumbnailActivated(name) => {
-                if self.selected.as_deref() != Some(name.as_str()) {
-                    // Persist unsaved tweaks to the outgoing file first.
-                    self.persist_roll();
-                    // Read the stored edits BEFORE the decode builds the
-                    // shader, which consumes `self.exposure_ev` and the tone
-                    // (via `set_curve` in `handle_detail_ready`).
-                    let stored_tone = self.roll.tone(name.as_str());
-                    self.selected = Some(name);
-                    self.clear_detail();
-                    self.exposure_ev = stored_tone.exposure_ev;
-                    self.curve_contrast = stored_tone.curve_contrast;
-                    self.curve_rolloff = stored_tone.curve_rolloff;
-                    self.curve_shadows = stored_tone.curve_shadows;
-                    // Anchor the reset snapshot to the opened state (the
-                    // stored manifest values), so Reset reverts here rather
-                    // than to identity.
-                    self.reset_exposure_ev = stored_tone.exposure_ev;
-                    self.reset_curve_contrast = stored_tone.curve_contrast;
-                    self.reset_curve_rolloff = stored_tone.curve_rolloff;
-                    self.reset_curve_shadows = stored_tone.curve_shadows;
-                }
-
-                self.decode_detail_next()
-            }
+            Message::ThumbnailActivated(name) => self.open_frame(name),
 
             Message::DetailFadeTick => {
                 let dt = self
@@ -808,19 +802,52 @@ detail_pan: (0.0, 0.0),
                 Task::none()
             }
 
-            Message::OpenSelectedRoll => {
-                if let Some(dir) = self.selected_roll.clone() {
+            Message::OpenSelected => {
+                if self.active.is_some() {
+                    // Frame page: open the highlighted frame in the detail view.
+                    if let Some(name) = self.frame_selected.clone() {
+                        self.open_frame(name)
+                    } else {
+                        Task::none()
+                    }
+                } else if let Some(dir) = self.selected_roll.clone() {
                     self.open_roll(dir)
                 } else {
                     Task::none()
                 }
             }
 
-            Message::RollNav(dir) => {
-                // Arrow navigation targets the library grid only.
+            Message::Nav(dir) => {
                 if self.active.is_some() {
+                    // Inside a roll. With the detail view open, Left/Right page
+                    // through the frames; on the bare grid they move the
+                    // highlight.
+                    if self.selected.is_some() {
+                        let matched = filtered_tiles(&self.tiles, &self.query);
+                        let current = self
+                            .selected
+                            .as_ref()
+                            .and_then(|name| matched.iter().position(|tile| tile.name == *name));
+                        if let Some(target) =
+                            current.and_then(|idx| paginate(idx, matched.len(), dir))
+                        {
+                            return self.open_frame(matched[target].name.clone());
+                        }
+                    } else {
+                        let matched = filtered_tiles(&self.tiles, &self.query);
+                        let selected = self
+                            .frame_selected
+                            .as_ref()
+                            .and_then(|name| matched.iter().position(|tile| tile.name == *name));
+                        let len = matched.len();
+                        if let Some(target) = nav_target(selected, len, self.grid_cols.max(1), dir) {
+                            self.frame_selected = Some(matched[target].name.clone());
+                        }
+                    }
                     return Task::none();
                 }
+
+                // Library grid: move the roll selection over the visible rolls.
                 let matched = filtered_rolls(&self.rolls, &self.query);
                 if matched.is_empty() {
                     return Task::none();
@@ -833,6 +860,11 @@ detail_pan: (0.0, 0.0),
                 if let Some(target) = nav_target(selected, len, self.grid_cols.max(1), dir) {
                     self.selected_roll = Some(matched[target].dir.clone());
                 }
+                Task::none()
+            }
+
+            Message::FrameSelected(name) => {
+                self.frame_selected = Some(name);
                 Task::none()
             }
 
@@ -866,6 +898,7 @@ detail_pan: (0.0, 0.0),
                 self.persist_roll();
                 self.active = None;
                 self.selected = None;
+                self.frame_selected = None;
                 self.tiles = Vec::new();
                 self.thumb_inflight.clear();
                 self.detail_inflight = None;
@@ -971,6 +1004,7 @@ impl AppModel {
         self.persist_roll();
         self.active = Some(dir.clone());
         self.selected = None;
+        self.frame_selected = None;
         self.clear_detail();
         self.close_editing();
         if self.context_page == ContextPage::RollInfo {
@@ -980,6 +1014,36 @@ impl AppModel {
             let files = load_files_in(dir.clone()).await;
             Message::RollOpened(dir, files)
         })
+    }
+
+    /// Opens a frame in the detail view (double-click, Enter on the highlighted
+    /// tile, or Left/Right paging while a detail view is open). Persists unsaved
+    /// tweaks to the outgoing file, loads the stored edits, updates both the
+    /// detail selection and the grid highlight, and starts the decode chain.
+    fn open_frame(&mut self, name: String) -> Task<cosmic::Action<Message>> {
+        if self.selected.as_deref() != Some(name.as_str()) {
+            // Persist unsaved tweaks to the outgoing file first.
+            self.persist_roll();
+            // Read the stored edits BEFORE the decode builds the shader, which
+            // consumes `self.exposure_ev` and the tone (via `set_curve` in
+            // `handle_detail_ready`).
+            let stored_tone = self.roll.tone(name.as_str());
+            self.selected = Some(name.clone());
+            self.frame_selected = Some(name);
+            self.clear_detail();
+            self.exposure_ev = stored_tone.exposure_ev;
+            self.curve_contrast = stored_tone.curve_contrast;
+            self.curve_rolloff = stored_tone.curve_rolloff;
+            self.curve_shadows = stored_tone.curve_shadows;
+            // Anchor the reset snapshot to the opened state (the stored
+            // manifest values), so Reset reverts here rather than to identity.
+            self.reset_exposure_ev = stored_tone.exposure_ev;
+            self.reset_curve_contrast = stored_tone.curve_contrast;
+            self.reset_curve_rolloff = stored_tone.curve_rolloff;
+            self.reset_curve_shadows = stored_tone.curve_shadows;
+        }
+
+        self.decode_detail_next()
     }
 
     /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] pending thumbnails.
@@ -1442,6 +1506,33 @@ fn nav_target(selected: Option<usize>, len: usize, cols: usize, dir: MoveDir) ->
     })
 }
 
+/// Frames whose name matches the toolbar query (case-insensitive substring).
+/// Shared by the frame grid view and frame navigation so both move over the
+/// same visible set.
+fn filtered_tiles<'a>(tiles: &'a [Tile], query: &str) -> Vec<&'a Tile> {
+    let query = query.trim().to_lowercase();
+    tiles
+        .iter()
+        .filter(move |tile| query.is_empty() || tile.name.to_lowercase().contains(&query))
+        .collect()
+}
+
+/// When a detail view is open, Left/Right step one frame through the visible,
+/// search-filtered set. The step is clamped at both ends (no wrap): `None` when
+/// there is no current frame anchored (or the list is empty), matching the
+/// selection-driven grid nav. Up/Down never page.
+fn paginate(current: usize, len: usize, dir: MoveDir) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let current = current.min(len - 1);
+    match dir {
+        MoveDir::Left => Some(current.saturating_sub(1)),
+        MoveDir::Right => Some((current + 1).min(len - 1)),
+        MoveDir::Up | MoveDir::Down => None,
+    }
+}
+
 /// Renders the library page: a responsive grid of roll cover tiles, or an
 /// empty-state message when there are no rolls.
 fn library_view(app: &AppModel) -> Element<'_, Message> {
@@ -1483,12 +1574,8 @@ fn library_view(app: &AppModel) -> Element<'_, Message> {
 fn frames_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let query = app.query.trim().to_lowercase();
-    let matched: Vec<&Tile> = app
-        .tiles
-        .iter()
-        .filter(|tile| query.is_empty() || tile.name.to_lowercase().contains(&query))
-        .collect();
+    let matched = filtered_tiles(&app.tiles, &app.query);
+    let selected = app.frame_selected.as_deref();
 
     let tiles: Element<'_, Message> = if matched.is_empty() {
         widget::container(widget::text(fl!("no-files")))
@@ -1498,10 +1585,12 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
             .align_y(Vertical::Center)
             .into()
     } else {
-        let grid = Grid::with_children(matched.into_iter().map(tile_view))
-            .fluid(THUMB_SIZE)
-            .height(grid::Sizing::AspectRatio(TILE_ASPECT))
-            .spacing(space_s);
+        let grid = Grid::with_children(matched.into_iter().map(|tile| {
+            tile_view(tile, selected == Some(tile.name.as_str()))
+        }))
+        .fluid(THUMB_SIZE)
+        .height(grid::Sizing::AspectRatio(TILE_ASPECT))
+        .spacing(space_s);
 
         widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
             .height(Length::Fill)
@@ -1736,63 +1825,96 @@ fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
     let mut stack = Stack::with_capacity(1);
     stack = stack.push(surface);
 
-    // Selection: a transparent overlay ring drawn ON TOP of the card, rounded
-    // to the theme radius, so the accent border is visible around the
-    // full-bleed preview on every side. Decorative only — no MouseArea — so it
-    // never eats the clicks the card below expects.
+    // Selection: an accent ring drawn ON TOP of this card.
     if selected {
-        stack = stack.push(
-            widget::container(
-                widget::Space::new().width(Length::Fill).height(Length::Fill),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .class(cosmic::theme::Container::custom(|theme| {
-                cosmic::iced::widget::container::Style {
-                    border: cosmic::iced::border::Border {
-                        color: theme.cosmic().accent.base.into(),
-                        width: 2.0,
-                        radius: theme.cosmic().corner_radii.radius_s.into(),
-                    },
-                    ..Default::default()
-                }
-            })),
-        );
+        stack = stack.push(selection_ring());
     }
 
     stack.width(Length::Fill).height(Length::Fill).into()
 }
 
+/// The selection highlight shared by every selectable tile (library rolls and
+/// open-roll frames): a transparent overlay ring drawn ON TOP of the card,
+/// rounded to the theme radius, so the accent border is visible around a
+/// full-bleed preview on every side. Decorative only — no `MouseArea` — so it
+/// never eats the clicks the card below expects.
+fn selection_ring() -> Element<'static, Message> {
+    widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(cosmic::theme::Container::custom(|theme| {
+            cosmic::iced::widget::container::Style {
+                border: cosmic::iced::border::Border {
+                    color: theme.cosmic().accent.base.into(),
+                    width: 2.0,
+                    radius: theme.cosmic().corner_radii.radius_s.into(),
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 /// Renders a single frame tile of the open roll, filling the square cell the
-/// grid assigns it.
-fn tile_view(tile: &Tile) -> Element<'_, Message> {
+/// grid assigns it. Single-clicking selects (accent ring highlight); a
+/// double-click (or Enter on the highlighted tile) opens the detail view. Like
+/// the library cards, the tile is a surface + Stack with the ring overlay; the
+/// image itself stays `Contain` so a film frame's full framing is never cropped.
+fn tile_view(tile: &Tile, selected: bool) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let preview: Element<'_, Message> = match &tile.thumb {
-        Thumb::Ready(handle) => MouseArea::new(
-            widget::image(handle.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(ContentFit::Contain),
-        )
-        .on_double_click(Message::ThumbnailActivated(tile.name.clone()))
-        .into(),
-        Thumb::Loading => icon::from_name("image-loading-symbolic").icon().into(),
-        Thumb::Failed => icon::from_name("image-missing-symbolic").icon().into(),
+    // The image keeps its square cell with ContentFit::Contain (no cropping);
+    // placeholders stay centered in the same sheet.
+    let content: Element<'_, Message> = match &tile.thumb {
+        Thumb::Ready(handle) => widget::image(handle.clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(ContentFit::Contain)
+            .into(),
+        Thumb::Loading => widget::container(icon::from_name("image-loading-symbolic").icon())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .into(),
+        Thumb::Failed => widget::container(icon::from_name("image-missing-symbolic").icon())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .into(),
     };
 
-    widget::column::with_capacity(2)
-        .push(
-            widget::container(preview)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Horizontal::Center)
-                .align_y(Vertical::Center),
-        )
-        .push(widget::text(&tile.name))
-        .spacing(space_s)
-        .align_x(Horizontal::Center)
-        .into()
+    // The frame name sits below the image; its horizontal padding also keeps
+    // the text clear of the selection ring.
+    let info: Element<'_, Message> = widget::container(widget::text(&tile.name))
+        .width(Length::Fill)
+        .padding(space_s)
+        .into();
+
+    let card = widget::column::with_capacity(2)
+        .push(content)
+        .push(info)
+        .spacing(0);
+
+    let card: Element<'_, Message> = MouseArea::new(card)
+        .on_press(Message::FrameSelected(tile.name.clone()))
+        .on_double_click(Message::ThumbnailActivated(tile.name.clone()))
+        .into();
+
+    let mut stack = Stack::with_capacity(1);
+    stack = stack.push(
+        widget::container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(cosmic::theme::Container::Primary),
+    );
+
+    if selected {
+        stack = stack.push(selection_ring());
+    }
+
+    stack.width(Length::Fill).height(Length::Fill).into()
 }
 
 /// Renders the detail view for the selected file, if any, over the still-mounted
@@ -2775,6 +2897,13 @@ mod tests {
         }
     }
 
+    fn tile(name: &str) -> Tile {
+        Tile {
+            name: name.to_string(),
+            thumb: Thumb::Loading,
+        }
+    }
+
     #[test]
     fn filtered_rolls_matches_case_insensitive_substring() {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "chicago")];
@@ -2829,6 +2958,47 @@ mod tests {
     #[test]
     fn nav_target_empty_list_has_no_target() {
         assert_eq!(nav_target(Some(0), 0, 3, MoveDir::Left), None);
+    }
+
+    #[test]
+    fn filtered_tiles_matches_case_insensitive_substring() {
+        let tiles = vec![tile("DSC_0001.CR2"), tile("scan-roll2.tif")];
+
+        let matched = filtered_tiles(&tiles, "dsc");
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "DSC_0001.CR2");
+    }
+
+    #[test]
+    fn filtered_tiles_returns_all_on_empty_query() {
+        let tiles = vec![tile("a"), tile("b")];
+
+        assert_eq!(filtered_tiles(&tiles, "").len(), 2);
+        assert_eq!(filtered_tiles(&tiles, "   ").len(), 2);
+    }
+
+    #[test]
+    fn paginate_steps_left_and_right_within_visible_set() {
+        assert_eq!(paginate(1, 5, MoveDir::Left), Some(0));
+        assert_eq!(paginate(1, 5, MoveDir::Right), Some(2));
+    }
+
+    #[test]
+    fn paginate_clamps_at_both_ends() {
+        assert_eq!(paginate(0, 5, MoveDir::Left), Some(0));
+        assert_eq!(paginate(4, 5, MoveDir::Right), Some(4));
+    }
+
+    #[test]
+    fn paginate_never_moves_vertically() {
+        assert_eq!(paginate(2, 5, MoveDir::Up), None);
+        assert_eq!(paginate(2, 5, MoveDir::Down), None);
+    }
+
+    #[test]
+    fn paginate_empty_list_has_no_target() {
+        assert_eq!(paginate(0, 0, MoveDir::Right), None);
     }
 
     #[test]
