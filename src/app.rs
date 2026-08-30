@@ -130,6 +130,12 @@ pub struct AppModel {
     curve_rolloff: f32,
     /// Exposure compensation in EV (−3.00 to +3.00).
     exposure_ev: f32,
+    /// Edit values as they were when the detail panel was opened — the stored
+    /// manifest values for the selected file. `ResetAll` restores these, not
+    /// the identity, so reset reverts the panel to its opened state.
+    reset_exposure_ev: f32,
+    reset_curve_contrast: f32,
+    reset_curve_rolloff: f32,
     /// Monotonic counter incremented each time a new detail decode finishes;
     /// stamped into [`ExposureProgram::image_id`] so the GPU pipeline
     /// recognises a new image and rebuilds its texture.
@@ -216,8 +222,9 @@ pub enum Message {
     /// The live tone curve changed: new contrast and rolloff powers. Applies
     /// to the shader as a uniform-only remap (non-persisted).
     CurveChanged(f32, f32),
-    /// Reset the tone curve back to the identity (contrast = rolloff = 1).
-    CurveReset,
+    /// Reset every first-class edit (exposure + tone curve) to their
+    /// identities in one action, and persist the reset like any other edit.
+    ResetAll,
     /// Flush the in-memory roll edits to the manifest file on disk.
     EditSave,
     /// Consume an input event without acting on it, blocking the grid
@@ -306,6 +313,9 @@ detail_pan: (0.0, 0.0),
         curve_contrast: 1.0,
         curve_rolloff: 1.0,
             exposure_ev: 0.0,
+            reset_exposure_ev: 0.0,
+            reset_curve_contrast: 1.0,
+            reset_curve_rolloff: 1.0,
             next_image_id: 0,
         };
 
@@ -485,12 +495,22 @@ detail_pan: (0.0, 0.0),
                 if self.selected.as_deref() != Some(name.as_str()) {
                     // Persist unsaved tweaks to the outgoing file first.
                     self.persist_roll();
-                    // Read the stored edit before the decode builds the
-                    // shader, which consumes `self.exposure_ev`.
+                    // Read the stored edits BEFORE the decode builds the
+                    // shader, which consumes `self.exposure_ev` and the curve
+                    // (via `set_curve` in `handle_detail_ready`).
                     let stored_ev = self.roll.exposure_ev(name.as_str());
+                    let (stored_contrast, stored_rolloff) = self.roll.curve(name.as_str());
                     self.selected = Some(name);
                     self.clear_detail();
                     self.exposure_ev = stored_ev;
+                    self.curve_contrast = stored_contrast;
+                    self.curve_rolloff = stored_rolloff;
+                    // Anchor the reset snapshot to the opened state (the
+                    // stored manifest values), so Reset reverts here rather
+                    // than to identity.
+                    self.reset_exposure_ev = stored_ev;
+                    self.reset_curve_contrast = stored_contrast;
+                    self.reset_curve_rolloff = stored_rolloff;
                 }
 
                 self.decode_detail_next()
@@ -566,17 +586,39 @@ detail_pan: (0.0, 0.0),
             Message::CurveChanged(contrast, rolloff) => {
                 self.curve_contrast = contrast;
                 self.curve_rolloff = rolloff;
+                // RAM-only until an edit flush point (slider `on_release`,
+                // `DetailClosed`, window close) — same lifecycle as exposure.
+                if let Some(selected) = &self.selected {
+                    self.roll.set_curve(selected, contrast, rolloff);
+                }
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_curve(contrast, rolloff);
                 }
                 Task::none()
             }
 
-            Message::CurveReset => {
-                self.curve_contrast = 1.0;
-                self.curve_rolloff = 1.0;
+            Message::ResetAll => {
+                // Reset every persisted edit back to the state when the edit
+                // panel was opened (the stored manifest values for the
+                // selected file), in RAM, push the live shader back to that
+                // state, and let the normal flush points persist it (the
+                // button is one unconscious click away from a slider, so
+                // mirror the sliders' choice of only-mutate-RAM: the same
+                // `EditSave` points persist it).
+                self.exposure_ev = self.reset_exposure_ev;
+                self.curve_contrast = self.reset_curve_contrast;
+                self.curve_rolloff = self.reset_curve_rolloff;
+                if let Some(selected) = &self.selected {
+                    self.roll.set_exposure(selected, self.reset_exposure_ev);
+                    self.roll.set_curve(
+                        selected,
+                        self.reset_curve_contrast,
+                        self.reset_curve_rolloff,
+                    );
+                }
                 if let Some(shader) = &mut self.detail_shader {
-                    shader.set_curve(self.curve_contrast, self.curve_rolloff);
+                    shader.set_exposure(self.reset_exposure_ev);
+                    shader.set_curve(self.reset_curve_contrast, self.reset_curve_rolloff);
                 }
                 Task::none()
             }
@@ -781,13 +823,17 @@ impl AppModel {
             return Task::none();
         }
 
-        let pending: Vec<(String, f32)> = self
+        let pending: Vec<(String, f32, f32, f32)> = self
             .tiles
             .iter()
             .filter(|tile| matches!(tile.thumb, Thumb::Loading))
             .filter(|tile| !self.thumb_inflight.iter().any(|name| name == &tile.name))
             .take(capacity)
-            .map(|tile| (tile.name.clone(), self.roll.exposure_ev(&tile.name)))
+            .map(|tile| {
+                let ev = self.roll.exposure_ev(&tile.name);
+                let (contrast, rolloff) = self.roll.curve(&tile.name);
+                (tile.name.clone(), ev, contrast, rolloff)
+            })
             .collect();
 
         if pending.is_empty() {
@@ -795,12 +841,14 @@ impl AppModel {
         }
 
         self.thumb_inflight
-            .extend(pending.iter().map(|(name, _)| name.clone()));
+            .extend(pending.iter().map(|(name, ..)| name.clone()));
 
         Task::batch(
             pending
                 .into_iter()
-                .map(move |(name, ev)| cosmic::task::future(decode_thumbnail(dir.clone(), name, ev))),
+                .map(move |(name, ev, contrast, rolloff)| {
+                    cosmic::task::future(decode_thumbnail(dir.clone(), name, ev, contrast, rolloff))
+                }),
         )
     }
 
@@ -901,6 +949,11 @@ impl AppModel {
         self.curve_contrast = 1.0;
         self.curve_rolloff = 1.0;
         self.exposure_ev = 0.0;
+        // The reset snapshot mirrors the live edit values' lifecycle: reset
+        // to identity on close; the next `ThumbnailActivated` re-syncs it.
+        self.reset_exposure_ev = 0.0;
+        self.reset_curve_contrast = 1.0;
+        self.reset_curve_rolloff = 1.0;
     }
 
     /// Writes the in-memory roll edits to the open roll's manifest file on disk.
@@ -1288,7 +1341,6 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     }
 
     let label = widget::text(fl!("exposure-label"));
-    let value_text = widget::text(format!("{:+.2} EV", app.exposure_ev));
     let slider = widget::slider(-3.0..=3.0, app.exposure_ev, Message::ExposureChanged)
         .step(0.01_f32)
         // A finished drag is an edit flush point.
@@ -1299,40 +1351,38 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // measured mid-gray; highlight rolloff at the measured white point —
     // each visibly different from exposure's gain. Grid thumbnails are
     // unaffected; every detail open starts from the identity.
-    let tone_label = widget::text(fl!("tone-label"));
     let contrast_label = widget::text(fl!("contrast-label"));
-    let contrast_value = widget::text(format!("{:.2}", app.curve_contrast));
     let contrast_slider = widget::slider(
-        0.5..=1.5,
+        0.2..=3.0,
         app.curve_contrast,
         // When either slider moves, the other value travels along so the
         // remap always composes the full curve, not a half-updated one.
         move |contrast| Message::CurveChanged(contrast, app.curve_rolloff),
     )
-    .step(0.05_f32);
+    .step(0.05_f32)
+    // A finished drag is an edit flush point, like exposure.
+    .on_release(Message::EditSave);
     let rolloff_label = widget::text(fl!("rolloff-label"));
-    let rolloff_value = widget::text(format!("{:.2}", app.curve_rolloff));
     let rolloff_slider = widget::slider(
-        0.5..=1.5,
+        0.2..=3.0,
         app.curve_rolloff,
         move |rolloff| Message::CurveChanged(app.curve_contrast, rolloff),
     )
-    .step(0.05_f32);
-    let reset = widget::button::standard(fl!("tone-reset")).on_press(Message::CurveReset);
+    .step(0.05_f32)
+    .on_release(Message::EditSave);
+    let reset_all =
+        widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
 
-    widget::column::with_capacity(12)
+    widget::column::with_capacity(8)
         .push(title)
         .push(label)
         .push(slider)
-        .push(value_text)
-        .push(tone_label)
         .push(contrast_label)
         .push(contrast_slider)
-        .push(contrast_value)
         .push(rolloff_label)
         .push(rolloff_slider)
-        .push(rolloff_value)
-        .push(reset)
+        .push(widget::divider::horizontal::default())
+        .push(reset_all)
         .spacing(space_s)
         .width(Length::Fill)
         .into()
@@ -1540,11 +1590,25 @@ fn zoom_about_anchor(
 }
 
 /// Decodes a RAW frame from the open roll into a thumbnail message, baking in
-/// the given exposure so the grid tile reflects the stored edit.
-async fn decode_thumbnail(dir: PathBuf, name: String, exposure_ev: f32) -> Message {
-    let result =
-        decode_raw(dir, name.clone(), move |image| convert_thumbnail(image, THUMB_SIZE, exposure_ev))
-            .await;
+/// the given exposure and tone curve so the grid tile reflects the stored
+/// edits (grid == detail).
+async fn decode_thumbnail(
+    dir: PathBuf,
+    name: String,
+    exposure_ev: f32,
+    curve_contrast: f32,
+    curve_rolloff: f32,
+) -> Message {
+    let result = decode_raw(dir, name.clone(), move |image| {
+        convert_thumbnail(
+            image,
+            THUMB_SIZE,
+            exposure_ev,
+            curve_contrast,
+            curve_rolloff,
+        )
+    })
+    .await;
 
     Message::ThumbReady(name, result)
 }
@@ -1552,8 +1616,10 @@ async fn decode_thumbnail(dir: PathBuf, name: String, exposure_ev: f32) -> Messa
 /// Decodes a roll's cover file into a thumbnail message (no stored exposure:
 /// roll cards are not per-frame editable).
 async fn decode_cover(dir: PathBuf, name: String) -> Message {
-    let result =
-        decode_raw(dir.clone(), name, |image| convert_thumbnail(image, THUMB_SIZE, 0.0)).await;
+    let result = decode_raw(dir.clone(), name, |image| {
+        convert_thumbnail(image, THUMB_SIZE, 0.0, 1.0, 1.0)
+    })
+    .await;
 
     Message::CoverReady(dir, result)
 }
@@ -2072,12 +2138,15 @@ fn downsample_bayer(
 }
 
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
-/// dimension exceeds `max_size`, baking `exposure_ev` into the pixels.
+/// dimension exceeds `max_size`, baking `exposure_ev` and the tone curve
+/// (`curve_contrast` / `curve_rolloff`) into the pixels.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn convert_thumbnail(
     image: &rawloader::RawImage,
     max_size: f32,
     exposure_ev: f32,
+    curve_contrast: f32,
+    curve_rolloff: f32,
 ) -> Result<Handle, ()> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
     // downscale straight from the sensor samples into a small linear negative.
@@ -2095,8 +2164,17 @@ fn convert_thumbnail(
     // overshoot stays out of the perceptually amplified display range.
     unsharp_mask(&mut mono, width as usize, height as usize);
 
+    // Bake the stored tone curve (contrast + highlight rolloff) in linear
+    // light, using the same anchor measurement + remap the detail shader uses,
+    // applied BEFORE the exposure gain to mirror the shader's ordering exactly
+    // (curve first, then `2^EV`, then clamp/sRGB). At the identity curve this
+    // is a no-op, so untouched renders stay byte-identical to pre-curve ones.
+    let (mid, white) = exposure_shader::tone_anchors(&mono);
+    exposure_shader::apply_curve(&mut mono, curve_contrast, curve_rolloff, mid, white);
+
     // Bake the stored exposure in linear light, matching the detail shader's
-    // `mono_linear * 2^EV`, so grid tile and detail view agree.
+    // `mono_linear * 2^EV` (applied after the curve remap), so grid tile and
+    // detail view agree.
     apply_exposure(&mut mono, exposure_ev);
 
     for value in &mut mono {

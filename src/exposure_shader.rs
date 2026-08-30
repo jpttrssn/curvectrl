@@ -182,18 +182,21 @@ const ANCHOR_BINS: usize = 4096;
 
 /// Smallest anchor accepted. Guards `pow(0, negative)` → NaN for degenerate
 /// all-black frames, where the 50th/98th percentile of noise can land at 0.
-const MIN_ANCHOR: f32 = 1e-3;
+pub(crate) const MIN_ANCHOR: f32 = 1e-3;
 
 /// Measure the tone anchors a pivoted curve needs, from the uploaded positive
 /// (`p` in [0,1]): the median (a stable mid-gray) and the 98th percentile
 /// (a robust white point, insensitive to a few hot specular pixels). Single
 /// pass over the mono, O(n) — no sort of a 2048² buffer.
+///
+/// `pub(crate)` so the CPU thumbnail bake reuses the same anchor machinery the
+/// detail shader does, keeping grid and detail measurements aligned.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn tone_anchors(mono: &[f32]) -> (f32, f32) {
+pub(crate) fn tone_anchors(mono: &[f32]) -> (f32, f32) {
     // Heap-allocated (4096 × u64 ≈ 32 KB would trip `large_stack_arrays`).
     let mut bins = vec![0_u64; ANCHOR_BINS];
     for &v in mono {
@@ -247,10 +250,35 @@ fn percentile(bins: &[u64], total: usize, q: f32) -> f32 {
 /// `(ratio, exp)` pair the WGSL shader applies as `ratio·p^exp`. At
 /// `kc = kr = 1` the remap is the identity (`ratio^... = 1`, `exp = 1`), so
 /// untouched renders stay byte-identical.
-fn curve_remap(contrast: f32, rolloff: f32, mid: f32, white: f32) -> (f32, f32) {
+///
+/// `pub(crate)` — the shared helper the CPU thumbnail bake reuses so grid and
+/// detail agree, alongside the GPU `prepare()` fold.
+pub(crate) fn curve_remap(contrast: f32, rolloff: f32, mid: f32, white: f32) -> (f32, f32) {
     let ratio = white.powf(1.0 - rolloff) * mid.powf(rolloff * (1.0 - contrast));
     let exponent = contrast * rolloff;
     (ratio, exponent)
+}
+
+/// Apply the composed tone remap `T(p) = clamp(ratio · p^exp, 0, 1)` to a mono
+/// positive in place.
+///
+/// This is the CPU twin of the WGSL's `clamp(curve_ratio * pow(p, curve_exp),
+/// 0, 1)` — the exact expression the grid thumbnail bake must match so a
+/// baked tile and the detail shader produce identical tones. Identity at the
+/// `(1.0, 1.0)` defaults; `mid`/`white` are the same anchors [`tone_anchors`]
+/// measures. A separate op from exposure (which the shader applies after), so
+/// callers must apply this *before* the `2^EV` gain to mirror the shader.
+pub(crate) fn apply_curve(
+    mono: &mut [f32],
+    contrast: f32,
+    rolloff: f32,
+    mid: f32,
+    white: f32,
+) {
+    let (ratio, exponent) = curve_remap(contrast, rolloff, mid, white);
+    for value in mono.iter_mut() {
+        *value = (ratio * value.powf(exponent)).clamp(0.0, 1.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +879,39 @@ mod tests {
         let (mid, white) = tone_anchors(&[0.0; 256]);
         assert_eq!(mid, MIN_ANCHOR);
         assert_eq!(white, MIN_ANCHOR);
+    }
+
+    #[test]
+    fn apply_curve_is_identity_at_defaults() {
+        // The grid thumbnail bake calls `apply_curve` with the identity curve,
+        // so untouched renders must be byte-identical (no phantom tone shift).
+        let mut values = vec![0.0_f32, 0.13, 0.5, 0.84, 1.0];
+        let original = values.clone();
+        apply_curve(&mut values, 1.0, 1.0, 0.45, 0.92);
+        assert!(
+            values
+                .iter()
+                .zip(&original)
+                .all(|(a, b)| (a - b).abs() < 1e-6),
+            "identity curve changed values: {values:?}"
+        );
+    }
+
+    #[test]
+    fn apply_curve_matches_the_wgsl_expression() {
+        // `apply_curve` is the CPU twin of the WGSL's
+        // `clamp(curve_ratio * pow(p, curve_exp), 0, 1)` — re-derive the same
+        // expression independently and confirm they agree on a range of inputs.
+        let (mid, white) = (0.42_f32, 0.93_f32);
+        let (contrast, rolloff) = (1.25_f32, 0.7_f32);
+        let (ratio, exponent) = curve_remap(contrast, rolloff, mid, white);
+
+        for p in [0.0_f32, 0.05, 0.25, 0.42, 0.7, 0.93, 1.0, 3.0] {
+            let expected = (ratio * p.powf(exponent)).clamp(0.0, 1.0);
+            let mut v = [p];
+            apply_curve(&mut v, contrast, rolloff, mid, white);
+            assert!((v[0] - expected).abs() < 1e-6, "p {p}: {v:?} vs {expected}");
+        }
     }
 
     #[test]
