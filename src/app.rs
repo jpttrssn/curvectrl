@@ -8,13 +8,14 @@ use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
+use cosmic::Application;
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
-use cosmic::iced::{Alignment, ContentFit, Length, Point, Subscription};
+use cosmic::iced::{ContentFit, Length, Point, Subscription};
 use cosmic::prelude::*;
-use cosmic::widget::{self, about::About, icon, image::Handle, menu, nav_bar};
-use std::collections::HashMap;
+use cosmic::widget::{self, about::About, icon, image::Handle, menu};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -64,13 +65,25 @@ pub struct AppModel {
     context_page: ContextPage,
     /// The about page for this app.
     about: About,
-    /// Contains items assigned to the nav bar panel.
-    nav: nav_bar::Model,
-    /// Key bindings for the application's menu bar.
+    /// Key bindings for the application's menu bar, consumed by
+    /// `cosmic::widget::menu::items` (values are unit [`MenuAction`]s, hence the
+    /// allow: the map shape is imposed by the menu API, not by choice).
+    #[allow(clippy::zero_sized_map_values)]
     key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Configuration data that persists between application runs.
     config: Config,
-    /// File entries from the pictures directory, displayed as tiles on Page 1.
+    /// Film rolls listed on the library page, one directory of negatives each.
+    rolls: Vec<Roll>,
+    /// Directory of the roll currently drilled into (its frame grid and the
+    /// detail view). `None` shows the library page of rolls.
+    active: Option<PathBuf>,
+    /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
+    /// roll tiles never double-spawn against the startup chain (memory bound).
+    cover_inflight: Vec<PathBuf>,
+    /// Roll search term: filters roll names on the library page and frame
+    /// names inside an open roll.
+    query: String,
+    /// File entries from the open roll, displayed as tiles on its frame grid.
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
     selected: Option<String>,
@@ -123,7 +136,21 @@ pub struct AppModel {
     next_image_id: u64,
 }
 
-/// A file entry displayed as a tile on Page 1.
+/// A film roll: a user-chosen directory of negatives, listed as a cover tile
+/// on the library page. Clicking a roll drills into its frame grid.
+#[derive(Debug, Clone)]
+pub struct Roll {
+    /// Absolute directory holding this roll's negatives.
+    pub dir: PathBuf,
+    /// Display name (the directory's final component).
+    pub name: String,
+    /// The roll's cover file name (first sorted non-dot file), if any.
+    pub cover: Option<String>,
+    /// Decoded cover thumbnail state.
+    pub thumb: Thumb,
+}
+
+/// A file entry displayed as a tile on the open roll's frame grid.
 struct Tile {
     /// File name.
     name: String,
@@ -131,8 +158,9 @@ struct Tile {
     thumb: Thumb,
 }
 
-/// Thumbnail loading state of a [`Tile`].
-enum Thumb {
+/// Thumbnail loading state of a [`Tile`] or roll cover.
+#[derive(Debug, Clone)]
+pub enum Thumb {
     /// The file has not been decoded yet.
     Loading,
     /// A decoded RGBA thumbnail.
@@ -149,7 +177,24 @@ pub enum Message {
     /// A hi-res decode for the detail view finished, returning the linear
     /// pre-sRGB mono buffer for the GPU shader.
     DetailReady(String, Result<(Vec<f32>, u32, u32, u32), ()>),
-    FilesLoaded(Vec<String>),
+    /// The startup roll scan finished.
+    RollsLoaded(Vec<Roll>),
+    /// A single roll was scanned after being added; push it into the library.
+    RollInfoLoaded(Roll),
+    /// A roll cover decode finished.
+    CoverReady(PathBuf, Result<Handle, ()>),
+    /// The folder picker returned a roll directory to add.
+    RollAdded(PathBuf),
+    /// The user pressed the Add roll button.
+    AddRoll,
+    /// A roll tile was clicked — drill into its frame grid.
+    RollActivated(PathBuf),
+    /// The frame scan for an opened roll finished.
+    RollOpened(PathBuf, Vec<String>),
+    /// Return from the frame grid to the library (roll grid).
+    BackToRolls,
+    /// The search field changed.
+    SearchChanged(String),
     LaunchUrl(String),
     ThumbReady(String, Result<Handle, ()>),
     /// A thumbnail was double-clicked, opening it in the detail view.
@@ -209,25 +254,6 @@ impl cosmic::Application for AppModel {
         mut core: cosmic::Core,
         _flags: Self::Flags,
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
-        // Create a nav bar with three page items.
-        let mut nav = nav_bar::Model::default();
-
-        nav.insert()
-            .text(fl!("page-id", num = 1))
-            .data::<Page>(Page::Page1)
-            .icon(icon::from_name("applications-science-symbolic"))
-            .activate();
-
-        nav.insert()
-            .text(fl!("page-id", num = 2))
-            .data::<Page>(Page::Page2)
-            .icon(icon::from_name("applications-system-symbolic"));
-
-        nav.insert()
-            .text(fl!("page-id", num = 3))
-            .data::<Page>(Page::Page3)
-            .icon(icon::from_name("applications-games-symbolic"));
-
         // Create the about widget
         let about = About::default()
             .name(fl!("app-title"))
@@ -245,7 +271,6 @@ impl cosmic::Application for AppModel {
             core,
             context_page: ContextPage::default(),
             about,
-            nav,
             key_binds: HashMap::new(),
             // Optional configuration file for an application.
             config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
@@ -260,6 +285,10 @@ impl cosmic::Application for AppModel {
                     }
                 })
                 .unwrap_or_default(),
+            rolls: Vec::new(),
+            active: None,
+            cover_inflight: Vec::new(),
+            query: String::new(),
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
@@ -280,10 +309,19 @@ detail_pan: (0.0, 0.0),
             next_image_id: 0,
         };
 
-        // Set the window title and scan the pictures directory in parallel.
+        // Seed the POC's original single roll directory so a fresh config
+        // shows the same frames the app always has, without any user action.
+        if app.config.rolls.is_empty()
+            && let Some(default) = default_library_dir()
+        {
+            app.config.rolls.push(default.to_string_lossy().into_owned());
+        }
+
+        // Set the window title and scan the configured roll directories.
+        let rolls = app.config.rolls.clone();
         let command = Task::batch([
             app.update_title(),
-            cosmic::task::future(async { Message::FilesLoaded(load_files().await) }),
+            cosmic::task::future(async { Message::RollsLoaded(load_rolls(rolls).await) }),
         ]);
 
         (app, command)
@@ -320,11 +358,6 @@ detail_pan: (0.0, 0.0),
             .into()]
     }
 
-    /// Enables the COSMIC application to create a nav bar with this model.
-    fn nav_model(&self) -> Option<&nav_bar::Model> {
-        Some(&self.nav)
-    }
-
     /// Display a context drawer if the context page is requested.
     fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, Self::Message>> {
         if !self.core.window.show_context {
@@ -357,93 +390,21 @@ detail_pan: (0.0, 0.0),
     /// Application events will be processed through the view. Any messages emitted by
     /// events received by widgets will be passed to the update method.
     fn view(&self) -> Element<'_, Self::Message> {
-        let space_s = cosmic::theme::spacing().space_s;
-        let content: Element<_> = match self.nav.active_data::<Page>().unwrap() {
-            Page::Page1 => {
-                let tiles: Element<'_, Message> = if self.tiles.is_empty() {
-                    widget::container(widget::text(fl!("no-files")))
-                        .width(Length::Fill)
-                        .align_x(Horizontal::Center)
-                        .into()
-                } else {
-                    let grid = Grid::with_children(self.tiles.iter().map(tile_view))
-                        .fluid(THUMB_SIZE)
-                        .height(grid::Sizing::AspectRatio(TILE_ASPECT))
-                        .spacing(space_s);
-
-                    widget::scrollable(grid).height(Length::Fill).into()
-                };
-
-                // The grid stays mounted (scroll position persists) under an
-                // opaque, theme-colored detail surface that captures input,
-                // so the detail view cannot leak wheel/clicks to the grid.
-                let mut page = Stack::with_capacity(1);
-                page = page.push(tiles);
-
-                if let Some(detail) = detail_view(self) {
-                    page = page.push(
-                        widget::container(
-                            MouseArea::new(detail)
-                                .on_press(Message::Ignore)
-                                .on_double_press(Message::Ignore)
-                                .on_double_click(Message::Ignore)
-                                .on_release(Message::Ignore)
-                                .on_right_press(Message::Ignore)
-                                .on_right_release(Message::Ignore)
-                                .on_middle_press(Message::Ignore)
-                                .on_middle_release(Message::Ignore)
-                                .on_scroll(|_delta| Message::Ignore),
-                        )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .style(|theme| cosmic::iced::widget::container::Style {
-                            background: Some(cosmic::iced::Background::Color(
-                                theme.cosmic().background(false).base.into(),
-                            )),
-                            ..Default::default()
-                        }),
-                    );
-                }
-
-                page.width(Length::Fill).height(Length::Fill).into()
-            }
-
-            Page::Page2 => {
-                let header = widget::row::with_capacity(2)
-                    .push(widget::text::title1(fl!("welcome")))
-                    .push(widget::text::title3(fl!("page-id", num = 2)))
-                    .align_y(Alignment::End)
-                    .spacing(space_s);
-
-                widget::column::with_capacity(1)
-                    .push(header)
-                    .spacing(space_s)
-                    .height(Length::Fill)
-                    .into()
-            }
-
-            Page::Page3 => {
-                let header = widget::row::with_capacity(2)
-                    .push(widget::text::title1(fl!("welcome")))
-                    .push(widget::text::title3(fl!("page-id", num = 3)))
-                    .align_y(Alignment::End)
-                    .spacing(space_s);
-
-                widget::column::with_capacity(1)
-                    .push(header)
-                    .spacing(space_s)
-                    .height(Length::Fill)
-                    .into()
-            }
+        // A fixed controls row (Add roll / back + search) stays above the
+        // scrollable content: the library page of roll covers, or an open
+        // roll's frame grid with its detail overlay.
+        let controls = controls_row(self);
+        let content: Element<_> = match self.active.as_deref() {
+            Some(_) => frames_view(self),
+            None => library_view(self),
         };
 
-        widget::container(content)
-            .width(Length::Fill)
+        widget::column::with_capacity(2)
+            .push(controls)
+            .push(content)
+            .spacing(cosmic::theme::spacing().space_s)
             .height(Length::Fill)
-            .apply(widget::container)
             .width(Length::Fill)
-            .align_x(Horizontal::Center)
-            .align_y(Vertical::Center)
             .into()
     }
 
@@ -501,12 +462,19 @@ detail_pan: (0.0, 0.0),
         match message {
             Message::DetailClosed => {
                 self.persist_roll();
-                self.selected = None;
-                self.clear_detail();
-                // Without a selection the editing drawer has nothing to
-                // show; close it so it does not linger empty.
-                if self.context_page == ContextPage::Editing && self.core.window.show_context {
-                    self.core_mut().set_show_context(false);
+                if self.selected.is_some() {
+                    self.selected = None;
+                    self.clear_detail();
+                    // Without a selection the editing drawer has nothing to
+                    // show; close it so it does not linger empty.
+                    self.close_editing();
+                } else if self.active.is_some() {
+                    // No detail open: Escape backs out of the roll entirely.
+                    self.active = None;
+                    self.tiles = Vec::new();
+                    self.thumb_inflight.clear();
+                    self.clear_detail();
+                    self.close_editing();
                 }
                 Task::none()
             }
@@ -613,16 +581,84 @@ detail_pan: (0.0, 0.0),
                 Task::none()
             }
 
-            Message::FilesLoaded(files) => {
+            Message::RollsLoaded(rolls) => {
+                self.rolls = rolls;
+                // A refresh supersedes any earlier cover chain.
+                self.cover_inflight.clear();
+                self.decode_covers()
+            }
+
+            Message::RollInfoLoaded(roll) => {
+                if self.rolls.iter().any(|existing| existing.dir == roll.dir) {
+                    return Task::none();
+                }
+                self.rolls.push(roll);
+                self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
+                self.decode_covers()
+            }
+
+            Message::CoverReady(dir, result) => {
+                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                    roll.thumb = match result {
+                        Ok(handle) => Thumb::Ready(handle),
+                        Err(()) => Thumb::Failed,
+                    };
+                }
+                self.cover_inflight.retain(|pending| pending != &dir);
+                self.decode_covers()
+            }
+
+            Message::AddRoll => cosmic::task::future(async {
+                match cosmic::dialog::file_chooser::open::Dialog::new()
+                    .open_folder()
+                    .await
+                {
+                    Ok(response) => response
+                        .url()
+                        .to_file_path()
+                        .map_or(Message::Ignore, Message::RollAdded),
+                    // Cancelled (or a portal failure) is a no-op.
+                    Err(_) => Message::Ignore,
+                }
+            }),
+
+            Message::RollAdded(dir) => {
+                // Persist the new roll; the library page owns the roll list.
+                if self.active.is_none() && !self.rolls.iter().any(|roll| roll.dir == dir) {
+                    self.config.rolls.push(dir.to_string_lossy().into_owned());
+                    self.persist_config();
+                }
+                // Scan the chosen directory for its cover and display name.
+                cosmic::task::future(async move { Message::RollInfoLoaded(load_roll(dir).await) })
+            }
+
+            Message::RollActivated(dir) => {
+                if self.active.as_deref() == Some(dir.as_path()) {
+                    return Task::none();
+                }
+                // The outgoing roll keeps its unsaved edits.
+                self.persist_roll();
+                self.active = Some(dir.clone());
+                self.selected = None;
+                self.clear_detail();
+                self.close_editing();
+                cosmic::task::future(async move {
+                    let files = load_files_in(dir.clone()).await;
+                    Message::RollOpened(dir, files)
+                })
+            }
+
+            Message::RollOpened(dir, files) => {
+                // A stale scan from a roll closed mid-scan must not land.
+                if self.active.as_deref() != Some(dir.as_path()) {
+                    return Task::none();
+                }
                 // Load the roll manifest and reconcile it against what is on
                 // disk, so edits for removed files never reattach to a name
                 // that later returns.
-                self.roll = library_dir()
-                    .map(|dir| edit_manifest::load_roll_manifest(&dir))
-                    .unwrap_or_default();
+                self.roll = edit_manifest::load_roll_manifest(&dir);
                 edit_manifest::reconcile(&mut self.roll, &files);
 
-                // A refresh supersedes any earlier chain.
                 self.thumb_inflight.clear();
 
                 self.tiles = files
@@ -634,6 +670,23 @@ detail_pan: (0.0, 0.0),
                     .collect();
 
                 self.decode_next()
+            }
+
+            Message::BackToRolls => {
+                self.persist_roll();
+                self.active = None;
+                self.selected = None;
+                self.tiles = Vec::new();
+                self.thumb_inflight.clear();
+                self.detail_inflight = None;
+                self.clear_detail();
+                self.close_editing();
+                Task::none()
+            }
+
+            Message::SearchChanged(query) => {
+                self.query = query;
+                Task::none()
             }
 
             Message::ThumbReady(name, result) => {
@@ -697,28 +750,13 @@ detail_pan: (0.0, 0.0),
     fn on_close_requested(&self, _id: cosmic::iced::window::Id) -> Option<Self::Message> {
         Some(Message::EditSave)
     }
-
-    /// Called when a nav item is selected.
-    fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {
-        // Activate the page in the model.
-        self.nav.activate(id);
-
-        self.update_title()
-    }
 }
 
 impl AppModel {
     /// Updates the header and window titles.
     pub fn update_title(&mut self) -> Task<cosmic::Action<Message>> {
-        let mut window_title = fl!("app-title");
-
-        if let Some(page) = self.nav.text(self.nav.active()) {
-            window_title.push_str(" — ");
-            window_title.push_str(page);
-        }
-
         if let Some(id) = self.core.main_window_id() {
-            self.set_window_title(window_title, id)
+            self.set_window_title(fl!("app-title"), id)
         } else {
             Task::none()
         }
@@ -735,6 +773,9 @@ impl AppModel {
     /// chain or re-bake) bakes in the version of the edit that is current when
     /// it actually decodes.
     fn decode_next(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(dir) = self.active.clone() else {
+            return Task::none();
+        };
         let capacity = MAX_CONCURRENT_THUMBS.saturating_sub(self.thumb_inflight.len());
         if capacity == 0 {
             return Task::none();
@@ -759,7 +800,38 @@ impl AppModel {
         Task::batch(
             pending
                 .into_iter()
-                .map(|(name, ev)| cosmic::task::future(decode_thumbnail(name, ev))),
+                .map(move |(name, ev)| cosmic::task::future(decode_thumbnail(dir.clone(), name, ev))),
+        )
+    }
+
+    /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] roll-cover
+    /// thumbnails, mirroring the frame chain's bounds and de-duplication.
+    fn decode_covers(&mut self) -> Task<cosmic::Action<Message>> {
+        let capacity = MAX_CONCURRENT_THUMBS.saturating_sub(self.cover_inflight.len());
+        if capacity == 0 {
+            return Task::none();
+        }
+
+        let pending: Vec<(PathBuf, String)> = self
+            .rolls
+            .iter()
+            .filter(|roll| matches!(roll.thumb, Thumb::Loading))
+            .filter(|roll| !self.cover_inflight.iter().any(|dir| dir == &roll.dir))
+            .filter_map(|roll| roll.cover.clone().map(|name| (roll.dir.clone(), name)))
+            .take(capacity)
+            .collect();
+
+        if pending.is_empty() {
+            return Task::none();
+        }
+
+        self.cover_inflight
+            .extend(pending.iter().map(|(dir, _)| dir.clone()));
+
+        Task::batch(
+            pending
+                .into_iter()
+                .map(|(dir, name)| cosmic::task::future(decode_cover(dir, name))),
         )
     }
 
@@ -807,7 +879,11 @@ impl AppModel {
             .expect("selected when a decode is due");
         self.detail_inflight = Some(name.clone());
 
-        cosmic::task::future(decode_detail(name, cap))
+        let Some(dir) = self.active.clone() else {
+            return Task::none();
+        };
+
+        cosmic::task::future(decode_detail(dir, name, cap))
     }
 
     /// Reset all detail-view buffers, crossfade state, the view transform, and
@@ -827,13 +903,32 @@ impl AppModel {
         self.exposure_ev = 0.0;
     }
 
-    /// Writes the in-memory roll edits to the manifest file on disk.
+    /// Writes the in-memory roll edits to the open roll's manifest file on disk.
     fn persist_roll(&self) {
-        let Some(dir) = library_dir() else {
+        let Some(dir) = &self.active else {
             return;
         };
-        if let Err(err) = edit_manifest::save_roll_manifest(&dir, &self.roll) {
+        if let Err(err) = edit_manifest::save_roll_manifest(dir, &self.roll) {
             eprintln!("failed to save edits: {err}");
+        }
+    }
+
+    /// Persists the user-controlled `rolls` list to the app config, so added
+    /// rolls survive restarts. The existing config file is written in place
+    /// (a fresh `Config` context, matching the one used at load).
+    fn persist_config(&self) {
+        let Ok(context) = cosmic_config::Config::new(Self::APP_ID, Config::VERSION) else {
+            return;
+        };
+        if let Err(err) = self.config.write_entry(&context) {
+            eprintln!("failed to save config: {err}");
+        }
+    }
+
+    /// Closes the editing context drawer when it has nothing left to show.
+    fn close_editing(&mut self) {
+        if self.context_page == ContextPage::Editing && self.core.window.show_context {
+            self.core_mut().set_show_context(false);
         }
     }
 
@@ -957,23 +1052,70 @@ fn detail_trace(args: std::fmt::Arguments<'_>) {
     }
 }
 
-/// The directory the POC treats as its one film roll.
-///
-/// Eventually this becomes the first entry in a user-managed list of roll
-/// directories; the storage layer is already parameterized by directory.
-fn library_dir() -> Option<PathBuf> {
+/// The default library directory a fresh install seeds, preserving the POC's
+/// original single-roll arrangement: the user's `~/Pictures/exposure`.
+fn default_library_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|home| Path::new(&home).join("Pictures").join("exposure"))
 }
 
-/// Scans the film roll directory for regular files and returns their sorted
-/// names. Dotfiles (including the edit manifest) are never shown as tiles.
-async fn load_files() -> Vec<String> {
-    let Some(dir) = library_dir() else {
-        return Vec::new();
+/// Loads one roll's metadata: display name (directory leaf) and cover file
+/// (first sorted non-dot file), with nothing decoded yet.
+async fn load_roll(dir: PathBuf) -> Roll {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
+    let cover = cover_name(&dir).await;
+    Roll {
+        dir,
+        name,
+        cover,
+        thumb: Thumb::Loading,
+    }
+}
+
+/// Loads roll metadata for each configured roll directory, de-duplicated and
+/// sorted by display name.
+async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
+    let mut seen = HashSet::new();
+    let mut loaded = Vec::with_capacity(rolls.len());
+    for entry in rolls {
+        let dir = PathBuf::from(entry);
+        if !seen.insert(dir.clone()) {
+            continue;
+        }
+        loaded.push(load_roll(dir).await);
+    }
+    loaded.sort_by(|a, b| a.name.cmp(&b.name));
+    loaded
+}
+
+/// Returns the first regular non-dot file name in `dir` in sorted order — the
+/// roll's cover, if the roll has any negatives yet.
+async fn cover_name(dir: &Path) -> Option<String> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return None;
     };
 
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_type().await.is_ok_and(|ty| ty.is_file())
+            && let Some(name) = entry.file_name().into_string().ok()
+            && !name.starts_with('.')
+        {
+            files.push(name);
+        }
+    }
+
+    files.sort();
+    files.into_iter().next()
+}
+
+/// Scans a roll directory for its frame files and returns their sorted names.
+/// Dotfiles (including the edit manifest) are never shown as tiles.
+async fn load_files_in(dir: PathBuf) -> Vec<String> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
     };
@@ -990,6 +1132,140 @@ async fn load_files() -> Vec<String> {
 
     files.sort();
     files
+}
+
+/// Renders the fixed controls row above the content: Add roll (library page)
+/// or a back button (inside a roll), with the roll/frame search beside them.
+///
+/// Stays outside the scrollable, so the tools remain visible while the grid
+/// scrolls — and above the detail overlay, where the back button doubles as
+/// an out-of-roll escape.
+fn controls_row(app: &AppModel) -> Element<'_, Message> {
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let mut tools = widget::row::with_capacity(2).spacing(space_s).width(Length::Fill);
+
+    if app.active.is_some() {
+        tools = tools.push(
+            widget::button::standard(fl!("back-to-rolls"))
+                .leading_icon(widget::icon::from_name("go-previous-symbolic"))
+                .on_press(Message::BackToRolls),
+        );
+    } else {
+        tools = tools.push(
+            widget::button::standard(fl!("add-roll"))
+                .leading_icon(widget::icon::from_name("list-add-symbolic"))
+                .on_press(Message::AddRoll),
+        );
+    }
+
+    tools = tools.push(
+        widget::search_input(fl!("search-rolls"), app.query.as_str())
+            .on_input(Message::SearchChanged)
+            .width(Length::Fill),
+    );
+
+    widget::container(tools)
+        .width(Length::Fill)
+        .padding(space_s)
+        .into()
+}
+
+/// Renders the library page: a responsive grid of roll cover tiles, or an
+/// empty-state message when there are no rolls.
+fn library_view(app: &AppModel) -> Element<'_, Message> {
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let query = app.query.trim().to_lowercase();
+    let matched: Vec<&Roll> = app
+        .rolls
+        .iter()
+        .filter(move |roll| {
+            query.is_empty() || roll.name.to_lowercase().contains(&query)
+        })
+        .collect();
+
+    if matched.is_empty() {
+        return widget::container(widget::text(if app.rolls.is_empty() {
+            fl!("no-rolls")
+        } else {
+            fl!("no-rolls-found")
+        }))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .into();
+    }
+
+    let grid = Grid::with_children(matched.into_iter().map(roll_tile))
+        .fluid(THUMB_SIZE)
+        .height(grid::Sizing::AspectRatio(TILE_ASPECT))
+        .spacing(space_s);
+
+    widget::scrollable(grid).height(Length::Fill).into()
+}
+
+/// Renders an open roll's frame grid (search-filtered), with the detail view
+/// overlaid on an opaque surface when a frame is selected.
+///
+/// The grid stays mounted (scroll position persists) under the detail surface
+/// that captures input, so the detail view cannot leak wheel/clicks to it.
+fn frames_view(app: &AppModel) -> Element<'_, Message> {
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let query = app.query.trim().to_lowercase();
+    let matched: Vec<&Tile> = app
+        .tiles
+        .iter()
+        .filter(|tile| query.is_empty() || tile.name.to_lowercase().contains(&query))
+        .collect();
+
+    let tiles: Element<'_, Message> = if matched.is_empty() {
+        widget::container(widget::text(fl!("no-files")))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .into()
+    } else {
+        let grid = Grid::with_children(matched.into_iter().map(tile_view))
+            .fluid(THUMB_SIZE)
+            .height(grid::Sizing::AspectRatio(TILE_ASPECT))
+            .spacing(space_s);
+
+        widget::scrollable(grid).height(Length::Fill).into()
+    };
+
+    let mut page = Stack::with_capacity(1);
+    page = page.push(tiles);
+
+    if let Some(detail) = detail_view(app) {
+        page = page.push(
+            widget::container(
+                MouseArea::new(detail)
+                    .on_press(Message::Ignore)
+                    .on_double_press(Message::Ignore)
+                    .on_double_click(Message::Ignore)
+                    .on_release(Message::Ignore)
+                    .on_right_press(Message::Ignore)
+                    .on_right_release(Message::Ignore)
+                    .on_middle_press(Message::Ignore)
+                    .on_middle_release(Message::Ignore)
+                    .on_scroll(|_delta| Message::Ignore),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|theme| cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(
+                    theme.cosmic().background(false).base.into(),
+                )),
+                ..Default::default()
+            }),
+        );
+    }
+
+    page.width(Length::Fill).height(Length::Fill).into()
 }
 
 /// Renders the editing panel for the context drawer.
@@ -1062,7 +1338,40 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .into()
 }
 
-/// Renders a single Page 1 tile, filling the square cell the grid assigns it.
+/// Renders a library page roll card, filling the square cell the grid assigns
+/// it. Clicking the cover drills into the roll's frame grid.
+fn roll_tile(roll: &Roll) -> Element<'_, Message> {
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let preview: Element<'_, Message> = match &roll.thumb {
+        Thumb::Ready(handle) => MouseArea::new(
+            widget::image(handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(ContentFit::Contain),
+        )
+        .on_press(Message::RollActivated(roll.dir.clone()))
+        .into(),
+        Thumb::Loading => icon::from_name("image-loading-symbolic").icon().into(),
+        Thumb::Failed => icon::from_name("image-missing-symbolic").icon().into(),
+    };
+
+    widget::column::with_capacity(2)
+        .push(
+            widget::container(preview)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center),
+        )
+        .push(widget::text(&roll.name))
+        .spacing(space_s)
+        .align_x(Horizontal::Center)
+        .into()
+}
+
+/// Renders a single frame tile of the open roll, filling the square cell the
+/// grid assigns it.
 fn tile_view(tile: &Tile) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
@@ -1230,23 +1539,32 @@ fn zoom_about_anchor(
     )
 }
 
-/// Decodes a RAW file from the pictures directory into a thumbnail message,
-/// baking in the given exposure so the grid tile reflects the stored edit.
-async fn decode_thumbnail(name: String, exposure_ev: f32) -> Message {
+/// Decodes a RAW frame from the open roll into a thumbnail message, baking in
+/// the given exposure so the grid tile reflects the stored edit.
+async fn decode_thumbnail(dir: PathBuf, name: String, exposure_ev: f32) -> Message {
     let result =
-        decode_raw(name.clone(), move |image| convert_thumbnail(image, THUMB_SIZE, exposure_ev))
+        decode_raw(dir, name.clone(), move |image| convert_thumbnail(image, THUMB_SIZE, exposure_ev))
             .await;
 
     Message::ThumbReady(name, result)
 }
 
-/// Decodes a RAW file from the pictures directory into a hi-res message for
+/// Decodes a roll's cover file into a thumbnail message (no stored exposure:
+/// roll cards are not per-frame editable).
+async fn decode_cover(dir: PathBuf, name: String) -> Message {
+    let result =
+        decode_raw(dir.clone(), name, |image| convert_thumbnail(image, THUMB_SIZE, 0.0)).await;
+
+    Message::CoverReady(dir, result)
+}
+
+/// Decodes a RAW frame from the open roll into a hi-res message for
 /// the detail view, returning the oriented linear mono data that the GPU
 /// shader uploads and applies exposure to.  `max_edge` caps the long edge in
 /// pixels; the overview level uses [`HI_RES_SIZE`], the native level-up
 /// [`MAX_TEXTURE_EDGE`].
-async fn decode_detail(name: String, max_edge: u32) -> Message {
-    let result = decode_raw_detail(name.clone(), max_edge).await;
+async fn decode_detail(dir: PathBuf, name: String, max_edge: u32) -> Message {
+    let result = decode_raw_detail(dir, name.clone(), max_edge).await;
     Message::DetailReady(name, result)
 }
 
@@ -1260,17 +1578,11 @@ async fn decode_detail(name: String, max_edge: u32) -> Message {
 /// scaled down from (< `max_edge` means the overview is already full-res).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn decode_raw_detail(
+    dir: PathBuf,
     name: String,
     max_edge: u32,
 ) -> Result<(Vec<f32>, u32, u32, u32), ()> {
-    let Ok(home) = std::env::var("HOME") else {
-        return Err(());
-    };
-
-    let path = Path::new(&home)
-        .join("Pictures")
-        .join("exposure")
-        .join(name);
+    let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
         let image = rawloader::decode_file(&path).map_err(|_| ())?;
@@ -1331,14 +1643,10 @@ async fn decode_raw_detail(
 
 /// Runs a RAW decode plus conversion on a blocking worker thread so the UI
 /// never stalls on CPU-heavy work.
-async fn decode_raw<F>(name: String, convert: F) -> Result<Handle, ()>
+async fn decode_raw<F>(dir: PathBuf, name: String, convert: F) -> Result<Handle, ()>
 where
     F: Fn(&rawloader::RawImage) -> Result<Handle, ()> + Send + 'static,
 {
-    let Some(dir) = library_dir() else {
-        return Err(());
-    };
-
     let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
@@ -2008,13 +2316,6 @@ fn detail_result_is_current(
     finished: &str,
 ) -> bool {
     selected == Some(finished) && inflight == Some(finished)
-}
-
-/// The page to display in the application.
-pub enum Page {
-    Page1,
-    Page2,
-    Page3,
 }
 
 /// The context page to display in the context drawer.
