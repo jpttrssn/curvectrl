@@ -25,6 +25,6 @@ editing-title = Editing
 editing-toggle = Show editing panel
 exposure-label = Exposure
 contrast-label = Contrast
-rolloff-label = Highlight rolloff
+rolloff-label = Highlights
 shadows-label = Shadows
 reset-all = Reset all edits
