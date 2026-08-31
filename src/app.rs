@@ -12,6 +12,7 @@ use cosmic::Application;
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
+use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::{ContentFit, Length, Point, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu};
@@ -90,6 +91,15 @@ pub struct AppModel {
     /// resizes, matching iced's `Grid::fluid` math), so Up/Down keyboard
     /// navigation can jump by exactly one row.
     grid_cols: usize,
+    /// The most recent viewport of whichever grid is mounted (library or frame
+    /// page — they are mutually exclusive). Drives keyboard scroll-into-view:
+    /// knowing the visible height, content height, and current translation lets
+    /// `Nav` reveal the highlighted tile precisely. Cleared when the page
+    /// changes; re-captured by each grid's `on_scroll`.
+    grid_viewport: Option<Viewport>,
+    /// The window height from the last resize, used only to estimate the grid
+    /// viewport height before the first real scroll has been observed.
+    window_height: f32,
     /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
     /// roll tiles never double-spawn against the startup chain (memory bound).
     cover_inflight: Vec<PathBuf>,
@@ -231,6 +241,10 @@ pub enum Message {
     /// A frame tile was single-clicked — highlight it (accent ring) without
     /// opening the detail view.
     FrameSelected(String),
+    /// A grid scrollable reported its geometry (bounds, content height, current
+    /// translation). Cached so keyboard navigation can reveal the highlighted
+    /// tile by scrolling the grid when it moves out of the visible viewport.
+    GridViewport(Viewport),
     /// The frame scan for an opened roll finished.
     RollOpened(PathBuf, Vec<String>),
     /// Return from the frame grid to the library (roll grid).
@@ -350,6 +364,10 @@ impl cosmic::Application for AppModel {
             frame_selected: None,
             // A 3-wide grid is a safe initial guess until the first resize.
             grid_cols: 3,
+            // No viewport is known until the grid lays out and scrolls; the
+            // resize handler estimates the height before that.
+            grid_viewport: None,
+            window_height: 600.0,
             cover_inflight: Vec::new(),
             query: String::new(),
             tiles: Vec::new(),
@@ -397,16 +415,18 @@ detail_pan: (0.0, 0.0),
 
     /// Track the content width so arrow-key navigation of the library grid can
     /// mirror iced's `Grid::fluid` column count exactly
-    /// (`ceil((width + spacing) / (max_width + spacing))`).
+    /// (`ceil((width + spacing) / (max_width + spacing))`), and remember the
+    /// window height for the pre-scroll viewport estimate.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn on_window_resize(
         &mut self,
         _id: cosmic::iced::window::Id,
         width: f32,
-        _height: f32,
+        height: f32,
     ) {
         let spacing = f32::from(cosmic::theme::spacing().space_s);
-        self.grid_cols = (((width + spacing) / (THUMB_SIZE + spacing)).ceil() as usize).max(1);
+        self.grid_cols = grid_num_cols(width, spacing).max(1);
+        self.window_height = height;
     }
 
     /// Elements to pack at the start of the header bar.
@@ -608,6 +628,7 @@ detail_pan: (0.0, 0.0),
                     // ...then backs out of the roll entirely.
                     self.active = None;
                     self.frame_selected = None;
+                    self.grid_viewport = None;
                     self.tiles = Vec::new();
                     self.thumb_inflight.clear();
                     self.clear_detail();
@@ -833,21 +854,27 @@ detail_pan: (0.0, 0.0),
                         {
                             return self.open_frame(matched[target].name.clone());
                         }
-                    } else {
-                        let matched = filtered_tiles(&self.tiles, &self.query);
-                        let selected = self
-                            .frame_selected
-                            .as_ref()
-                            .and_then(|name| matched.iter().position(|tile| tile.name == *name));
-                        let len = matched.len();
-                        if let Some(target) = nav_target(selected, len, self.grid_cols.max(1), dir) {
-                            self.frame_selected = Some(matched[target].name.clone());
-                        }
+                        return Task::none();
+                    }
+
+                    // Bare frame grid: move the highlight, then reveal it if it
+                    // stepped out of the viewport.
+                    let matched = filtered_tiles(&self.tiles, &self.query);
+                    let selected = self
+                        .frame_selected
+                        .as_ref()
+                        .and_then(|name| matched.iter().position(|tile| tile.name == *name));
+                    let len = matched.len();
+                    let cols = self.nav_cols();
+                    if let Some(target) = nav_target(selected, len, cols, dir) {
+                        self.frame_selected = Some(matched[target].name.clone());
+                        return self.scroll_selection_into_view("frames-grid", target, len, cols);
                     }
                     return Task::none();
                 }
 
-                // Library grid: move the roll selection over the visible rolls.
+                // Library grid: move the roll selection over the visible rolls,
+                // then reveal it out of the viewport.
                 let matched = filtered_rolls(&self.rolls, &self.query);
                 if matched.is_empty() {
                     return Task::none();
@@ -857,14 +884,21 @@ detail_pan: (0.0, 0.0),
                     .as_ref()
                     .and_then(|dir| matched.iter().position(|roll| &roll.dir == dir));
                 let len = matched.len();
-                if let Some(target) = nav_target(selected, len, self.grid_cols.max(1), dir) {
+                let cols = self.nav_cols();
+                if let Some(target) = nav_target(selected, len, cols, dir) {
                     self.selected_roll = Some(matched[target].dir.clone());
+                    return self.scroll_selection_into_view("rolls-grid", target, len, cols);
                 }
                 Task::none()
             }
 
             Message::FrameSelected(name) => {
                 self.frame_selected = Some(name);
+                Task::none()
+            }
+
+            Message::GridViewport(viewport) => {
+                self.grid_viewport = Some(viewport);
                 Task::none()
             }
 
@@ -881,6 +915,9 @@ detail_pan: (0.0, 0.0),
                 self.roll = edit_manifest::load_roll_manifest(&dir);
                 edit_manifest::reconcile(&mut self.roll, &files);
 
+                // The frame grid remounts; any cached viewport is stale until
+                // it scrolls again.
+                self.grid_viewport = None;
                 self.thumb_inflight.clear();
 
                 self.tiles = files
@@ -899,6 +936,7 @@ detail_pan: (0.0, 0.0),
                 self.active = None;
                 self.selected = None;
                 self.frame_selected = None;
+                self.grid_viewport = None;
                 self.tiles = Vec::new();
                 self.thumb_inflight.clear();
                 self.detail_inflight = None;
@@ -1005,6 +1043,7 @@ impl AppModel {
         self.active = Some(dir.clone());
         self.selected = None;
         self.frame_selected = None;
+        self.grid_viewport = None;
         self.clear_detail();
         self.close_editing();
         if self.context_page == ContextPage::RollInfo {
@@ -1044,6 +1083,78 @@ impl AppModel {
         }
 
         self.decode_detail_next()
+    }
+
+    /// The column count arrow-key navigation should use: the exact grid count
+    /// derived from the cached viewport width when one is known (matching iced's
+    /// fluid math), falling back to the window-resize track when the grid has
+    /// not scrolled yet.
+    fn nav_cols(&self) -> usize {
+        self.grid_viewport.as_ref().map_or_else(
+            || self.grid_cols.max(1),
+            |viewport| {
+                let spacing = f32::from(cosmic::theme::spacing().space_s);
+                grid_num_cols(viewport.bounds().width - 2.0 * spacing, spacing).max(1)
+            },
+        )
+    }
+
+    /// Scrolls the mounted grid so the tile at `index` (within the matched set
+    /// of `len`, laid out `cols`-wide) is fully visible, when it has moved
+    /// beyond the viewport. Uses the cached [`Viewport`] for precise reveal;
+    /// before the first real scroll the geometry is estimated from the window
+    /// height and row count. Returns the scroll effect, or `Task::none()` when
+    /// the tile is already visible.
+    #[allow(clippy::cast_precision_loss)] // row/cell counts are far below f32's exact range
+    fn scroll_selection_into_view(
+        &self,
+        name: &'static str,
+        index: usize,
+        len: usize,
+        cols: usize,
+    ) -> Task<cosmic::Action<Message>> {
+        let spacing = f32::from(cosmic::theme::spacing().space_s);
+        let padding = spacing;
+
+        let (cell_width, viewport_height, viewport_offset_y, content_height) =
+            if let Some(viewport) = &self.grid_viewport {
+                let available = viewport.bounds().width - 2.0 * padding;
+                let cols = grid_num_cols(available, spacing).max(1);
+                let cell = (available - spacing * (cols as f32 - 1.0)) / cols as f32;
+                (
+                    cell,
+                    viewport.bounds().height,
+                    viewport.absolute_offset().y,
+                    viewport.content_bounds().height,
+                )
+            } else {
+                // No viewport yet: the grid sits at the top, its height is the
+                // window minus the controls row (≈80 px incl. padding +
+                // spacing), and the content is sized from the row count at
+                // THUMB cells.
+                let rows = len.div_ceil(cols.max(1));
+                let content_height = 2.0 * padding
+                    + rows as f32 * (THUMB_SIZE + spacing)
+                    + spacing * (rows.saturating_sub(1)) as f32;
+                (THUMB_SIZE, (self.window_height - 80.0).max(1.0), 0.0, content_height)
+            };
+
+        match reveal_target_y(
+            cols,
+            index,
+            spacing,
+            padding,
+            cell_width,
+            viewport_height,
+            viewport_offset_y,
+            content_height,
+        ) {
+            Some(y) => cosmic::iced::widget::scrollable::scroll_to::<cosmic::Action<Message>>(
+                scrollable_id(name),
+                cosmic::iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) },
+            ),
+            None => Task::none(),
+        }
     }
 
     /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] pending thumbnails.
@@ -1533,6 +1644,55 @@ fn paginate(current: usize, len: usize, dir: MoveDir) -> Option<usize> {
     }
 }
 
+/// Column count for a fluid grid of `THUMB_SIZE` cells at `available` width,
+/// mirroring iced's `Grid::fluid`/`Constraint::MaxWidth` math exactly
+/// (`ceil((available + spacing) / (max + spacing))`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn grid_num_cols(available: f32, spacing: f32) -> usize {
+    (((available + spacing) / (THUMB_SIZE + spacing)).ceil()) as usize
+}
+
+/// The absolute scroll offset (content-space y) that brings the tile at
+/// `index` into the grid's visible viewport, or `None` when it is already
+/// fully visible. Row geometry mirrors `Grid`: each square cell is `cell_width`
+/// tall and rows advance by `cell_width + spacing`, with the grid inset by
+/// `padding` inside the scrollable content.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments
+)]
+fn reveal_target_y(
+    cols: usize,
+    index: usize,
+    spacing: f32,
+    padding: f32,
+    cell_width: f32,
+    viewport_height: f32,
+    viewport_offset_y: f32,
+    content_height: f32,
+) -> Option<f32> {
+    if cols == 0 {
+        return None;
+    }
+    let row = index / cols;
+    let top = padding + row as f32 * (cell_width + spacing);
+    let bottom = top + cell_width;
+
+    let target = if top < viewport_offset_y {
+        top
+    } else if bottom > viewport_offset_y + viewport_height {
+        bottom - viewport_height
+    } else {
+        return None;
+    };
+
+    // Clamp to the scroller's range so an estimate can never overshoot.
+    let max = (content_height - viewport_height).max(0.0);
+    Some(target.clamp(0.0, max))
+}
+
 /// Renders the library page: a responsive grid of roll cover tiles, or an
 /// empty-state message when there are no rolls.
 fn library_view(app: &AppModel) -> Element<'_, Message> {
@@ -1562,8 +1722,19 @@ fn library_view(app: &AppModel) -> Element<'_, Message> {
         .spacing(space_s);
 
     widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
+        .id(scrollable_id("rolls-grid"))
+        // Report the viewport so `Nav` can scroll the highlighted tile into
+        // view when it moves beyond the visible area.
+        .on_scroll(Message::GridViewport)
         .height(Length::Fill)
         .into()
+}
+
+/// The stable widget [`Id`] names the mounted grid's [`Scrollable`], the target
+/// for keyboard scroll-into-view effects. Only one page's grid is mounted at a
+/// time, so the ids never collide.
+fn scrollable_id(name: &'static str) -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new(name)
 }
 
 /// Renders an open roll's frame grid (search-filtered), with the detail view
@@ -1593,6 +1764,8 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
         .spacing(space_s);
 
         widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
+            .id(scrollable_id("frames-grid"))
+.on_scroll(Message::GridViewport)
             .height(Length::Fill)
             .into()
     };
@@ -2999,6 +3172,62 @@ mod tests {
     #[test]
     fn paginate_empty_list_has_no_target() {
         assert_eq!(paginate(0, 0, MoveDir::Right), None);
+    }
+
+    #[test]
+    fn grid_num_cols_matches_iced_ceil_math() {
+        // (1200 + 16) / (384 + 16) = 3.04 → ceil 4
+        assert_eq!(grid_num_cols(1200.0, 16.0), 4);
+        // (400 + 16) / (384 + 16) = 1.04 → ceil 2
+        assert_eq!(grid_num_cols(400.0, 16.0), 2);
+    }
+
+    #[test]
+    fn reveal_target_y_no_movement_when_visible() {
+        // 3-column grid, tile 4 sits in row 1 (top = 16 + 400*1 = 416) inside a
+        // 900-high viewport scrolled to 0.
+        assert_eq!(
+            reveal_target_y(3, 4, 16.0, 16.0, 384.0, 900.0, 0.0, 3000.0),
+            None
+        );
+    }
+
+    #[test]
+    fn reveal_target_y_scrolls_down_below_the_fold() {
+        // tile 30 in row 10: top = 16 + 400*10 = 4016, bottom = 4400. Viewport
+        // is 900 tall, scrolled to 1000 → fold at 1900. Scroll to 4400 - 900.
+        assert_eq!(
+            reveal_target_y(3, 30, 16.0, 16.0, 384.0, 900.0, 1000.0, 30000.0),
+            Some(3500.0)
+        );
+    }
+
+    #[test]
+    fn reveal_target_y_scrolls_up_above_the_viewport() {
+        // Tile 2 in row 0 (top = 16) is above a viewport scrolled to 300 —
+        // scroll back to 16.
+        assert_eq!(
+            reveal_target_y(3, 2, 16.0, 16.0, 384.0, 900.0, 300.0, 3000.0),
+            Some(16.0)
+        );
+    }
+
+    #[test]
+    fn reveal_target_y_clamps_to_content() {
+        // tile 30 in row 10 wants 4400 - 1000 = 3400, but content is only 2700
+        // tall, so the scroll clamps to 2700 - 1000 = 1700.
+        assert_eq!(
+            reveal_target_y(3, 30, 16.0, 16.0, 384.0, 1000.0, 0.0, 2700.0),
+            Some(1700.0)
+        );
+    }
+
+    #[test]
+    fn reveal_target_y_zero_columns_is_no_op() {
+        assert_eq!(
+            reveal_target_y(0, 0, 16.0, 16.0, 384.0, 900.0, 0.0, 3000.0),
+            None
+        );
     }
 
     #[test]
