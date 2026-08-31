@@ -6,13 +6,13 @@ use crate::edit_manifest::{self, RollManifest};
 use crate::exposure_shader;
 use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
+use cosmic::Application;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
-use cosmic::Application;
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::keyboard;
-use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::widget::scrollable::Viewport;
+use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{ContentFit, Length, Point, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu};
@@ -78,10 +78,11 @@ pub struct AppModel {
     /// Directory of the roll currently drilled into (its frame grid and the
     /// detail view). `None` shows the library page of rolls.
     active: Option<PathBuf>,
-    /// Directory of the roll single-clicked on the library page. `None`
-    /// (initial state) until the user selects a roll; drives the selected-tile
+    /// The library cell single-clicked (or arrow-key selected) on the library
+    /// page: either the always-first Add Roll tile or a real roll. `None`
+    /// (initial state) until the user selects a cell; drives the selected-tile
     /// highlight, the `Ctrl+Space` metadata drawer, and Enter/arrow navigation.
-    selected_roll: Option<PathBuf>,
+    library_selection: Option<LibrarySelection>,
     /// Frame-grid highlight: the tile single-clicked (or last opened / paged
     /// to) inside an open roll. Distinct from `selected` (the opened detail
     /// frame) so the highlight survives closing the detail view and drives the
@@ -103,9 +104,12 @@ pub struct AppModel {
     /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
     /// roll tiles never double-spawn against the startup chain (memory bound).
     cover_inflight: Vec<PathBuf>,
-    /// Roll search term: filters roll names on the library page and frame
-    /// names inside an open roll.
-    query: String,
+    /// Search state: `None` hides the search input (the header shows only the
+    /// search icon); `Some(term)` shows the input, which filters roll names on
+    /// the library page and frame names inside an open roll. An empty term
+    /// keeps the input open but matches everything — echoing cosmic-files, the
+    /// mere presence of the input is the toggle, not the text.
+    search: Option<String>,
     /// File entries from the open roll, displayed as tiles on its frame grid.
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
@@ -170,6 +174,19 @@ pub struct AppModel {
     next_image_id: u64,
 }
 
+/// The selectable cell on the library page: either the always-first Add Roll
+/// tile or a real roll. Modeling both with a single type makes the selection,
+/// highlight, keyboard navigation, and the open action uniform across the grid
+/// — the add tile is selected and Entered exactly like a roll card.
+#[derive(Debug, Clone, PartialEq)]
+enum LibrarySelection {
+    /// The Add Roll tile (grid cell 0). Enter / double-click opens the folder
+    /// picker; it has no directory or metadata of its own.
+    AddRoll,
+    /// A real roll card, by its directory.
+    Roll(PathBuf),
+}
+
 /// A film roll: a user-chosen directory of negatives, listed as a cover tile
 /// on the library page. Double-clicking (or Enter on the selected roll) drills
 /// into its frame grid.
@@ -228,9 +245,13 @@ pub enum Message {
     /// A roll tile was single-clicked — select it (highlight + metadata
     /// drawer target). Does not drill in.
     RollSelected(PathBuf),
-    /// Open the roll currently selected by a single click (`selected_roll`),
-    /// from Enter or a double click; on the frame page it opens the frame
-    /// currently highlighted by `frame_selected`.
+    /// The Add Roll tile was single-clicked — select it (highlight). Does not
+    /// open the folder picker; that still needs a double click or Enter.
+    AddRollSelected,
+    /// Open the library cell currently selected by a single click
+    /// (`library_selection`), from Enter or a double click — a roll drills into
+    /// its frame grid, the Add Roll tile opens the folder picker; on the frame
+    /// page it opens the frame currently highlighted by `frame_selected`.
     OpenSelected,
     /// A roll tile was double-clicked — drill into its frame grid.
     RollActivated(PathBuf),
@@ -249,8 +270,14 @@ pub enum Message {
     RollOpened(PathBuf, Vec<String>),
     /// Return from the frame grid to the library (roll grid).
     BackToRolls,
-    /// The search field changed.
-    SearchChanged(String),
+    /// Activate the search field: reveal the header input (and focus it),
+    /// mirroring cosmic-files' search icon toggle. No-op if already active.
+    SearchActivate,
+    /// Deactivate the search field via the input's clear button: hide the
+    /// input and drop any term, returning the header to the search icon.
+    SearchClear,
+    /// The active search term changed (typed into the header input).
+    SearchInput(String),
     LaunchUrl(String),
     ThumbReady(String, Result<Handle, ()>),
     /// A thumbnail was double-clicked, opening it in the detail view.
@@ -360,7 +387,7 @@ impl cosmic::Application for AppModel {
                 .unwrap_or_default(),
             rolls: Vec::new(),
             active: None,
-            selected_roll: None,
+            library_selection: None,
             frame_selected: None,
             // A 3-wide grid is a safe initial guess until the first resize.
             grid_cols: 3,
@@ -369,7 +396,7 @@ impl cosmic::Application for AppModel {
             grid_viewport: None,
             window_height: 600.0,
             cover_inflight: Vec::new(),
-            query: String::new(),
+            search: None,
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
@@ -381,12 +408,12 @@ impl cosmic::Application for AppModel {
             detail_last_frame: None,
             detail_thumb: None,
             detail_zoom: 1.0,
-detail_pan: (0.0, 0.0),
-        detail_panning: false,
-        detail_cursor: None,
-        curve_contrast: 1.0,
-        curve_rolloff: 1.0,
-        curve_shadows: 1.0,
+            detail_pan: (0.0, 0.0),
+            detail_panning: false,
+            detail_cursor: None,
+            curve_contrast: 1.0,
+            curve_rolloff: 1.0,
+            curve_shadows: 1.0,
             exposure_ev: 0.0,
             reset_exposure_ev: 0.0,
             reset_curve_contrast: 1.0,
@@ -400,7 +427,9 @@ detail_pan: (0.0, 0.0),
         if app.config.rolls.is_empty()
             && let Some(default) = default_library_dir()
         {
-            app.config.rolls.push(default.to_string_lossy().into_owned());
+            app.config
+                .rolls
+                .push(default.to_string_lossy().into_owned());
         }
 
         // Set the window title and scan the configured roll directories.
@@ -418,12 +447,7 @@ detail_pan: (0.0, 0.0),
     /// (`ceil((width + spacing) / (max_width + spacing))`), and remember the
     /// window height for the pre-scroll viewport estimate.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn on_window_resize(
-        &mut self,
-        _id: cosmic::iced::window::Id,
-        width: f32,
-        height: f32,
-    ) {
+    fn on_window_resize(&mut self, _id: cosmic::iced::window::Id, width: f32, height: f32) {
         let spacing = f32::from(cosmic::theme::spacing().space_s);
         self.grid_cols = grid_num_cols(width, spacing).max(1);
         self.window_height = height;
@@ -452,7 +476,7 @@ detail_pan: (0.0, 0.0),
             && self.core.window.show_context
             && self.selected.is_some();
 
-        vec![widget::button::icon(icon::from_name("edit-symbolic"))
+        let editing = widget::button::icon(icon::from_name("edit-symbolic"))
             .selected(active)
             .tooltip(fl!("editing-toggle"))
             .on_press_maybe(
@@ -460,7 +484,29 @@ detail_pan: (0.0, 0.0),
                     .is_some()
                     .then_some(Message::ToggleContextPage(ContextPage::Editing)),
             )
-            .into()]
+            .into();
+
+        // Search filters the current view's entries (roll names on the library
+        // page, frame names in a roll). Mirroring cosmic-files, the input is
+        // only shown once search is active: an inactive state packs a search
+        // icon that reveals (and focuses) the input, which then replaces the
+        // icon until it is cleared.
+        let search: Element<'_, Message> = if let Some(term) = &self.search {
+            cosmic::widget::text_input::search_input(fl!("search-rolls"), term)
+                .width(Length::Fixed(240.0))
+                .id(search_input_id())
+                .on_clear(Message::SearchClear)
+                .on_input(Message::SearchInput)
+                .into()
+        } else {
+            widget::button::icon(icon::from_name("system-search-symbolic"))
+                .tooltip(fl!("search-toggle"))
+                .on_press(Message::SearchActivate)
+                .padding(8)
+                .into()
+        };
+
+        vec![editing, search]
     }
 
     /// Display a context drawer if the context page is requested.
@@ -488,14 +534,16 @@ detail_pan: (0.0, 0.0),
                 )
             }
             ContextPage::RollInfo => {
-                // Only meaningful on the library page with a selection: the
-                // drawer shows metadata for `selected_roll`, so a stale or
-                // missing selection closes the drawer rather than rendering
-                // an empty panel.
+                // Only meaningful on the library page with a roll selection:
+                // the drawer shows metadata for that roll, so an active roll, a
+                // stale, or a missing (or Add-Roll-tile) selection closes the
+                // drawer rather than rendering an empty panel.
                 if self.active.is_some() {
                     return None;
                 }
-                let dir = self.selected_roll.as_ref()?;
+                let LibrarySelection::Roll(dir) = self.library_selection.as_ref()? else {
+                    return None;
+                };
                 let roll = self.rolls.iter().find(|roll| &roll.dir == dir)?;
 
                 Some(
@@ -514,19 +562,20 @@ detail_pan: (0.0, 0.0),
     /// Application events will be processed through the view. Any messages emitted by
     /// events received by widgets will be passed to the update method.
     fn view(&self) -> Element<'_, Self::Message> {
-        // A fixed controls row (Add roll / back + search) stays above the
-        // scrollable content: the library page of roll covers, or an open
-        // roll's frame grid with its detail overlay.
-        let controls = controls_row(self);
+        // The back-to-rolls row only exists inside a roll; the library page has
+        // no toolbar — search lives in the header and Add Roll is the first
+        // grid tile.
+        let mut page = widget::column::with_capacity(2);
+        if self.active.is_some() {
+            page = page.push(controls_row());
+        }
         let content: Element<_> = match self.active.as_deref() {
             Some(_) => frames_view(self),
             None => library_view(self),
         };
+        page = page.push(content);
 
-        widget::column::with_capacity(2)
-            .push(controls)
-            .push(content)
-            .spacing(cosmic::theme::spacing().space_s)
+        page.spacing(cosmic::theme::spacing().space_s)
             .height(Length::Fill)
             .width(Length::Fill)
             .into()
@@ -566,6 +615,12 @@ detail_pan: (0.0, 0.0),
                 } if modifiers.control() && character == " " => {
                     Some(Message::ToggleContextPage(ContextPage::RollInfo))
                 }
+                // Ctrl+F reveals (and focuses) the search field.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if modifiers.control() && character == "f" => Some(Message::SearchActivate),
                 _ => None,
             }),
             // Watch for application configuration changes.
@@ -604,6 +659,13 @@ detail_pan: (0.0, 0.0),
         match message {
             Message::DetailClosed => {
                 self.persist_roll();
+                // Escape first deactivates an active search (hiding the header
+                // input back to the search icon) before any other close
+                // behavior, mirroring cosmic-files.
+                if self.search.is_some() {
+                    self.search = None;
+                    return Task::none();
+                }
                 // On the library page, Escape first closes an open context
                 // drawer (roll info / about); only falls through when there is
                 // nothing open to close.
@@ -759,14 +821,14 @@ detail_pan: (0.0, 0.0),
                 self.rolls = rolls;
                 // A refresh supersedes any earlier cover chain.
                 self.cover_inflight.clear();
-                // A selection pointing at a roll that left the config is
-                // stale; drop it and close a metadata drawer showing it.
-                if self
-                    .selected_roll
-                    .as_ref()
-                    .is_some_and(|dir| !self.rolls.iter().any(|roll| &roll.dir == dir))
-                {
-                    self.selected_roll = None;
+                // A roll selection pointing at a roll that left the config is
+                // stale; drop it and close a metadata drawer showing it. An Add
+                // Roll selection always stays valid (the tile is always present).
+                if matches!(
+                    &self.library_selection,
+                    Some(LibrarySelection::Roll(dir)) if !self.rolls.iter().any(|roll| &roll.dir == dir)
+                ) {
+                    self.library_selection = None;
                     if self.context_page == ContextPage::RollInfo {
                         self.core_mut().set_show_context(false);
                     }
@@ -794,19 +856,7 @@ detail_pan: (0.0, 0.0),
                 self.decode_covers()
             }
 
-            Message::AddRoll => cosmic::task::future(async {
-                match cosmic::dialog::file_chooser::open::Dialog::new()
-                    .open_folder()
-                    .await
-                {
-                    Ok(response) => response
-                        .url()
-                        .to_file_path()
-                        .map_or(Message::Ignore, Message::RollAdded),
-                    // Cancelled (or a portal failure) is a no-op.
-                    Err(_) => Message::Ignore,
-                }
-            }),
+            Message::AddRoll => open_roll_picker(),
 
             Message::RollAdded(dir) => {
                 // Persist the new roll; the library page owns the roll list.
@@ -819,7 +869,12 @@ detail_pan: (0.0, 0.0),
             }
 
             Message::RollSelected(dir) => {
-                self.selected_roll = Some(dir);
+                self.library_selection = Some(LibrarySelection::Roll(dir));
+                Task::none()
+            }
+
+            Message::AddRollSelected => {
+                self.library_selection = Some(LibrarySelection::AddRoll);
                 Task::none()
             }
 
@@ -831,10 +886,14 @@ detail_pan: (0.0, 0.0),
                     } else {
                         Task::none()
                     }
-                } else if let Some(dir) = self.selected_roll.clone() {
-                    self.open_roll(dir)
                 } else {
-                    Task::none()
+                    match self.library_selection.clone() {
+                        // A roll drills in; the Add Roll tile opens the folder
+                        // picker, mirroring how Enter opens a selected roll.
+                        Some(LibrarySelection::Roll(dir)) => self.open_roll(dir),
+                        Some(LibrarySelection::AddRoll) => open_roll_picker(),
+                        None => Task::none(),
+                    }
                 }
             }
 
@@ -844,7 +903,7 @@ detail_pan: (0.0, 0.0),
                     // through the frames; on the bare grid they move the
                     // highlight.
                     if self.selected.is_some() {
-                        let matched = filtered_tiles(&self.tiles, &self.query);
+                        let matched = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
                         let current = self
                             .selected
                             .as_ref()
@@ -859,7 +918,7 @@ detail_pan: (0.0, 0.0),
 
                     // Bare frame grid: move the highlight, then reveal it if it
                     // stepped out of the viewport.
-                    let matched = filtered_tiles(&self.tiles, &self.query);
+                    let matched = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
                     let selected = self
                         .frame_selected
                         .as_ref()
@@ -873,20 +932,16 @@ detail_pan: (0.0, 0.0),
                     return Task::none();
                 }
 
-                // Library grid: move the roll selection over the visible rolls,
-                // then reveal it out of the viewport.
-                let matched = filtered_rolls(&self.rolls, &self.query);
-                if matched.is_empty() {
-                    return Task::none();
-                }
-                let selected = self
-                    .selected_roll
-                    .as_ref()
-                    .and_then(|dir| matched.iter().position(|roll| &roll.dir == dir));
-                let len = matched.len();
+                // Library grid: move the selection over every visible cell —
+                // the always-first Add Roll tile, then the filtered rolls — and
+                // reveal it out of the viewport. The add tile is always a valid
+                // destination, so there is no empty-match early return.
+                let cells = library_cells(&self.rolls, self.search.as_deref().unwrap_or(""));
+                let selected = library_cell_index(self.library_selection.as_ref(), &cells);
+                let len = cells.len();
                 let cols = self.nav_cols();
                 if let Some(target) = nav_target(selected, len, cols, dir) {
-                    self.selected_roll = Some(matched[target].dir.clone());
+                    self.library_selection = Some(cells[target].selection());
                     return self.scroll_selection_into_view("rolls-grid", target, len, cols);
                 }
                 Task::none()
@@ -945,8 +1000,21 @@ detail_pan: (0.0, 0.0),
                 Task::none()
             }
 
-            Message::SearchChanged(query) => {
-                self.query = query;
+            Message::SearchActivate => {
+                if self.search.is_none() {
+                    self.search = Some(String::new());
+                }
+                // Focus the (now visible) input.
+                cosmic::widget::text_input::focus(search_input_id())
+            }
+
+            Message::SearchClear => {
+                self.search = None;
+                Task::none()
+            }
+
+            Message::SearchInput(term) => {
+                self.search = Some(term);
                 Task::none()
             }
 
@@ -963,11 +1031,13 @@ detail_pan: (0.0, 0.0),
             }
 
             Message::ToggleContextPage(context_page) => {
-                // The metadata drawer needs a library selection; without one
-                // the toggle is a no-op so it never opens an empty drawer
-                // (the menu item stays enabled, like the editing toggle).
+                // The metadata drawer needs a library *roll* selection; without
+                // one (no selection, or the Add Roll tile) the toggle is a no-op
+                // so it never opens an empty drawer (the menu item stays enabled,
+                // like the editing toggle).
                 if context_page == ContextPage::RollInfo
-                    && (self.active.is_some() || self.selected_roll.is_none())
+                    && (self.active.is_some()
+                        || !matches!(self.library_selection, Some(LibrarySelection::Roll(_))))
                 {
                     return Task::none();
                 }
@@ -1136,7 +1206,12 @@ impl AppModel {
                 let content_height = 2.0 * padding
                     + rows as f32 * (THUMB_SIZE + spacing)
                     + spacing * (rows.saturating_sub(1)) as f32;
-                (THUMB_SIZE, (self.window_height - 80.0).max(1.0), 0.0, content_height)
+                (
+                    THUMB_SIZE,
+                    (self.window_height - 80.0).max(1.0),
+                    0.0,
+                    content_height,
+                )
             };
 
         match reveal_target_y(
@@ -1151,7 +1226,10 @@ impl AppModel {
         ) {
             Some(y) => cosmic::iced::widget::scrollable::scroll_to::<cosmic::Action<Message>>(
                 scrollable_id(name),
-                cosmic::iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) },
+                cosmic::iced::widget::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
             ),
             None => Task::none(),
         }
@@ -1195,13 +1273,9 @@ impl AppModel {
         self.thumb_inflight
             .extend(pending.iter().map(|(name, _)| name.clone()));
 
-        Task::batch(
-            pending
-                .into_iter()
-                .map(move |(name, tone)| {
-                    cosmic::task::future(decode_thumbnail(dir.clone(), name, tone))
-                }),
-        )
+        Task::batch(pending.into_iter().map(move |(name, tone)| {
+            cosmic::task::future(decode_thumbnail(dir.clone(), name, tone))
+        }))
     }
 
     /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] roll-cover
@@ -1361,21 +1435,18 @@ impl AppModel {
                     landed = true;
                     detail_trace(format_args!(
                         "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
-                        width,
-                        height,
-                        self.detail_zoom
+                        width, height, self.detail_zoom
                     ));
                     // Cache the current thumbnail so it stays visible over the
                     // shader during the crossfade (first load only — a level-up
                     // swap must not re-insert the faded thumb).
                     if fresh_open
-                        && let Some(tile) = self
-                            .tiles
-                            .iter()
-                            .find(|t| t.name == name)
-                            .and_then(|t| match &t.thumb {
-                                Thumb::Ready(h) => Some(h.clone()),
-                                _ => None,
+                        && let Some(tile) =
+                            self.tiles.iter().find(|t| t.name == name).and_then(|t| {
+                                match &t.thumb {
+                                    Thumb::Ready(h) => Some(h.clone()),
+                                    _ => None,
+                                }
                             })
                     {
                         self.detail_thumb = Some(tile);
@@ -1393,7 +1464,11 @@ impl AppModel {
                     // was in flight (the program starts at contain fit).
                     if let Some(shader) = &mut self.detail_shader {
                         shader.set_view(self.detail_zoom, self.detail_pan);
-                        shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
+                        shader.set_curve(
+                            self.curve_contrast,
+                            self.curve_rolloff,
+                            self.curve_shadows,
+                        );
                     }
                     // The level-up is one-shot: a decode that lands after the
                     // first shader IS the native one, and an overview that was
@@ -1552,30 +1627,17 @@ async fn load_files_in(dir: PathBuf) -> Vec<String> {
 /// Stays outside the scrollable, so the tools remain visible while the grid
 /// scrolls — and above the detail overlay, where the back button doubles as
 /// an out-of-roll escape.
-fn controls_row(app: &AppModel) -> Element<'_, Message> {
+fn controls_row() -> Element<'static, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let mut tools = widget::row::with_capacity(2).spacing(space_s).width(Length::Fill);
-
-    if app.active.is_some() {
-        tools = tools.push(
+    let tools = widget::row::with_capacity(1)
+        .spacing(space_s)
+        .width(Length::Fill)
+        .push(
             widget::button::standard(fl!("back-to-rolls"))
                 .leading_icon(widget::icon::from_name("go-previous-symbolic"))
                 .on_press(Message::BackToRolls),
         );
-    } else {
-        tools = tools.push(
-            widget::button::standard(fl!("add-roll"))
-                .leading_icon(widget::icon::from_name("list-add-symbolic"))
-                .on_press(Message::AddRoll),
-        );
-    }
-
-    tools = tools.push(
-        widget::search_input(fl!("search-rolls"), app.query.as_str())
-            .on_input(Message::SearchChanged)
-            .width(Length::Fill),
-    );
 
     widget::container(tools)
         .width(Length::Fill)
@@ -1594,9 +1656,71 @@ fn filtered_rolls<'a>(rolls: &'a [Roll], query: &str) -> Vec<&'a Roll> {
         .collect()
 }
 
+/// A selectable cell in the library grid: the always-first Add Roll tile, or a
+/// search-filtered roll. One type so rendering and arrow-key navigation walk
+/// the same set, keeping the Add Roll tile selectable just like a roll card.
+enum LibraryCell<'a> {
+    /// The Add Roll tile (grid cell 0).
+    AddRoll,
+    /// A real roll card.
+    Roll(&'a Roll),
+}
+
+impl LibraryCell<'_> {
+    /// The [`LibrarySelection`] this cell carries, for storing a picked cell.
+    fn selection(&self) -> LibrarySelection {
+        match self {
+            LibraryCell::AddRoll => LibrarySelection::AddRoll,
+            LibraryCell::Roll(roll) => LibrarySelection::Roll(roll.dir.clone()),
+        }
+    }
+}
+
+/// Every selectable cell in the library grid: the Add Roll tile always first,
+/// then the rolls whose name matches the query. Since the add tile is always
+/// present, the returned slice is never empty.
+fn library_cells<'a>(rolls: &'a [Roll], query: &str) -> Vec<LibraryCell<'a>> {
+    std::iter::once(LibraryCell::AddRoll)
+        .chain(
+            filtered_rolls(rolls, query)
+                .into_iter()
+                .map(LibraryCell::Roll),
+        )
+        .collect()
+}
+
+/// The index of `selection` within `cells`, if it names a cell in the set.
+/// None means nothing is selected (or the selection left the set).
+fn library_cell_index(
+    selection: Option<&LibrarySelection>,
+    cells: &[LibraryCell<'_>],
+) -> Option<usize> {
+    let selection = selection?;
+    cells.iter().position(|cell| cell.selection() == *selection)
+}
+
+/// Opens the system folder picker, and on success emits [`Message::RollAdded`]
+/// for the chosen directory (a cancel or portal failure is a no-op). Shared by
+/// the double-click handler and Enter on a selected Add Roll tile.
+fn open_roll_picker() -> Task<cosmic::Action<Message>> {
+    cosmic::task::future(async {
+        match cosmic::dialog::file_chooser::open::Dialog::new()
+            .open_folder()
+            .await
+        {
+            Ok(response) => response
+                .url()
+                .to_file_path()
+                .map_or(Message::Ignore, Message::RollAdded),
+            // Cancelled (or a portal failure) is a no-op.
+            Err(_) => Message::Ignore,
+        }
+    })
+}
+
 /// The index arrow-key navigation moves the selection to: `selected` as an
-/// index into the visible rolls (None = nothing selected yet), `len` visible
-/// rolls, `cols` grid columns. Left/Right step within the row and never wrap;
+/// index into the visible cells (None = nothing selected yet), `len` visible
+/// cells, `cols` grid columns. Left/Right step within the row and never wrap;
 /// Up/Down step a full row, clamped to the first/last item.
 fn nav_target(selected: Option<usize>, len: usize, cols: usize, dir: MoveDir) -> Option<usize> {
     if len == 0 {
@@ -1693,41 +1817,58 @@ fn reveal_target_y(
     Some(target.clamp(0.0, max))
 }
 
-/// Renders the library page: a responsive grid of roll cover tiles, or an
-/// empty-state message when there are no rolls.
+/// Renders the library page: a responsive grid of selectable cells. The Add
+/// Roll tile is always the first cell; when no rolls (or no matches) remain, a
+/// centered hint overlays the empty space beside the still-present add tile.
 fn library_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let matched = filtered_rolls(&app.rolls, &app.query);
+    let cells = library_cells(&app.rolls, app.search.as_deref().unwrap_or(""));
+    let selected_index = library_cell_index(app.library_selection.as_ref(), &cells);
+    // The hint overlays only when no real roll remains (the add tile is always
+    // present, so `cells` can never be empty on its own).
+    let empty = !cells
+        .iter()
+        .any(|cell| matches!(cell, LibraryCell::Roll(_)));
 
-    if matched.is_empty() {
-        return widget::container(widget::text(if app.rolls.is_empty() {
-            fl!("no-rolls")
-        } else {
-            fl!("no-rolls-found")
-        }))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Horizontal::Center)
-        .align_y(Vertical::Center)
-        .into();
-    }
-
-    let grid = Grid::with_children(matched.into_iter().map(|roll| {
-        let selected = app.selected_roll.as_deref() == Some(roll.dir.as_path());
-        roll_tile(roll, selected)
+    let grid = Grid::with_children(cells.iter().enumerate().map(|(index, cell)| {
+        let selected = selected_index == Some(index);
+        match cell {
+            LibraryCell::AddRoll => add_roll_tile(selected),
+            LibraryCell::Roll(roll) => roll_tile(roll, selected),
+        }
     }))
-        .fluid(THUMB_SIZE)
-        .height(grid::Sizing::AspectRatio(TILE_ASPECT))
-        .spacing(space_s);
+    .fluid(THUMB_SIZE)
+    .height(grid::Sizing::AspectRatio(TILE_ASPECT))
+    .spacing(space_s);
 
-    widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
-        .id(scrollable_id("rolls-grid"))
+    let body = widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
         // Report the viewport so `Nav` can scroll the highlighted tile into
         // view when it moves beyond the visible area.
+        .id(scrollable_id("rolls-grid"))
         .on_scroll(Message::GridViewport)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+
+    if !empty {
+        return body.into();
+    }
+
+    // Nothing matches: keep the add tile visible and hint at the result over
+    // the space the grid leaves empty.
+    let hint = widget::container(widget::text(if app.rolls.is_empty() {
+        fl!("no-rolls")
+    } else {
+        fl!("no-rolls-found")
+    }))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Horizontal::Center)
+    .align_y(Vertical::Center);
+
+    let mut page = Stack::with_capacity(2);
+    page = page.push(body);
+    page = page.push(hint);
+    page.width(Length::Fill).height(Length::Fill).into()
 }
 
 /// The stable widget [`Id`] names the mounted grid's [`Scrollable`], the target
@@ -1735,6 +1876,12 @@ fn library_view(app: &AppModel) -> Element<'_, Message> {
 /// time, so the ids never collide.
 fn scrollable_id(name: &'static str) -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new(name)
+}
+
+/// The stable widget [`Id`] of the header's search input, so activating search
+/// can focus it. It is only mounted while search is active.
+fn search_input_id() -> cosmic::iced::widget::Id {
+    cosmic::iced::widget::Id::new("search-input")
 }
 
 /// Renders an open roll's frame grid (search-filtered), with the detail view
@@ -1745,7 +1892,7 @@ fn scrollable_id(name: &'static str) -> cosmic::iced::widget::Id {
 fn frames_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let matched = filtered_tiles(&app.tiles, &app.query);
+    let matched = filtered_tiles(&app.tiles, app.search.as_deref().unwrap_or(""));
     let selected = app.frame_selected.as_deref();
 
     let tiles: Element<'_, Message> = if matched.is_empty() {
@@ -1756,16 +1903,18 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
             .align_y(Vertical::Center)
             .into()
     } else {
-        let grid = Grid::with_children(matched.into_iter().map(|tile| {
-            tile_view(tile, selected == Some(tile.name.as_str()))
-        }))
+        let grid = Grid::with_children(
+            matched
+                .into_iter()
+                .map(|tile| tile_view(tile, selected == Some(tile.name.as_str()))),
+        )
         .fluid(THUMB_SIZE)
         .height(grid::Sizing::AspectRatio(TILE_ASPECT))
         .spacing(space_s);
 
         widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
             .id(scrollable_id("frames-grid"))
-.on_scroll(Message::GridViewport)
+            .on_scroll(Message::GridViewport)
             .height(Length::Fill)
             .into()
     };
@@ -1837,33 +1986,24 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         app.curve_contrast,
         // When any slider moves, the other values travel along so the
         // remap always composes the full curve, not a half-updated one.
-        move |contrast| {
-            Message::CurveChanged(contrast, app.curve_rolloff, app.curve_shadows)
-        },
+        move |contrast| Message::CurveChanged(contrast, app.curve_rolloff, app.curve_shadows),
     )
     .step(0.05_f32)
     // A finished drag is an edit flush point, like exposure.
     .on_release(Message::EditSave);
     let rolloff_label = widget::text(fl!("rolloff-label"));
-    let rolloff_slider = widget::slider(
-        0.2..=3.0,
-        app.curve_rolloff,
-        move |rolloff| Message::CurveChanged(app.curve_contrast, rolloff, app.curve_shadows),
-    )
+    let rolloff_slider = widget::slider(0.2..=3.0, app.curve_rolloff, move |rolloff| {
+        Message::CurveChanged(app.curve_contrast, rolloff, app.curve_shadows)
+    })
     .step(0.05_f32)
     .on_release(Message::EditSave);
     let shadows_label = widget::text(fl!("shadows-label"));
-    let shadows_slider = widget::slider(
-        0.2..=3.0,
-        app.curve_shadows,
-        move |shadows| {
-            Message::CurveChanged(app.curve_contrast, app.curve_rolloff, shadows)
-        },
-    )
+    let shadows_slider = widget::slider(0.2..=3.0, app.curve_shadows, move |shadows| {
+        Message::CurveChanged(app.curve_contrast, app.curve_rolloff, shadows)
+    })
     .step(0.05_f32)
     .on_release(Message::EditSave);
-    let reset_all =
-        widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
+    let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
 
     widget::column::with_capacity(11)
         .push(title)
@@ -1916,6 +2056,33 @@ fn meta_row(label: String, value: String) -> Element<'static, Message> {
         .into()
 }
 
+/// Renders the library grid's first tile: an "Add Roll" card that opens the
+/// folder picker on double-click. Mirrors a roll card's surface, radius, and
+/// selection ring so it reads and behaves as another tile — single-clicking
+/// selects it (highlight), double-clicking (or Enter) opens the picker — with
+/// a large plus icon.
+fn add_roll_tile(selected: bool) -> Element<'static, Message> {
+    let content = widget::container(
+        icon::from_name("list-add-symbolic")
+            .size(130)
+            .icon()
+            .opacity(0.50),
+    )
+    .align_x(Horizontal::Center)
+    .align_y(Vertical::Center)
+    .height(Length::Fill)
+    .width(Length::Fill);
+
+    // Single-click selects the tile (highlight only); double-click opens the
+    // folder picker.
+    let card: Element<'_, Message> = MouseArea::new(content)
+        .on_press(Message::AddRollSelected)
+        .on_double_click(Message::AddRoll)
+        .into();
+
+    selectable_tile(card, selected)
+}
+
 /// Renders a library page roll card, filling the square cell the grid assigns
 /// it. Single-clicking anywhere on the card selects the roll; double-clicking
 /// (or Enter) drills into its frame grid. The selection highlight is an accent
@@ -1966,7 +2133,10 @@ fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
     let info: Element<'_, Message> = widget::container(
         widget::column::with_capacity(2)
             .push(widget::text(&roll.name))
-            .push(widget::text::caption(fl!("roll-frames", count = roll.frame_count)))
+            .push(widget::text::caption(fl!(
+                "roll-frames",
+                count = roll.frame_count
+            )))
             .spacing(space_xs)
             .align_x(Horizontal::Center),
     )
@@ -1987,10 +2157,16 @@ fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
         .on_double_click(Message::RollActivated(roll.dir.clone()))
         .into();
 
-    // Surface background only (its radius follows the theme). The selection is
-    // NOT a card style here: iced paints a container's border behind its
-    // children, which the full-bleed cover would cover up.
-    let surface = widget::container(card)
+    selectable_tile(card, selected)
+}
+
+/// Wraps a library tile's interactive content in the shared selection chrome: a
+/// `Container::Primary` surface (background only, its radius follows the theme)
+/// with an accent ring drawn ON TOP when selected. The selection is NOT a card
+/// style here: iced paints a container's border behind its children, which a
+/// full-bleed cover would cover up, so the ring is a separate overlay layer.
+fn selectable_tile(content: Element<'_, Message>, selected: bool) -> Element<'_, Message> {
+    let surface = widget::container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .class(cosmic::theme::Container::Primary);
@@ -2012,20 +2188,24 @@ fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
 /// full-bleed preview on every side. Decorative only — no `MouseArea` — so it
 /// never eats the clicks the card below expects.
 fn selection_ring() -> Element<'static, Message> {
-    widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .class(cosmic::theme::Container::custom(|theme| {
-            cosmic::iced::widget::container::Style {
-                border: cosmic::iced::border::Border {
-                    color: theme.cosmic().accent.base.into(),
-                    width: 2.0,
-                    radius: theme.cosmic().corner_radii.radius_s.into(),
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
+    widget::container(
+        widget::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .class(cosmic::theme::Container::custom(|theme| {
+        cosmic::iced::widget::container::Style {
+            border: cosmic::iced::border::Border {
+                color: theme.cosmic().accent.base.into(),
+                width: 2.0,
+                radius: theme.cosmic().corner_radii.radius_s.into(),
+            },
+            ..Default::default()
+        }
+    }))
+    .into()
 }
 
 /// Renders a single frame tile of the open roll, filling the square cell the
@@ -2213,12 +2393,7 @@ fn apply_detail_zoom(
 /// `off1 = off0 + (1 - 2^(z1-z0)) * (cursor - off0)`.
 /// Both `pan` and `cursor` are relative to the widget center; the widget
 /// center itself never enters the formula.
-fn zoom_about_anchor(
-    zoom_old: f32,
-    zoom_new: f32,
-    pan: (f32, f32),
-    cursor: Point,
-) -> (f32, f32) {
+fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: (f32, f32), cursor: Point) -> (f32, f32) {
     let ratio = (zoom_new - zoom_old).exp2();
     let k = 1.0 - ratio;
     (
@@ -2231,9 +2406,10 @@ fn zoom_about_anchor(
 /// the given exposure and tone curve so the grid tile reflects the stored
 /// edits (grid == detail).
 async fn decode_thumbnail(dir: PathBuf, name: String, tone: edit_manifest::ToneEdit) -> Message {
-    let result =
-        decode_raw(dir, name.clone(), move |image| convert_thumbnail(image, THUMB_SIZE, tone))
-            .await;
+    let result = decode_raw(dir, name.clone(), move |image| {
+        convert_thumbnail(image, THUMB_SIZE, tone)
+    })
+    .await;
 
     Message::ThumbReady(name, result)
 }
@@ -2318,8 +2494,7 @@ async fn decode_raw_detail(
             .unwrap_or(ACTIVE_STOCK.base);
         invert_gray(&mut mono, &ACTIVE_STOCK, base);
 
-        let (mono, width, height) =
-            resize_area(&mono, width as u32, height as u32, max_edge, 1);
+        let (mono, width, height) = resize_area(&mono, width as u32, height as u32, max_edge, 1);
 
         let mut mono = mono;
         unsharp_mask(&mut mono, width as usize, height as usize);
@@ -2574,11 +2749,7 @@ fn downsample_thumbnail(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn downsample_rgb(
-    image: &rawloader::RawImage,
-    out_w: usize,
-    out_h: usize,
-) -> Option<Vec<f32>> {
+fn downsample_rgb(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> Option<Vec<f32>> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
     let cpp = usize::max(image.cpp, 1);
@@ -2658,11 +2829,7 @@ fn downsample_rgb(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn downsample_bayer(
-    image: &rawloader::RawImage,
-    out_w: usize,
-    out_h: usize,
-) -> Option<Vec<f32>> {
+fn downsample_bayer(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> Option<Vec<f32>> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
     let [top, right, bottom, left] = image.crops;
@@ -2773,8 +2940,7 @@ fn convert_thumbnail(
 ) -> Result<Handle, ()> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
     // downscale straight from the sensor samples into a small linear negative.
-    let (mut mono, width, height) =
-        downsample_thumbnail(image, max_size as u32).ok_or(())?;
+    let (mut mono, width, height) = downsample_thumbnail(image, max_size as u32).ok_or(())?;
 
     // Anchor the black point on the frame's clearest film, then invert the
     // negative in density space.
@@ -3035,7 +3201,7 @@ pub enum ContextPage {
     About,
     /// The editing panel for the active detail view.
     Editing,
-    /// The metadata drawer for the library selection (`selected_roll`).
+    /// The metadata drawer for the library roll selection (`library_selection`).
     RollInfo,
 }
 
@@ -3093,6 +3259,72 @@ mod tests {
 
         assert_eq!(filtered_rolls(&rolls, "").len(), 2);
         assert_eq!(filtered_rolls(&rolls, "   ").len(), 2);
+    }
+
+    #[test]
+    fn library_cells_keep_the_add_tile_first() {
+        let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
+
+        let cells = library_cells(&rolls, "");
+
+        assert_eq!(cells.len(), 3);
+        assert!(matches!(cells[0], LibraryCell::AddRoll));
+        // Rolls follow in filtered order.
+        assert!(matches!(cells[1], LibraryCell::Roll(r) if r.name == "Alpha"));
+        assert!(matches!(cells[2], LibraryCell::Roll(r) if r.name == "Beta"));
+    }
+
+    #[test]
+    fn library_cells_never_empty_even_with_no_matches() {
+        // No rolls at all: still the add tile.
+        assert_eq!(library_cells(&[], "").len(), 1);
+        // A query matching nothing still yields the add tile.
+        let rolls = vec![roll("/a", "Alpha")];
+        assert_eq!(library_cells(&rolls, "zzz").len(), 1);
+    }
+
+    #[test]
+    fn library_cell_index_finds_add_and_roll_slots() {
+        let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
+        let cells = library_cells(&rolls, "");
+
+        assert_eq!(
+            library_cell_index(Some(&LibrarySelection::AddRoll), &cells),
+            Some(0)
+        );
+        assert_eq!(
+            library_cell_index(Some(&LibrarySelection::Roll(PathBuf::from("/b"))), &cells),
+            Some(2)
+        );
+        // No selection, or one not in the (filtered) set, yields None.
+        assert_eq!(library_cell_index(None, &cells), None);
+        assert_eq!(
+            library_cell_index(Some(&LibrarySelection::Roll(PathBuf::from("/x"))), &cells),
+            None
+        );
+    }
+
+    #[test]
+    fn nav_can_land_on_and_leave_the_add_tile() {
+        let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
+        let cells = library_cells(&rolls, "");
+
+        // From nothing, Down selects cell 0 (the add tile).
+        let target = nav_target(None, cells.len(), 2, MoveDir::Down).unwrap();
+        assert_eq!(target, 0);
+        assert!(matches!(&cells[target], LibraryCell::AddRoll));
+
+        // From the add tile, Right moves to the first roll (cell 1).
+        let target = nav_target(Some(0), cells.len(), 2, MoveDir::Right).unwrap();
+        assert_eq!(target, 1);
+        assert!(matches!(&cells[target], LibraryCell::Roll(r) if r.name == "Alpha"));
+
+        // From cell 1, Left returns to the add tile.
+        let target = nav_target(Some(1), cells.len(), 2, MoveDir::Left).unwrap();
+        assert_eq!(target, 0);
+        assert!(matches!(&cells[target], LibraryCell::AddRoll));
+        // Left on the add tile does not wrap.
+        assert_eq!(nav_target(Some(0), cells.len(), 2, MoveDir::Left), Some(0));
     }
 
     #[test]
@@ -3501,13 +3733,7 @@ mod tests {
     fn downsample_thumbnail_preserves_phase_after_averaging() {
         // Same class casts compressed into one 1x1 output pixel: the per-class
         // averages must be rescalled before combining, or the cast survives.
-        let image = raw_with_transmissions(
-            2,
-            2,
-            "RGGB",
-            vec![600, 500, 500, 400],
-            [0, 0, 0, 0],
-        );
+        let image = raw_with_transmissions(2, 2, "RGGB", vec![600, 500, 500, 400], [0, 0, 0, 0]);
 
         let (mono, width, height) = downsample_thumbnail(&image, 1).unwrap();
 
