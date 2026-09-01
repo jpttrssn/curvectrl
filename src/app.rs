@@ -1065,13 +1065,29 @@ impl cosmic::Application for AppModel {
                 // thumbnail so the tile reflects the exposure. The decode
                 // reads the EV from the manifest when it starts, so even a
                 // queued re-bake catches the latest value.
-                if let Some(name) = self.selected.clone() {
-                    if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
-                        tile.thumb = Thumb::Loading;
-                    }
-                    return self.decode_next();
+                let mut tasks = Vec::with_capacity(2);
+                let Some(name) = self.selected.clone() else {
+                    return Task::batch(tasks);
+                };
+                if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
+                    tile.thumb = Thumb::Loading;
                 }
-                Task::none()
+                tasks.push(self.decode_next());
+                // If the edited frame is also this roll's cover, the library
+                // roll tile's preview should reflect it too — re-bake the
+                // cover in lockstep with the frame tile.
+                if let Some(active) = self.active.as_ref() {
+                    let Some(roll) = self
+                        .rolls
+                        .iter_mut()
+                        .find(|roll| roll.dir == *active && roll.cover.as_deref() == Some(name.as_str()))
+                    else {
+                        return Task::batch(tasks);
+                    };
+                    roll.thumb = Thumb::Loading;
+                    tasks.push(self.decode_covers());
+                }
+                Task::batch(tasks)
             }
 
             Message::LaunchUrl(url) => match open::that_detached(&url) {
@@ -2414,11 +2430,14 @@ async fn decode_thumbnail(dir: PathBuf, name: String, tone: edit_manifest::ToneE
     Message::ThumbReady(name, result)
 }
 
-/// Decodes a roll's cover file into a thumbnail message (no stored exposure:
-/// roll cards are not per-frame editable).
+/// Decodes a roll's cover file into a thumbnail message, baking in the cover
+/// file's stored exposure and tone curve from the roll's manifest so the roll
+/// tile preview parallels the edited frame (grid == detail for covers too). A
+/// roll with no manifest (or an unedited cover) falls back to identity.
 async fn decode_cover(dir: PathBuf, name: String) -> Message {
-    let result = decode_raw(dir.clone(), name, |image| {
-        convert_thumbnail(image, THUMB_SIZE, edit_manifest::ToneEdit::identity())
+    let tone = edit_manifest::load_roll_manifest(&dir).tone(&name);
+    let result = decode_raw(dir.clone(), name, move |image| {
+        convert_thumbnail(image, THUMB_SIZE, tone)
     })
     .await;
 
