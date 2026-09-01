@@ -6,7 +6,6 @@ repository = Repository
 view = View
 search-rolls = Search rolls
 search-toggle = Search
-back-to-rolls = Back to rolls
 no-rolls = No rolls yet. Choose a folder with negatives to get started.
 no-rolls-found = No rolls match your search
 no-files = No images in this roll

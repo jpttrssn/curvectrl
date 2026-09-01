@@ -441,8 +441,6 @@ pub enum Message {
     GridViewport(Viewport),
     /// The frame scan for an opened roll finished.
     RollOpened(PathBuf, Vec<String>),
-    /// Return from the frame grid to the library (roll grid).
-    BackToRolls,
     /// Activate the search field: reveal the header input (and focus it),
     /// mirroring cosmic-files' search icon toggle. No-op if already active.
     SearchActivate,
@@ -837,20 +835,19 @@ impl cosmic::Application for AppModel {
     /// Application events will be processed through the view. Any messages emitted by
     /// events received by widgets will be passed to the update method.
     fn view(&self) -> Element<'_, Self::Message> {
-        // The back-to-rolls row only exists inside a roll; the library page has
-        // no toolbar — search lives in the header and Add Roll is the first
-        // grid tile.
-        let mut page = widget::column::with_capacity(2);
-        if self.active.is_some() {
-            page = page.push(controls_row());
-        }
+        // The page body holds only the content: there is no in-roll toolbar
+        // (the back-to-rolls button was removed — Esc is the way out; search
+        // lives in the header, and Add Roll is the first library tile). The
+        // column wrapper also applies the Fill sizing the views otherwise
+        // shrink to.
         let content: Element<_> = match self.active.as_deref() {
             Some(_) => frames_view(self),
             None => library_view(self),
         };
-        page = page.push(content);
 
-        page.spacing(cosmic::theme::spacing().space_s)
+        widget::column::with_capacity(1)
+            .push(content)
+            .spacing(cosmic::theme::spacing().space_s)
             .height(Length::Fill)
             .width(Length::Fill)
             .into()
@@ -1024,12 +1021,24 @@ impl cosmic::Application for AppModel {
                     // No detail open: Escape first clears the grid highlight...
                     self.frame_selected = None;
                 } else {
-                    // ...then backs out of the roll entirely.
+                    // ...then backs out of the roll entirely, resetting every
+                    // detail- and roll-page field so nothing from the closed
+                    // roll leaks into the library (edits were already flushed
+                    // by `persist_roll` at the top of this arm).
                     self.active = None;
+                    self.selected = None;
                     self.frame_selected = None;
+                    self.selected_frames.clear();
+                    self.selection_anchor = None;
                     self.grid_viewport = None;
                     self.tiles = Vec::new();
                     self.thumb_inflight.clear();
+                    self.detail_inflight = None;
+                    self.detail_preload_inflight.clear();
+                    // The RAM manifest is dropped with the roll; re-opened
+                    // rolls re-load it (see `RollOpened`). The overview LRU is
+                    // deliberately kept: it survives roll switches by design.
+                    self.roll = edit_manifest::RollManifest::default();
                     self.clear_detail();
                     self.close_editing();
                 }
@@ -1391,22 +1400,6 @@ impl cosmic::Application for AppModel {
                 self.decode_next()
             }
 
-            Message::BackToRolls => {
-                self.persist_roll();
-                self.active = None;
-                self.selected = None;
-                self.frame_selected = None;
-                self.selected_frames.clear();
-                self.selection_anchor = None;
-                self.grid_viewport = None;
-                self.tiles = Vec::new();
-                self.thumb_inflight.clear();
-                self.detail_inflight = None;
-                self.clear_detail();
-                self.close_editing();
-                Task::none()
-            }
-
             Message::SearchActivate => {
                 if self.search.is_none() {
                     self.search = Some(String::new());
@@ -1682,9 +1675,8 @@ impl AppModel {
                 )
             } else {
                 // No viewport yet: the grid sits at the top, its height is the
-                // window minus the controls row (≈80 px incl. padding +
-                // spacing), and the content is sized from the row count at
-                // THUMB cells.
+                // window (≈80 px of header sizing leaves the content space),
+                // and the content is sized from the row count at THUMB cells.
                 let rows = len.div_ceil(cols.max(1));
                 let content_height = 2.0 * padding
                     + rows as f32 * (THUMB_SIZE + spacing)
@@ -2450,30 +2442,6 @@ async fn load_files_in(dir: PathBuf) -> Vec<String> {
 
     files.sort();
     files
-}
-
-/// Renders the fixed controls row above the content: Add roll (library page)
-/// or a back button (inside a roll), with the roll/frame search beside them.
-///
-/// Stays outside the scrollable, so the tools remain visible while the grid
-/// scrolls — and above the detail overlay, where the back button doubles as
-/// an out-of-roll escape.
-fn controls_row() -> Element<'static, Message> {
-    let space_s = cosmic::theme::spacing().space_s;
-
-    let tools = widget::row::with_capacity(1)
-        .spacing(space_s)
-        .width(Length::Fill)
-        .push(
-            widget::button::standard(fl!("back-to-rolls"))
-                .leading_icon(widget::icon::from_name("go-previous-symbolic"))
-                .on_press(Message::BackToRolls),
-        );
-
-    widget::container(tools)
-        .width(Length::Fill)
-        .padding(space_s)
-        .into()
 }
 
 /// Rolls whose name matches the toolbar query (case-insensitive substring).
