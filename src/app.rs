@@ -43,6 +43,21 @@ const TILE_ASPECT: f32 = 1.0;
 /// to a few dozen hundred MB, not the whole roll.
 const MAX_CONCURRENT_THUMBS: usize = 4;
 
+/// Number of detail-view overview (2048px) mono buffers to cache most-recently
+/// used. Sized to cover a typical film roll (~40 frames). Each entry is the
+/// fixed 2048 overview decode (~12–17 MB), so the worst case is bounded at
+/// ~600 MB; native zoom level-up decodes are never cached.
+const DETAIL_CACHE_CAPACITY: usize = 40;
+
+/// Maximum number of neighbor detail preload decodes in flight at once.
+/// Preloads run on their own bounded channel, separate from the single
+/// critical detail slot, so they never starve the currently-viewed frame.
+const MAX_CONCURRENT_PRELOADS: usize = 2;
+
+/// How many frames on each side of the currently-viewed frame to preload into
+/// the overview LRU cache (so Left/Right paging to a neighbor is instant).
+const DETAIL_PRELOAD_DISTANCE: usize = 1;
+
 /// Maximum detail-view zoom in `log2` units: 1.0 = contain fit, each +1
 /// doubles the rendered scale, so this caps at 2^6 = 64× the fit scale.
 const MAX_DETAIL_ZOOM: f32 = 7.0;
@@ -175,6 +190,15 @@ pub struct AppModel {
     /// True while the detail view's editing drawer is hidden for a full-screen
     /// preview (toggled by spacebar). Only meaningful while `selected` is set.
     fullscreen: bool,
+    /// LRU of decoded detail overviews keyed by (roll dir, file name), so
+    /// returning to a recently-viewed frame doesn't re-decode the RAW. Survives
+    /// roll switches and detail close; eviction is global (see
+    /// [`DETAIL_CACHE_CAPACITY`]). Only overview (2048px) buffers are stored.
+    detail_cache: LruCache<(PathBuf, String), DetailMono>,
+    /// (roll dir, file name) handed to the bounded neighbor preload decodes,
+    /// so a frame already being preloaded (or already cached) is never spawned
+    /// twice. Independent of the single critical detail slot.
+    detail_preload_inflight: Vec<(PathBuf, String)>,
 }
 
 /// The selectable cell on the library page: either the always-first Add Roll
@@ -216,6 +240,99 @@ struct Tile {
     thumb: Thumb,
 }
 
+/// A decoded detail-view overview: the linear pre-sRGB mono buffer plus its
+/// geometry, as delivered by [`decode_raw_detail`]. Exactly what an
+/// [`exposure_shader::ExposureProgram`] needs to (re)build without re-decoding
+/// the RAW. Cached by the detail LRU keyed on (roll dir, file name).
+#[derive(Debug, Clone)]
+struct DetailMono {
+    mono: Vec<f32>,
+    width: u32,
+    height: u32,
+    /// The sensor's true long edge AFTER cropping but BEFORE the downscale, so
+    /// a served cache entry can decide whether the overview was already native.
+    src_long_edge: u32,
+}
+
+/// A fixed-capacity least-recently-used map keyed by (roll dir, file name).
+///
+/// Backed by a `HashMap` for O(1) lookup plus a `VecDeque` of keys as the
+/// recency index: `get` moves the key to the back, `insert` pops the front
+/// (least-recent) key once the capacity is exceeded and hands back the evicted
+/// value so the caller can release (drop) its memory. Dependency-free and pure,
+/// so the eviction order is unit-tested.
+struct LruCache<K, V> {
+    map: std::collections::HashMap<K, V>,
+    order: std::collections::VecDeque<K>,
+    capacity: usize,
+}
+
+impl<K, V> LruCache<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    fn new(capacity: usize) -> Self {
+        LruCache {
+            map: std::collections::HashMap::with_capacity(capacity),
+            order: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns the cached value for `key`, marking it most-recently used.
+    fn get(&mut self, key: &K) -> Option<&V> {
+        if self.map.contains_key(key) {
+            self.bump(key.clone());
+        }
+        self.map.get(key)
+    }
+
+    /// Inserts `value` under `key`, marking it most-recently used. Once the
+    /// capacity is exceeded the least-recently-used entry is evicted and its
+    /// value returned (so the caller can drop it); `None` when nothing was
+    /// evicted. With a zero capacity every insert is immediately evicted and
+    /// returned, so the cache stays empty.
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.capacity == 0 {
+            return Some(value);
+        }
+        let evicted = if !self.map.contains_key(&key) && self.map.len() >= self.capacity {
+            self.order
+                .pop_front()
+                .and_then(|oldest| self.map.remove(&oldest))
+        } else {
+            None
+        };
+        self.map.insert(key.clone(), value);
+        self.bump(key);
+        evicted
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Moves `key` to the back of the recency order (most-recently used). If it
+    /// was not present, keeps the order consistent by removing any duplicate.
+    fn bump(&mut self, key: K) {
+        if let Some(position) = self.order.iter().position(|k| k == &key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key);
+    }
+}
+
 /// Thumbnail loading state of a [`Tile`] or roll cover.
 #[derive(Debug, Clone)]
 pub enum Thumb {
@@ -235,6 +352,9 @@ pub enum Message {
     /// A hi-res decode for the detail view finished, returning the linear
     /// pre-sRGB mono buffer for the GPU shader.
     DetailReady(String, Result<(Vec<f32>, u32, u32, u32), ()>),
+    /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
+    /// only lands into the detail LRU cache; it never becomes the active shader.
+    DetailPreloaded(PathBuf, String, Result<(Vec<f32>, u32, u32, u32), ()>),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
@@ -428,6 +548,8 @@ impl cosmic::Application for AppModel {
             reset_curve_shadows: 1.0,
             next_image_id: 0,
             fullscreen: false,
+            detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
+            detail_preload_inflight: Vec::new(),
         };
 
         // Seed the POC's original single roll directory so a fresh config
@@ -716,6 +838,10 @@ impl cosmic::Application for AppModel {
             }
 
             Message::DetailReady(name, result) => self.handle_detail_ready(&name, result),
+
+            Message::DetailPreloaded(dir, name, result) => {
+                self.handle_detail_preloaded(&dir, &name, result)
+            }
 
             Message::ThumbnailActivated(name) => self.open_frame(name),
 
@@ -1191,7 +1317,7 @@ impl AppModel {
             // `handle_detail_ready`).
             let stored_tone = self.roll.tone(name.as_str());
             self.selected = Some(name.clone());
-            self.frame_selected = Some(name);
+            self.frame_selected = Some(name.clone());
             self.clear_detail();
             self.exposure_ev = stored_tone.exposure_ev;
             self.curve_contrast = stored_tone.curve_contrast;
@@ -1214,7 +1340,10 @@ impl AppModel {
             self.core.window.show_context = true;
         }
 
-        self.decode_detail_next()
+        Task::batch([
+            self.decode_detail_next(),
+            self.preload_detail_neighbors(&name),
+        ])
     }
 
     /// The column count arrow-key navigation should use: the exact grid count
@@ -1403,16 +1532,39 @@ impl AppModel {
             return Task::none();
         };
 
+        let name = self
+            .selected
+            .clone()
+            .expect("selected when a decode is due");
+
+        // An overview request that's already in the LRU cache is served without
+        // re-decoding the RAW (the whole point of the cache): build the shader
+        // from the cached mono and return — the preview is ready immediately
+        // with no thumbnail crossfade. Native level-up requests are never
+        // cached/served; they always re-decode on demand. (The cached mono is
+        // cloned out so the cache keeps serving future hits; the clone is a
+        // fraction of the cost of a full RAW decode.)
+        if cap == HI_RES_SIZE
+            && let Some(dir) = self.active.clone()
+            && let Some(cached) = self
+                .detail_cache
+                .get(&(dir, name.clone()))
+                .map(|c| (c.mono.clone(), c.width, c.height, c.src_long_edge))
+        {
+            let (mono, width, height, src_long_edge) = cached;
+            detail_trace(format_args!(
+                "cache hit: {name} {width}x{height} (src {src_long_edge})"
+            ));
+            self.install_detail_shader(mono, width, height, src_long_edge);
+            return Task::none();
+        }
+
         detail_trace(format_args!(
             "trigger fire: cap={cap}, shader={}, zoom={:.3}",
             self.detail_shader.is_some(),
             self.detail_zoom
         ));
 
-        let name = self
-            .selected
-            .clone()
-            .expect("selected when a decode is due");
         self.detail_inflight = Some(name.clone());
 
         let Some(dir) = self.active.clone() else {
@@ -1420,6 +1572,119 @@ impl AppModel {
         };
 
         cosmic::task::future(decode_detail(dir, name, cap))
+    }
+
+    /// Builds and installs the detail shader from a decoded mono buffer,
+    /// applying the current exposure, zoom/pan and tone curve, and marking the
+    /// native level-up done when the source was already at (or below) the
+    /// overview cap. Used when serving an LRU cache hit so the preview appears
+    /// immediately without re-decoding the RAW.
+    fn install_detail_shader(&mut self, mono: Vec<f32>, width: u32, height: u32, src_long_edge: u32) {
+        let image_id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1);
+        self.detail_shader = Some(exposure_shader::ExposureProgram::new(
+            mono,
+            width,
+            height,
+            self.exposure_ev,
+            image_id,
+        ));
+        if let Some(shader) = &mut self.detail_shader {
+            shader.set_view(self.detail_zoom, self.detail_pan);
+            shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
+        }
+        // A cached overview that was already at native resolution needs no
+        // level-up re-decode.
+        if src_long_edge <= HI_RES_SIZE {
+            self.detail_native_queued = true;
+        }
+    }
+
+    /// Handles a finished neighbor preload decode: lands the overview into the
+    /// LRU cache (dropping any evicted buffer) and frees its preload slot.
+    /// A preload never touches `detail_inflight` or the active shader, and a
+    /// stale landing (roll switched away mid-decode) is still a valid cached
+    /// overview, so it is inserted regardless.
+    fn handle_detail_preloaded(
+        &mut self,
+        dir: &PathBuf,
+        name: &str,
+        result: Result<(Vec<f32>, u32, u32, u32), ()>,
+    ) -> Task<cosmic::Action<Message>> {
+        self.detail_preload_inflight
+            .retain(|(pending_dir, pending_name)| pending_dir != dir || pending_name != name);
+
+        if let Ok((mono, width, height, src_long_edge)) = result {
+            let _evicted = self.detail_cache.insert(
+                (dir.clone(), name.to_string()),
+                DetailMono {
+                    mono,
+                    width,
+                    height,
+                    src_long_edge,
+                },
+            );
+        }
+        Task::none()
+    }
+
+    /// Preloads the frames `DETAIL_PRELOAD_DISTANCE` either side of `name` in
+    /// the search-filtered set into the LRU cache, so Left/Right paging to a
+    /// neighbor is instant. Runs on its own bounded channel, separate from the
+    /// single critical detail slot. Already-cached and already-in-flight frames
+    /// are skipped.
+    fn preload_detail_neighbors(&mut self, name: &str) -> Task<cosmic::Action<Message>> {
+        let Some(dir) = self.active.clone() else {
+            return Task::none();
+        };
+
+        let matched = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+        let Some(current) = matched.iter().position(|tile| tile.name == name) else {
+            return Task::none();
+        };
+
+        // Build the neighbor names in priority order (closest first) so the
+        // bounded slots fill with the most useful frames first.
+        let mut neighbors = Vec::new();
+        for step in 1..=DETAIL_PRELOAD_DISTANCE {
+            if let Some(prev) = current.checked_sub(step) {
+                neighbors.push(matched[prev].name.clone());
+            }
+            if let Some(next) = current.checked_add(step).filter(|&i| i < matched.len()) {
+                neighbors.push(matched[next].name.clone());
+            }
+        }
+
+        let capacity = MAX_CONCURRENT_PRELOADS.saturating_sub(self.detail_preload_inflight.len());
+        if capacity == 0 {
+            return Task::none();
+        }
+
+        let pending: Vec<String> = neighbors
+            .into_iter()
+            .filter(|n| {
+                let key = (dir.clone(), n.clone());
+                !self.detail_cache.contains(&key)
+                    && !self
+                        .detail_preload_inflight
+                        .iter()
+                        .any(|(pd, pn)| pd == &dir && pn == n)
+            })
+            .take(capacity)
+            .collect();
+
+        if pending.is_empty() {
+            return Task::none();
+        }
+
+        self.detail_preload_inflight
+            .extend(pending.iter().map(|n| (dir.clone(), n.clone())));
+
+        Task::batch(
+            pending
+                .into_iter()
+                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n))),
+        )
     }
 
     /// Reset all detail-view buffers, crossfade state, the view transform, and
@@ -1501,6 +1766,26 @@ impl AppModel {
                         "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
                         width, height, self.detail_zoom
                     ));
+                    // Stash a fresh overview decode into the LRU so returning
+                    // to this frame is instant. Only the level-1 overview is
+                    // cached (never a native level-up swap). Edits are applied
+                    // in-shader at open time, so the cached mono stays valid
+                    // across edit changes. Any evicted entry drops here, freeing
+                    // its memory eagerly.
+                    if fresh_open && let Some(dir) = self.active.clone() {
+                        // Bound so the evicted entry (if any) is dropped here,
+                        // freeing its memory eagerly; the value is otherwise
+                        // unused.
+                        let _evicted = self.detail_cache.insert(
+                            (dir.clone(), name.to_string()),
+                            DetailMono {
+                                mono: mono.clone(),
+                                width,
+                                height,
+                                src_long_edge,
+                            },
+                        );
+                    }
                     // Cache the current thumbnail so it stays visible over the
                     // shader during the crossfade (first load only — a level-up
                     // swap must not re-insert the faded thumb).
@@ -2500,6 +2785,14 @@ async fn decode_cover(dir: PathBuf, name: String) -> Message {
 async fn decode_detail(dir: PathBuf, name: String, max_edge: u32) -> Message {
     let result = decode_raw_detail(dir, name.clone(), max_edge).await;
     Message::DetailReady(name, result)
+}
+
+/// Decodes a neighbor frame's overview for the preload cache. Unlike
+/// [`decode_detail`] this only populates the LRU — it never becomes the active
+/// detail shader — so it always decodes at the fixed overview cap.
+async fn preload_detail(dir: PathBuf, name: String) -> Message {
+    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE).await;
+    Message::DetailPreloaded(dir, name, result)
 }
 
 /// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
@@ -3984,5 +4277,64 @@ mod tests {
         assert!((detail_zoom_delta(pixels) - 1.0).abs() < 1e-6);
         let up = cosmic::iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 };
         assert!((detail_zoom_delta(up) + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lru_cache_get_marks_most_recently_used() {
+        let mut cache = LruCache::new(2);
+        assert!(cache.insert("a", 1).is_none());
+        assert!(cache.insert("b", 2).is_none());
+        // Touching "a" makes it most-recently used, so "b" is evicted next.
+        assert_eq!(cache.get(&"a"), Some(&1));
+        assert_eq!(cache.insert("c", 3), Some(2));
+        assert!(cache.contains(&"a"));
+        assert!(!cache.contains(&"b"));
+        assert!(cache.contains(&"c"));
+    }
+
+    #[test]
+    fn lru_cache_evicts_least_recently_used_at_capacity() {
+        let mut cache = LruCache::new(3);
+        assert!(cache.insert("a", 1).is_none());
+        assert!(cache.insert("b", 2).is_none());
+        assert!(cache.insert("c", 3).is_none());
+        assert_eq!(cache.len(), 3);
+        // Full: inserting "d" evicts the least-recently-used "a".
+        assert_eq!(cache.insert("d", 4), Some(1));
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains(&"a"));
+        for key in ["b", "c", "d"] {
+            assert!(cache.contains(&key));
+        }
+    }
+
+    #[test]
+    fn lru_cache_insert_same_key_updates_in_place() {
+        let mut cache = LruCache::new(2);
+        assert!(cache.insert("a", 1).is_none());
+        // Re-inserting an existing key updates the value and never evicts.
+        assert!(cache.insert("a", 10).is_none());
+        assert_eq!(cache.get(&"a"), Some(&10));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn lru_cache_clear_drops_everything_and_reuse() {
+        let mut cache = LruCache::new(2);
+        assert!(cache.insert("a", 1).is_none());
+        assert!(cache.insert("b", 2).is_none());
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains(&"a"));
+        // The cache is usable again after clearing.
+        assert!(cache.insert("c", 3).is_none());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn lru_cache_zero_capacity_insert_evicts_every_new_entry() {
+        let mut cache = LruCache::new(0);
+        assert_eq!(cache.insert("a", 1), Some(1));
+        assert_eq!(cache.len(), 0);
     }
 }
