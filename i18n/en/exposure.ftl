@@ -22,7 +22,6 @@ roll-frames = {$count ->
 }
 git-description = Git commit {$hash} on {$date}
 editing-title = Editing
-editing-toggle = Show editing panel
 exposure-label = Exposure
 contrast-label = Contrast
 rolloff-label = Highlights

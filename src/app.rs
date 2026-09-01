@@ -172,6 +172,9 @@ pub struct AppModel {
     /// stamped into [`ExposureProgram::image_id`] so the GPU pipeline
     /// recognises a new image and rebuilds its texture.
     next_image_id: u64,
+    /// True while the detail view's editing drawer is hidden for a full-screen
+    /// preview (toggled by spacebar). Only meaningful while `selected` is set.
+    fullscreen: bool,
 }
 
 /// The selectable cell on the library page: either the always-first Add Roll
@@ -286,6 +289,10 @@ pub enum Message {
     DetailFadeTick,
     /// The user moved the exposure slider.
     ExposureChanged(f32),
+    /// Toggle the full-screen preview: hide the editing drawer (spacebar) so
+    /// the detail view fills the window; toggling again (or pressing Escape)
+    /// restores the drawer.
+    ToggleFullscreen,
     /// Wheel-scroll zoom in the detail view; payload is the change in zoom
     /// units (log2 of the scale ratio), positive = zoom in, negative = out.
     DetailZoom(f32),
@@ -420,6 +427,7 @@ impl cosmic::Application for AppModel {
             reset_curve_rolloff: 1.0,
             reset_curve_shadows: 1.0,
             next_image_id: 0,
+            fullscreen: false,
         };
 
         // Seed the POC's original single roll directory so a fresh config
@@ -471,20 +479,10 @@ impl cosmic::Application for AppModel {
 
     /// Elements to pack at the end of the header bar.
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        // Toggles the editing panel drawer for the active detail view.
-        let active = self.context_page == ContextPage::Editing
-            && self.core.window.show_context
-            && self.selected.is_some();
-
-        let editing = widget::button::icon(icon::from_name("edit-symbolic"))
-            .selected(active)
-            .tooltip(fl!("editing-toggle"))
-            .on_press_maybe(
-                self.selected
-                    .is_some()
-                    .then_some(Message::ToggleContextPage(ContextPage::Editing)),
-            )
-            .into();
+        // The editing drawer is no longer toggled from a header button — it
+        // opens automatically with the detail view (see `open_frame`) and is
+        // hidden/revealed by the spacebar full-screen preview — so the header
+        // end packs only the search control.
 
         // Search filters the current view's entries (roll names on the library
         // page, frame names in a roll). Mirroring cosmic-files, the input is
@@ -506,7 +504,7 @@ impl cosmic::Application for AppModel {
                 .into()
         };
 
-        vec![editing, search]
+        vec![search]
     }
 
     /// Display a context drawer if the context page is requested.
@@ -607,7 +605,16 @@ impl cosmic::Application for AppModel {
                     _ => None,
                 },
                 // The spacebar carries no Named variant in this iced fork, so
-                // Ctrl+Space arrives as a character — matched by payload.
+                // it arrives as a character — matched by payload. A bare
+                // space (no modifiers) toggles the full-screen preview; the
+                // handler no-ops when no detail view is open.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == " " => Some(Message::ToggleFullscreen),
+                // Ctrl+Space opens the roll-info drawer (a modifying wildcard
+                // would otherwise catch the bare-space above).
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
                     modifiers,
@@ -676,6 +683,15 @@ impl cosmic::Application for AppModel {
                     return Task::none();
                 }
                 if self.selected.is_some() {
+                    // First Escape in full-screen preview only exits full-screen
+                    // (restoring the editing drawer); a second Escape then closes
+                    // the detail view back to the grid.
+                    if self.fullscreen {
+                        self.fullscreen = false;
+                        self.context_page = ContextPage::Editing;
+                        self.core.window.show_context = true;
+                        return Task::none();
+                    }
                     // Close the detail view; the frame highlight survives so
                     // the grid still shows where you were.
                     self.selected = None;
@@ -1030,6 +1046,24 @@ impl cosmic::Application for AppModel {
                 self.decode_next()
             }
 
+            Message::ToggleFullscreen => {
+                // Full-screen preview only applies to a detail view; on the
+                // library page (or the bare grid) spacebar does nothing.
+                if self.selected.is_none() {
+                    return Task::none();
+                }
+                self.fullscreen = !self.fullscreen;
+                if self.fullscreen {
+                    // Hide the editing drawer so the preview fills the window.
+                    self.core_mut().set_show_context(false);
+                } else {
+                    // Back to the editing drawer mode.
+                    self.context_page = ContextPage::Editing;
+                    self.core.window.show_context = true;
+                }
+                Task::none()
+            }
+
             Message::ToggleContextPage(context_page) => {
                 // The metadata drawer needs a library *roll* selection; without
                 // one (no selection, or the Add Roll tile) the toggle is a no-op
@@ -1146,6 +1180,9 @@ impl AppModel {
     /// tweaks to the outgoing file, loads the stored edits, updates both the
     /// detail selection and the grid highlight, and starts the decode chain.
     fn open_frame(&mut self, name: String) -> Task<cosmic::Action<Message>> {
+        // A fresh open (no frame selected yet) — but not a same-session
+        // re-open/pagination — shows the editing drawer immediately.
+        let opening = self.selected.is_none();
         if self.selected.as_deref() != Some(name.as_str()) {
             // Persist unsaved tweaks to the outgoing file first.
             self.persist_roll();
@@ -1166,6 +1203,15 @@ impl AppModel {
             self.reset_curve_contrast = stored_tone.curve_contrast;
             self.reset_curve_rolloff = stored_tone.curve_rolloff;
             self.reset_curve_shadows = stored_tone.curve_shadows;
+        }
+
+        // Show the editing drawer as soon as a frame is first opened, so the
+        // controls are available immediately. A same-session paging to a
+        // neighbour file does not re-open it (it stays inside whatever mode
+        // the user is in, e.g. full-screen preview).
+        if opening {
+            self.context_page = ContextPage::Editing;
+            self.core.window.show_context = true;
         }
 
         self.decode_detail_next()
@@ -1398,6 +1444,8 @@ impl AppModel {
         self.reset_curve_contrast = 1.0;
         self.reset_curve_rolloff = 1.0;
         self.reset_curve_shadows = 1.0;
+        // The full-screen preview dies with the detail view it belongs to.
+        self.fullscreen = false;
     }
 
     /// Writes the in-memory roll edits to the open roll's manifest file on disk.
