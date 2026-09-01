@@ -58,6 +58,17 @@ const MAX_CONCURRENT_PRELOADS: usize = 2;
 /// the overview LRU cache (so Left/Right paging to a neighbor is instant).
 const DETAIL_PRELOAD_DISTANCE: usize = 1;
 
+/// Keyboard shortcut step for exposure (EV) when an edit control is adjusted
+/// with a bare key.
+const EDIT_STEP_EV: f32 = 0.50;
+/// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier.
+const EDIT_NUDGE_EV: f32 = 0.05;
+/// Keyboard shortcut step for a tone-curve power (contrast/rolloff/shadows)
+/// with a bare key.
+const EDIT_STEP_CURVE: f32 = 0.20;
+/// Keyboard shortcut nudge step for a tone-curve power with the Shift modifier.
+const EDIT_NUDGE_CURVE: f32 = 0.05;
+
 /// Maximum detail-view zoom in `log2` units: 1.0 = contain fit, each +1
 /// doubles the rendered scale, so this caps at 2^6 = 64× the fit scale.
 const MAX_DETAIL_ZOOM: f32 = 7.0;
@@ -101,8 +112,26 @@ pub struct AppModel {
     /// Frame-grid highlight: the tile single-clicked (or last opened / paged
     /// to) inside an open roll. Distinct from `selected` (the opened detail
     /// frame) so the highlight survives closing the detail view and drives the
-    /// accent ring, Enter, and arrow-key navigation.
+    /// accent ring, Enter, and arrow-key navigation. Also the "primary" of any
+    /// multi-selection: it is always a member of `selected_frames`.
     frame_selected: Option<String>,
+    /// Multi-selected frames on the open roll's grid. A plain click (or the
+    /// primary `frame_selected`) always lands here; Ctrl+click toggles a frame
+    /// in/out, Shift+click selects the range from the anchor through the
+    /// clicked frame, and Ctrl+A selects everything in the filtered set. Used
+    /// as the batch target for copy/paste edits.
+    selected_frames: HashSet<String>,
+    /// Last frame used as the Shift+click range anchor within the filtered set.
+    selection_anchor: Option<String>,
+    /// Whether the Ctrl modifier is currently held. Tracked from the global
+    /// keyboard subscription so a frame click can distinguish a plain click
+    /// (clear + select) from a Ctrl+click (toggle a frame in/out of the
+    /// multi-selection), since iced's `MouseArea` delivers no modifier info.
+    ctrl_down: bool,
+    /// Whether the Shift modifier is currently held. Drives Shift+click range
+    /// selection (and whether control shortcuts activate). Tracked from the
+    /// global keyboard subscription like `ctrl_down`.
+    shift_down: bool,
     /// Number of columns the library grid last laid out (tracked from window
     /// resizes, matching iced's `Grid::fluid` math), so Up/Down keyboard
     /// navigation can jump by exactly one row.
@@ -183,6 +212,9 @@ pub struct AppModel {
     reset_curve_contrast: f32,
     reset_curve_rolloff: f32,
     reset_curve_shadows: f32,
+    /// The last edit copied for paste (Ctrl+C), as a full [`ToneEdit`]. `None`
+    /// until the user copies — a paste with nothing copied is a no-op.
+    clipboard: Option<edit_manifest::ToneEdit>,
     /// Monotonic counter incremented each time a new detail decode finishes;
     /// stamped into [`ExposureProgram::image_id`] so the GPU pipeline
     /// recognises a new image and rebuilds its texture.
@@ -368,6 +400,14 @@ pub enum Message {
     /// A roll tile was single-clicked — select it (highlight + metadata
     /// drawer target). Does not drill in.
     RollSelected(PathBuf),
+    /// Remove a roll from the library (the library page owns the roll list).
+    /// Non-destructive: drops the directory from the persisted config so it no
+    /// longer shows as a roll card — the files and their edit manifest on disk
+    /// are left untouched and the roll can be re-added later.
+    RemoveRoll(PathBuf),
+    /// Remove the roll currently selected in the library (menu-driven variant
+    /// of [`Message::RemoveRoll`]); no-ops when no roll is selected.
+    RemoveSelectedRoll,
     /// The Add Roll tile was single-clicked — select it (highlight). Does not
     /// open the folder picker; that still needs a double click or Enter.
     AddRollSelected,
@@ -382,9 +422,19 @@ pub enum Message {
     /// inside an open roll it moves the frame highlight, or pages the detail
     /// view left/right when one is open.
     Nav(MoveDir),
-    /// A frame tile was single-clicked — highlight it (accent ring) without
-    /// opening the detail view.
+    /// A frame tile was single-clicked — select it (accent ring) without
+    /// opening the detail view. Honors the current modifier state: a plain
+    /// click clears and selects, Ctrl+click toggles membership, Shift+click
+    /// selects the range from the anchor through this frame.
     FrameSelected(String),
+    /// Select every frame in the open roll's filtered set (Ctrl+A).
+    SelectAllFrames,
+    /// A modifier key was pressed. Tracks Ctrl/Shift state so frame clicks can
+    /// distinguish plain/Ctrl/Shift selection (iced's `MouseArea` carries no
+    /// modifier info).
+    ModifierDown(Mod),
+    /// A modifier key was released; see [`Message::ModifierDown`].
+    ModifierUp(Mod),
     /// A grid scrollable reported its geometry (bounds, content height, current
     /// translation). Cached so keyboard navigation can reveal the highlighted
     /// tile by scrolling the grid when it moves out of the visible viewport.
@@ -402,6 +452,9 @@ pub enum Message {
     /// The active search term changed (typed into the header input).
     SearchInput(String),
     LaunchUrl(String),
+    /// A surface action from a menu popup (Wayland): forwarded to the cosmic
+    /// runtime, which creates/destroys the popup surface backing the menus.
+    Surface(cosmic::surface::Action),
     ThumbReady(String, Result<Handle, ()>),
     /// A thumbnail was double-clicked, opening it in the detail view.
     ThumbnailActivated(String),
@@ -409,6 +462,10 @@ pub enum Message {
     DetailFadeTick,
     /// The user moved the exposure slider.
     ExposureChanged(f32),
+    /// A keyboard shortcut adjusted one of the editing controls by a signed
+    /// delta (positive = increase). Routes through the same RAM + live-shader
+    /// path as the matching slider; no-op unless a detail view is open.
+    AdjustEdit(EditAdjust),
     /// Toggle the full-screen preview: hide the editing drawer (spacebar) so
     /// the detail view fills the window; toggling again (or pressing Escape)
     /// restores the drawer.
@@ -431,9 +488,17 @@ pub enum Message {
     ResetAll,
     /// Flush the in-memory roll edits to the manifest file on disk.
     EditSave,
+    /// Copy the focused frame's full edit (exposure + tone curve) to the
+    /// clipboard as a [`ToneEdit`] (Ctrl+C).
+    CopyEdits,
+    /// Paste the copied edit onto every multi-selected frame, or the focused
+    /// frame when nothing else is selected (Ctrl+V).
+    PasteEdits,
     /// Consume an input event without acting on it, blocking the grid
     /// beneath the detail view's input surface.
     Ignore,
+    /// Quit the application, persisting any open edits first.
+    Quit,
     ToggleContextPage(ContextPage),
     UpdateConfig(Config),
 }
@@ -446,6 +511,26 @@ pub enum MoveDir {
     Right,
     Up,
     Down,
+}
+
+/// A single editing-control adjustment from a keyboard shortcut: which control
+/// and the signed delta to apply (positive = increase). The step (coarse vs
+/// nudge) is resolved at construction by `edit_adjust_for`, so the handler
+/// only clamps against the control's range and applies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EditAdjust {
+    Exposure(f32),
+    Contrast(f32),
+    Rolloff(f32),
+    Shadows(f32),
+}
+
+/// A tracked modifier key whose held state a frame click needs to decide its
+/// multi-select behavior (iced's `MouseArea` does not deliver modifier state).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mod {
+    Ctrl,
+    Shift,
 }
 
 /// Create a COSMIC application from the app model
@@ -492,13 +577,36 @@ impl cosmic::Application for AppModel {
             core,
             context_page: ContextPage::default(),
             about,
-            key_binds: HashMap::from([(
-                menu::KeyBind {
-                    modifiers: vec![menu::key_bind::Modifier::Ctrl],
-                    key: keyboard::Key::Character(" ".into()),
-                },
-                MenuAction::RollInfo,
-            )]),
+            key_binds: HashMap::from([
+                (
+                    menu::KeyBind {
+                        modifiers: vec![menu::key_bind::Modifier::Ctrl],
+                        key: keyboard::Key::Character(" ".into()),
+                    },
+                    MenuAction::RollInfo,
+                ),
+                (
+                    menu::KeyBind {
+                        modifiers: vec![menu::key_bind::Modifier::Ctrl],
+                        key: keyboard::Key::Character("a".into()),
+                    },
+                    MenuAction::SelectAll,
+                ),
+                (
+                    menu::KeyBind {
+                        modifiers: vec![menu::key_bind::Modifier::Ctrl],
+                        key: keyboard::Key::Character("c".into()),
+                    },
+                    MenuAction::CopyEdits,
+                ),
+                (
+                    menu::KeyBind {
+                        modifiers: vec![menu::key_bind::Modifier::Ctrl],
+                        key: keyboard::Key::Character("v".into()),
+                    },
+                    MenuAction::PasteEdits,
+                ),
+            ]),
             // Optional configuration file for an application.
             config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
                 .map(|context| match Config::get_entry(&context) {
@@ -516,6 +624,10 @@ impl cosmic::Application for AppModel {
             active: None,
             library_selection: None,
             frame_selected: None,
+            selected_frames: HashSet::new(),
+            selection_anchor: None,
+            ctrl_down: false,
+            shift_down: false,
             // A 3-wide grid is a safe initial guess until the first resize.
             grid_cols: 3,
             // No viewport is known until the grid lays out and scrolls; the
@@ -546,6 +658,7 @@ impl cosmic::Application for AppModel {
             reset_curve_contrast: 1.0,
             reset_curve_rolloff: 1.0,
             reset_curve_shadows: 1.0,
+            clipboard: None,
             next_image_id: 0,
             fullscreen: false,
             detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
@@ -585,8 +698,43 @@ impl cosmic::Application for AppModel {
 
     /// Elements to pack at the start of the header bar.
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        let menu_bar = menu::bar(vec![menu::Tree::with_children(
-            menu::root(fl!("view")).apply(Element::from),
+        // Remove roll is only actionable when a roll is selected in the
+        // library; otherwise it shows disabled on the menu.
+        let roll_selected = matches!(&self.library_selection, Some(LibrarySelection::Roll(_)));
+        let remove_roll = if roll_selected {
+            menu::Item::Button(fl!("menu-remove-roll"), None, MenuAction::RemoveRoll)
+        } else {
+            menu::Item::ButtonDisabled(fl!("menu-remove-roll"), None, MenuAction::RemoveRoll)
+        };
+
+        let file_menu = menu::Tree::with_children(
+            menu::root(fl!("menu-file")).apply(Element::from),
+            menu::items(
+                &self.key_binds,
+                vec![
+                    menu::Item::Button(fl!("menu-add-roll"), None, MenuAction::AddRoll),
+                    remove_roll,
+                    menu::Item::Divider,
+                    menu::Item::Button(fl!("menu-quit"), None, MenuAction::Quit),
+                ],
+            ),
+        );
+
+        let edit_menu = menu::Tree::with_children(
+            menu::root(fl!("menu-edit")).apply(Element::from),
+            menu::items(
+                &self.key_binds,
+                vec![
+                    menu::Item::Button(fl!("menu-select-all"), None, MenuAction::SelectAll),
+                    menu::Item::Divider,
+                    menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits),
+                    menu::Item::Button(fl!("menu-paste-edits"), None, MenuAction::PasteEdits),
+                ],
+            ),
+        );
+
+        let view_menu = menu::Tree::with_children(
+            menu::root(fl!("menu-view")).apply(Element::from),
             menu::items(
                 &self.key_binds,
                 vec![
@@ -594,7 +742,14 @@ impl cosmic::Application for AppModel {
                     menu::Item::Button(fl!("menu-roll-info"), None, MenuAction::RollInfo),
                 ],
             ),
-        )]);
+        );
+
+        // Menu popups must be backed by real Wayland surfaces (and know which
+        // window to anchor to), so the bar forwards surface actions to the
+        // cosmic runtime — matching how cosmic-files wires its menu bar.
+        let menu_bar = menu::bar(vec![file_menu, edit_menu, view_menu])
+            .window_id_maybe(self.core().main_window_id())
+            .on_surface_action(Message::Surface);
 
         vec![menu_bar.into()]
     }
@@ -724,6 +879,19 @@ impl cosmic::Application for AppModel {
                     keyboard::key::Named::ArrowRight => Some(Message::Nav(MoveDir::Right)),
                     keyboard::key::Named::ArrowUp => Some(Message::Nav(MoveDir::Up)),
                     keyboard::key::Named::ArrowDown => Some(Message::Nav(MoveDir::Down)),
+                    keyboard::key::Named::Control => Some(Message::ModifierDown(Mod::Ctrl)),
+                    keyboard::key::Named::Shift => Some(Message::ModifierDown(Mod::Shift)),
+                    _ => None,
+                },
+                // Mirror the modifier releases so `ctrl_down`/`shift_down`
+                // stay accurate even when the frame click that reads them
+                // happens later.
+                keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(named),
+                    ..
+                } => match named {
+                    keyboard::key::Named::Control => Some(Message::ModifierUp(Mod::Ctrl)),
+                    keyboard::key::Named::Shift => Some(Message::ModifierUp(Mod::Shift)),
                     _ => None,
                 },
                 // The spacebar carries no Named variant in this iced fork, so
@@ -750,6 +918,37 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if modifiers.control() && character == "f" => Some(Message::SearchActivate),
+                // Ctrl+A selects every frame in the open roll's filtered set.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if modifiers.control() && character == "a" => Some(Message::SelectAllFrames),
+                // Ctrl+C / Ctrl+V copy and paste edits. The handlers no-op
+                // when there is nothing focused to copy (or nothing copied to
+                // paste), and a focused text input captures these keys first
+                // (so search-field copy/paste is unaffected).
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if modifiers.control() && character == "c" => Some(Message::CopyEdits),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if modifiers.control() && character == "v" => Some(Message::PasteEdits),
+                // Editing shortcuts: bare (no Ctrl) keys that map to one of the
+                // editing controls; holding Shift switches to the fine nudge
+                // step. The handler no-ops unless a detail view is open, so
+                // these stay inert on the library/grid pages.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() => {
+                    edit_adjust_for(character.as_str(), modifiers.shift()).map(Message::AdjustEdit)
+                }
                 _ => None,
             }),
             // Watch for application configuration changes.
@@ -868,6 +1067,12 @@ impl cosmic::Application for AppModel {
                     shader.set_exposure(ev);
                 }
                 Task::none()
+            }
+
+            Message::AdjustEdit(adjust) => {
+                // Keyboard shortcuts only make sense while a detail view (and
+                // its editing controls) are on screen.
+                self.apply_edit_adjust(adjust)
             }
 
             Message::DetailZoom(delta) => {
@@ -1020,6 +1225,13 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
+            Message::RemoveRoll(dir) => self.remove_roll(dir),
+
+            Message::RemoveSelectedRoll => match self.library_selection.clone() {
+                Some(LibrarySelection::Roll(dir)) => self.remove_roll(dir),
+                _ => Task::none(),
+            },
+
             Message::OpenSelected => {
                 if self.active.is_some() {
                     // Frame page: open the highlighted frame in the detail view.
@@ -1045,7 +1257,8 @@ impl cosmic::Application for AppModel {
                     // through the frames; on the bare grid they move the
                     // highlight.
                     if self.selected.is_some() {
-                        let matched = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+                        let matched =
+                            filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
                         let current = self
                             .selected
                             .as_ref()
@@ -1068,7 +1281,17 @@ impl cosmic::Application for AppModel {
                     let len = matched.len();
                     let cols = self.nav_cols();
                     if let Some(target) = nav_target(selected, len, cols, dir) {
-                        self.frame_selected = Some(matched[target].name.clone());
+                        let name = matched[target].name.clone();
+                        self.frame_selected = Some(name.clone());
+                        // Shift+arrow extends the multi-selection (keeping it
+                        // additive); a plain arrow collapses to the new primary.
+                        if self.shift_down {
+                            self.selected_frames.insert(name.clone());
+                        } else {
+                            self.selected_frames.clear();
+                            self.selected_frames.insert(name.clone());
+                        }
+                        self.selection_anchor = Some(name.clone());
                         return self.scroll_selection_into_view("frames-grid", target, len, cols);
                     }
                     return Task::none();
@@ -1090,7 +1313,47 @@ impl cosmic::Application for AppModel {
             }
 
             Message::FrameSelected(name) => {
-                self.frame_selected = Some(name);
+                // The clicked tile is always the keyboard focus / primary, even
+                // when a multi-select toggle removes it from the selection set.
+                self.frame_selected = Some(name.clone());
+                let order = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+                let (updated, anchor) = apply_frame_click(
+                    std::mem::take(&mut self.selected_frames),
+                    &name,
+                    self.ctrl_down,
+                    self.shift_down,
+                    self.selection_anchor.as_deref(),
+                    &order,
+                );
+                self.selected_frames = updated;
+                self.selection_anchor = anchor;
+                Task::none()
+            }
+
+            Message::SelectAllFrames => {
+                if self.active.is_some() {
+                    self.selected_frames =
+                        filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""))
+                            .into_iter()
+                            .map(|tile| tile.name.clone())
+                            .collect();
+                }
+                Task::none()
+            }
+
+            Message::ModifierDown(modifier) => {
+                match modifier {
+                    Mod::Ctrl => self.ctrl_down = true,
+                    Mod::Shift => self.shift_down = true,
+                }
+                Task::none()
+            }
+
+            Message::ModifierUp(modifier) => {
+                match modifier {
+                    Mod::Ctrl => self.ctrl_down = false,
+                    Mod::Shift => self.shift_down = false,
+                }
                 Task::none()
             }
 
@@ -1133,6 +1396,8 @@ impl cosmic::Application for AppModel {
                 self.active = None;
                 self.selected = None;
                 self.frame_selected = None;
+                self.selected_frames.clear();
+                self.selection_anchor = None;
                 self.grid_viewport = None;
                 self.tiles = Vec::new();
                 self.thumb_inflight.clear();
@@ -1237,17 +1502,37 @@ impl cosmic::Application for AppModel {
                 // roll tile's preview should reflect it too — re-bake the
                 // cover in lockstep with the frame tile.
                 if let Some(active) = self.active.as_ref() {
-                    let Some(roll) = self
-                        .rolls
-                        .iter_mut()
-                        .find(|roll| roll.dir == *active && roll.cover.as_deref() == Some(name.as_str()))
-                    else {
+                    let Some(roll) = self.rolls.iter_mut().find(|roll| {
+                        roll.dir == *active && roll.cover.as_deref() == Some(name.as_str())
+                    }) else {
                         return Task::batch(tasks);
                     };
                     roll.thumb = Thumb::Loading;
                     tasks.push(self.decode_covers());
                 }
                 Task::batch(tasks)
+            }
+
+            Message::CopyEdits => {
+                self.copy_edits();
+                Task::none()
+            }
+
+            Message::PasteEdits => self.paste_edits(),
+
+            Message::Quit => {
+                // Flush any in-progress edit to disk, then ask the window to
+                // close (the cosmic runtime runs our on_close_requested hook,
+                // which persists a final time before exiting).
+                self.persist_roll();
+                self.persist_config();
+                Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Close))
+            }
+
+            // Forward menu-bar popup surface actions to the cosmic runtime,
+            // which creates/destroys the actual popup surfaces on Wayland.
+            Message::Surface(action) => {
+                cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)))
             }
 
             Message::LaunchUrl(url) => match open::that_detached(&url) {
@@ -1289,6 +1574,8 @@ impl AppModel {
         self.active = Some(dir.clone());
         self.selected = None;
         self.frame_selected = None;
+        self.selected_frames.clear();
+        self.selection_anchor = None;
         self.grid_viewport = None;
         self.clear_detail();
         self.close_editing();
@@ -1318,6 +1605,11 @@ impl AppModel {
             let stored_tone = self.roll.tone(name.as_str());
             self.selected = Some(name.clone());
             self.frame_selected = Some(name.clone());
+            // The opened frame becomes the primary of the multi-selection (and
+            // the Shift+click anchor), so copy/paste batches stay consistent
+            // with what is on screen.
+            self.selected_frames.insert(name.clone());
+            self.selection_anchor = Some(name.clone());
             self.clear_detail();
             self.exposure_ev = stored_tone.exposure_ev;
             self.curve_contrast = stored_tone.curve_contrast;
@@ -1579,7 +1871,13 @@ impl AppModel {
     /// native level-up done when the source was already at (or below) the
     /// overview cap. Used when serving an LRU cache hit so the preview appears
     /// immediately without re-decoding the RAW.
-    fn install_detail_shader(&mut self, mono: Vec<f32>, width: u32, height: u32, src_long_edge: u32) {
+    fn install_detail_shader(
+        &mut self,
+        mono: Vec<f32>,
+        width: u32,
+        height: u32,
+        src_long_edge: u32,
+    ) {
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1);
         self.detail_shader = Some(exposure_shader::ExposureProgram::new(
@@ -1740,6 +2038,190 @@ impl AppModel {
         if self.context_page == ContextPage::Editing && self.core.window.show_context {
             self.core_mut().set_show_context(false);
         }
+    }
+
+    /// Applies a keyboard-shortcut edit adjustment, mirroring the slider
+    /// messages: mutate the RAM roll edit and the live shader, and rely on the
+    /// normal flush points (`EditSave`, close) to persist. No-ops unless a
+    /// detail view is open (there is nothing to edit otherwise).
+    fn apply_edit_adjust(&mut self, adjust: EditAdjust) -> Task<cosmic::Action<Message>> {
+        // Only adjust while a detail view is up, so the bindings never mutate
+        // edits for an unseen frame.
+        if self.selected.is_none() {
+            return Task::none();
+        }
+
+        match adjust {
+            EditAdjust::Exposure(delta) => {
+                let ev = clamp_ev(self.exposure_ev + delta);
+                self.exposure_ev = ev;
+                if let Some(selected) = &self.selected {
+                    self.roll.set_exposure(selected, ev);
+                }
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_exposure(ev);
+                }
+            }
+            // Each tone arm only changes one power; the others keep their
+            // current values so the composed curve stays fully defined.
+            EditAdjust::Contrast(delta) => {
+                let contrast = clamp_curve_power(self.curve_contrast + delta);
+                self.curve_contrast = contrast;
+                if let Some(selected) = &self.selected {
+                    self.roll
+                        .set_curve(selected, contrast, self.curve_rolloff, self.curve_shadows);
+                }
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_curve(contrast, self.curve_rolloff, self.curve_shadows);
+                }
+            }
+            EditAdjust::Rolloff(delta) => {
+                let rolloff = clamp_curve_power(self.curve_rolloff + delta);
+                self.curve_rolloff = rolloff;
+                if let Some(selected) = &self.selected {
+                    self.roll
+                        .set_curve(selected, self.curve_contrast, rolloff, self.curve_shadows);
+                }
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_curve(self.curve_contrast, rolloff, self.curve_shadows);
+                }
+            }
+            EditAdjust::Shadows(delta) => {
+                let shadows = clamp_curve_power(self.curve_shadows + delta);
+                self.curve_shadows = shadows;
+                if let Some(selected) = &self.selected {
+                    self.roll
+                        .set_curve(selected, self.curve_contrast, self.curve_rolloff, shadows);
+                }
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_curve(self.curve_contrast, self.curve_rolloff, shadows);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Copies the focused frame's full edit (exposure + tone curve) to the
+    /// edit clipboard for a later [`Self::paste_edits`]. The focus is the
+    /// primary grid frame (`frame_selected`), falling back to the open detail
+    /// frame `selected`. No-op when there is nothing focused/selected.
+    fn copy_edits(&mut self) {
+        let source = self.frame_selected.as_deref().or(self.selected.as_deref());
+        if let Some(source) = source {
+            self.clipboard = Some(self.roll.tone(source));
+        }
+    }
+
+    /// Pastes the copied edit onto every multi-selected frame (or the focused
+    /// frame when nothing else is selected): writes each target's full edit to
+    /// the RAM manifest, updates the live shader to the pasted values when the
+    /// open detail frame is a target, persists, and re-bakes the affected grid
+    /// thumbnails (plus the roll cover if it is one of them).
+    fn paste_edits(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(tone) = self.clipboard else {
+            return Task::none();
+        };
+
+        // Target frames: the multi-selection, else the focused (or open) frame.
+        let mut targets: Vec<String> = self
+            .selected_frames
+            .iter()
+            .cloned()
+            .chain(
+                self.frame_selected
+                    .clone()
+                    .into_iter()
+                    .chain(self.selected.clone().into_iter()),
+            )
+            .collect();
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            return Task::none();
+        }
+
+        // Apply to the RAM manifest for every target.
+        for name in &targets {
+            self.roll.set_tone(name, tone);
+        }
+
+        // If the live detail frame is a target, sync the on-screen preview
+        // state and the GPU shader to the pasted values.
+        if let Some(open) = self.selected.as_deref() {
+            if targets.iter().any(|name| name == open) {
+                self.exposure_ev = tone.exposure_ev;
+                self.curve_contrast = tone.curve_contrast;
+                self.curve_rolloff = tone.curve_rolloff;
+                self.curve_shadows = tone.curve_shadows;
+                if let Some(shader) = &mut self.detail_shader {
+                    shader.set_exposure(tone.exposure_ev);
+                    shader.set_curve(tone.curve_contrast, tone.curve_rolloff, tone.curve_shadows);
+                }
+            }
+        }
+
+        self.persist_roll();
+
+        // Re-bake the affected tiles so the grid reflects the new edits.
+        let mut tasks = Vec::with_capacity(2);
+        for name in &targets {
+            if let Some(tile) = self.tiles.iter_mut().find(|tile| &tile.name == name) {
+                tile.thumb = Thumb::Loading;
+            }
+        }
+        tasks.push(self.decode_next());
+        // If the open roll's cover is among the targets, its library card also
+        // re-bakes to mirror the edit.
+        if let Some(active) = self.active.as_ref() {
+            if let Some(roll) = self.rolls.iter_mut().find(|roll| {
+                roll.dir == *active
+                    && roll
+                        .cover
+                        .as_deref()
+                        .is_some_and(|cover| targets.iter().any(|t| t == cover))
+            }) {
+                roll.thumb = Thumb::Loading;
+                tasks.push(self.decode_covers());
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Removes a roll from the library, dropping its directory from the
+    /// persisted config so it stops appearing as a roll card.
+    ///
+    /// Non-destructive and reversible: the on-disk files and the roll's edit
+    /// manifest are left untouched — only the library listing changes, so the
+    /// roll can be re-added later without losing edits. No-ops when the roll
+    /// is not in the library (e.g. a stale reference) or while it is open.
+    fn remove_roll(&mut self, dir: PathBuf) -> Task<cosmic::Action<Message>> {
+        // Only the library page owns the roll list; an open roll cannot be
+        // removed from under its frame grid.
+        if self.active.is_some() {
+            return Task::none();
+        }
+        let removed = self.rolls.iter().any(|roll| roll.dir == dir);
+        if !removed {
+            return Task::none();
+        }
+
+        self.config
+            .rolls
+            .retain(|candidate| Path::new(candidate) != dir.as_path());
+        self.persist_config();
+        self.rolls.retain(|roll| roll.dir != dir);
+
+        // If the removed roll was selected (driving the RollInfo drawer and
+        // the keyboard highlight), clear the selection so no stale target
+        // remains and close that drawer.
+        if matches!(self.library_selection.as_ref(), Some(LibrarySelection::Roll(sel)) if *sel == dir)
+        {
+            self.library_selection = None;
+            if self.context_page == ContextPage::RollInfo {
+                self.core_mut().set_show_context(false);
+            }
+        }
+        Task::none()
     }
 
     /// Handle the completion of a hi-res detail decode, applying the result
@@ -2117,6 +2599,67 @@ fn paginate(current: usize, len: usize, dir: MoveDir) -> Option<usize> {
     }
 }
 
+/// Updates the multi-selection after a frame tile is clicked, given the current
+/// modifier state and the visible (filtered) `order` of frames.
+///
+/// - Plain click: replace the selection with just the clicked frame.
+/// - Ctrl+click: toggle the clicked frame's membership.
+/// - Shift+click: replace the selection with the inclusive range from the
+///   `anchor` through the clicked frame (in `order`); a missing anchor or a
+///   clicked frame outside `order` collapses to a plain single selection.
+///
+/// Returns the new selection set and the new shift-anchor (the clicked frame,
+/// unless it was toggled out by a Ctrl+click, in which case the anchor is
+/// unchanged so a later Shift+click still sources a valid frame).
+fn apply_frame_click(
+    mut selected: HashSet<String>,
+    clicked: &str,
+    ctrl: bool,
+    shift: bool,
+    anchor: Option<&str>,
+    order: &[&Tile],
+) -> (HashSet<String>, Option<String>) {
+    // Index of the clicked frame in the visible order (None when filtered out).
+    let click_idx = order.iter().position(|tile| tile.name == clicked);
+
+    if shift {
+        // Range: anchor through clicked, inclusive, in display order.
+        if let Some(anchor) = anchor {
+            if let (Some(click_idx), Some(anchor_idx)) =
+                (click_idx, order.iter().position(|tile| tile.name == anchor))
+            {
+                let (lo, hi) = if anchor_idx <= click_idx {
+                    (anchor_idx, click_idx)
+                } else {
+                    (click_idx, anchor_idx)
+                };
+                selected.clear();
+                for tile in &order[lo..=hi] {
+                    selected.insert(tile.name.clone());
+                }
+                return (selected, Some(clicked.to_owned()));
+            }
+        }
+        // No usable anchor: fall through to a plain single selection.
+    }
+
+    if ctrl {
+        if selected.contains(clicked) {
+            selected.remove(clicked);
+            // Keep the anchor stable (the toggled-off frame is gone from the
+            // set but may still be the focus); return the old anchor.
+            return (selected, anchor.map(str::to_owned));
+        }
+        selected.insert(clicked.to_owned());
+        return (selected, Some(clicked.to_owned()));
+    }
+
+    // Plain click: single selection.
+    selected.clear();
+    selected.insert(clicked.to_owned());
+    (selected, Some(clicked.to_owned()))
+}
+
 /// Column count for a fluid grid of `THUMB_SIZE` cells at `available` width,
 /// mirroring iced's `Grid::fluid`/`Constraint::MaxWidth` math exactly
 /// (`ceil((available + spacing) / (max + spacing))`).
@@ -2242,7 +2785,6 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
     let matched = filtered_tiles(&app.tiles, app.search.as_deref().unwrap_or(""));
-    let selected = app.frame_selected.as_deref();
 
     let tiles: Element<'_, Message> = if matched.is_empty() {
         widget::container(widget::text(fl!("no-files")))
@@ -2255,7 +2797,7 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
         let grid = Grid::with_children(
             matched
                 .into_iter()
-                .map(|tile| tile_view(tile, selected == Some(tile.name.as_str()))),
+                .map(|tile| tile_view(tile, app.selected_frames.contains(&tile.name))),
         )
         .fluid(THUMB_SIZE)
         .height(grid::Sizing::AspectRatio(TILE_ASPECT))
@@ -2376,7 +2918,10 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
 fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    widget::column::with_capacity(3)
+    let remove = widget::button::destructive(fl!("remove-roll"))
+        .on_press(Message::RemoveRoll(roll.dir.clone()));
+
+    widget::column::with_capacity(7)
         .push(widget::text::heading(&roll.name))
         .push(widget::divider::horizontal::default())
         .push(meta_row(
@@ -2391,6 +2936,8 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
             fl!("roll-cover-label"),
             roll.cover.clone().unwrap_or_else(|| fl!("roll-no-cover")),
         ))
+        .push(widget::divider::horizontal::default())
+        .push(remove)
         .spacing(space_s)
         .width(Length::Fill)
         .into()
@@ -2749,6 +3296,49 @@ fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: (f32, f32), cursor: Poin
         pan.0 + k * (cursor.x - pan.0),
         pan.1 + k * (cursor.y - pan.1),
     )
+}
+
+/// Clamps an exposure adjustment in EV to the slider's range (−3.0..=+3.0).
+fn clamp_ev(ev: f32) -> f32 {
+    ev.clamp(-3.0, 3.0)
+}
+
+/// Clamps a tone-curve power (contrast/rolloff/shadows) to the slider's range
+/// (0.2..=3.0) so a keyboard shortcut and the slider agree on bounds.
+fn clamp_curve_power(power: f32) -> f32 {
+    power.clamp(0.2, 3.0)
+}
+
+/// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
+/// key is not bound.
+///
+/// The four control pairs are laid out on a US keyboard left-to-right to match
+/// the editing panel's control order (Exposure → Contrast → Rolloff → Shadows):
+/// `-`/`=` exposure, `[`/`]` contrast, `;`/`'` rolloff, `,`/`.` shadows. A bare
+/// key uses the coarse step; holding `Shift` selects the fine nudge step. The
+/// `key` payload is deliberately layout-stable: iced's `keyboard::listen`
+/// delivers the unmodified character (`key_without_modifiers`), and the iced
+/// fork never reports the `Shift`-produced symbols from the base keys used
+/// here, so nudge is driven by the event's modifier state rather than by
+/// matching `_`/`+`/`{`/`}`/`:`/`"`/`<`/`>`.
+fn edit_adjust_for(key: &str, shift: bool) -> Option<EditAdjust> {
+    let ev = if shift { EDIT_NUDGE_EV } else { EDIT_STEP_EV };
+    let curve = if shift {
+        EDIT_NUDGE_CURVE
+    } else {
+        EDIT_STEP_CURVE
+    };
+    match key {
+        "-" => Some(EditAdjust::Exposure(-ev)),
+        "=" => Some(EditAdjust::Exposure(ev)),
+        "[" => Some(EditAdjust::Contrast(-curve)),
+        "]" => Some(EditAdjust::Contrast(curve)),
+        ";" => Some(EditAdjust::Rolloff(-curve)),
+        "'" => Some(EditAdjust::Rolloff(curve)),
+        "," => Some(EditAdjust::Shadows(-curve)),
+        "." => Some(EditAdjust::Shadows(curve)),
+        _ => None,
+    }
 }
 
 /// Decodes a RAW frame from the open roll into a thumbnail message, baking in
@@ -3567,6 +4157,12 @@ pub enum ContextPage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
+    AddRoll,
+    RemoveRoll,
+    Quit,
+    SelectAll,
+    CopyEdits,
+    PasteEdits,
     About,
     RollInfo,
 }
@@ -3576,6 +4172,12 @@ impl menu::action::MenuAction for MenuAction {
 
     fn message(&self) -> Self::Message {
         match self {
+            MenuAction::AddRoll => Message::AddRoll,
+            MenuAction::RemoveRoll => Message::RemoveSelectedRoll,
+            MenuAction::Quit => Message::Quit,
+            MenuAction::SelectAll => Message::SelectAllFrames,
+            MenuAction::CopyEdits => Message::CopyEdits,
+            MenuAction::PasteEdits => Message::PasteEdits,
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
             MenuAction::RollInfo => Message::ToggleContextPage(ContextPage::RollInfo),
         }
@@ -4336,5 +4938,151 @@ mod tests {
         let mut cache = LruCache::new(0);
         assert_eq!(cache.insert("a", 1), Some(1));
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn clamp_ev_bounds_to_the_slider_range() {
+        assert_eq!(clamp_ev(-99.0), -3.0);
+        assert_eq!(clamp_ev(99.0), 3.0);
+        assert_eq!(clamp_ev(0.5), 0.5);
+    }
+
+    #[test]
+    fn clamp_curve_power_bounds_to_the_slider_range() {
+        assert_eq!(clamp_curve_power(0.0), 0.2);
+        assert_eq!(clamp_curve_power(9.0), 3.0);
+        assert_eq!(clamp_curve_power(1.0), 1.0);
+    }
+
+    #[test]
+    fn edit_adjust_maps_bare_and_shifted_keys() {
+        // Exposure pair: `-`/`=` coarse, Shift nudge.
+        assert_eq!(
+            edit_adjust_for("-", false),
+            Some(EditAdjust::Exposure(-EDIT_STEP_EV))
+        );
+        assert_eq!(
+            edit_adjust_for("=", false),
+            Some(EditAdjust::Exposure(EDIT_STEP_EV))
+        );
+        assert_eq!(
+            edit_adjust_for("-", true),
+            Some(EditAdjust::Exposure(-EDIT_NUDGE_EV))
+        );
+        assert_eq!(
+            edit_adjust_for("=", true),
+            Some(EditAdjust::Exposure(EDIT_NUDGE_EV))
+        );
+        // Contrast pair: `[`/`]` coarse, Shift nudge.
+        assert_eq!(
+            edit_adjust_for("[", false),
+            Some(EditAdjust::Contrast(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for("]", false),
+            Some(EditAdjust::Contrast(EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for("[", true),
+            Some(EditAdjust::Contrast(-EDIT_NUDGE_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for("]", true),
+            Some(EditAdjust::Contrast(EDIT_NUDGE_CURVE))
+        );
+        // Rolloff pair: `;`/`'` coarse, Shift nudge.
+        assert_eq!(
+            edit_adjust_for(";", false),
+            Some(EditAdjust::Rolloff(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for("'", false),
+            Some(EditAdjust::Rolloff(EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for(";", true),
+            Some(EditAdjust::Rolloff(-EDIT_NUDGE_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for("'", true),
+            Some(EditAdjust::Rolloff(EDIT_NUDGE_CURVE))
+        );
+        // Shadows pair: `,`/`.` coarse, Shift nudge.
+        assert_eq!(
+            edit_adjust_for(",", false),
+            Some(EditAdjust::Shadows(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for(".", false),
+            Some(EditAdjust::Shadows(EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for(",", true),
+            Some(EditAdjust::Shadows(-EDIT_NUDGE_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for(".", true),
+            Some(EditAdjust::Shadows(EDIT_NUDGE_CURVE))
+        );
+    }
+
+    #[test]
+    fn edit_adjust_ignores_unbound_keys() {
+        assert_eq!(edit_adjust_for("a", false), None);
+        assert_eq!(edit_adjust_for(" ", false), None);
+        assert_eq!(edit_adjust_for("p", true), None);
+        assert_eq!(edit_adjust_for("_", true), None);
+    }
+
+    #[test]
+    fn plain_click_selects_a_single_frame() {
+        let tiles = vec![tile("a"), tile("b"), tile("c")];
+        let ord: Vec<&Tile> = tiles.iter().collect();
+        let (set, anchor) = apply_frame_click(HashSet::new(), "b", false, false, None, &ord);
+        let mut v: Vec<_> = set.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec!["b".to_string()]);
+        assert_eq!(anchor.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_membership() {
+        let tiles = vec![tile("a"), tile("b"), tile("c")];
+        let ord: Vec<&Tile> = tiles.iter().collect();
+        let start: HashSet<String> = ["a", "b"].into_iter().map(str::to_owned).collect();
+        // Toggle "b" off.
+        let (set, anchor) = apply_frame_click(start.clone(), "b", true, false, Some("a"), &ord);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("a"));
+        assert!(!set.contains("b"));
+        assert_eq!(anchor.as_deref(), Some("a"));
+        // Toggle "c" on.
+        let (set, _) = apply_frame_click(start, "c", true, false, Some("a"), &ord);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn shift_click_selects_range_anchor_to_clicked() {
+        let tiles = vec![tile("a"), tile("b"), tile("c"), tile("d")];
+        let ord: Vec<&Tile> = tiles.iter().collect();
+        // Anchor "a", click "c" → selects a..=c.
+        let (set, anchor) = apply_frame_click(HashSet::new(), "c", false, true, Some("a"), &ord);
+        let mut v: Vec<_> = set.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(anchor.as_deref(), Some("c"));
+        // Reverse range: anchor "d", click "b" → selects b..=d.
+        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, Some("d"), &ord);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("b") && set.contains("c") && set.contains("d"));
+    }
+
+    #[test]
+    fn shift_click_without_anchor_collapses_to_single() {
+        let tiles = vec![tile("a"), tile("b"), tile("c")];
+        let ord: Vec<&Tile> = tiles.iter().collect();
+        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, None, &ord);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("b"));
     }
 }

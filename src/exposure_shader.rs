@@ -8,8 +8,8 @@
 //! per frame.
 
 use cosmic::iced::core::{Length, Rectangle};
-use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewport};
 use cosmic::iced::wgpu::util::DeviceExt;
+use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewport};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -416,8 +416,8 @@ impl Primitive for ExposurePrimitive {
                 tex.create_view(&cosmic::iced::wgpu::TextureViewDescriptor::default());
 
             pipeline.texture = Some(texture_view);
-            pipeline.bind_group = Some(
-                device.create_bind_group(&cosmic::iced::wgpu::BindGroupDescriptor {
+            pipeline.bind_group = Some(device.create_bind_group(
+                &cosmic::iced::wgpu::BindGroupDescriptor {
                     label: Some("exposure bg"),
                     layout: &pipeline.bind_group_layout,
                     entries: &[
@@ -438,8 +438,8 @@ impl Primitive for ExposurePrimitive {
                             resource: pipeline.uniform_buf.as_entire_binding(),
                         },
                     ],
-                }),
-            );
+                },
+            ));
             pipeline.current_image_id = Some(self.image_id);
             pipeline.initialized = true;
         }
@@ -456,8 +456,14 @@ impl Primitive for ExposurePrimitive {
         // anchor. Composed on the CPU into one `ratio · p^exp`; identity at
         // the 1.0 defaults, so untouched renders stay byte-identical to the
         // pre-curve pass.
-        let (curve_ratio, curve_exp) =
-            curve_remap(self.contrast, self.rolloff, self.shadows, self.shadow, self.mid, self.white);
+        let (curve_ratio, curve_exp) = curve_remap(
+            self.contrast,
+            self.rolloff,
+            self.shadows,
+            self.shadow,
+            self.mid,
+            self.white,
+        );
         let uniforms = Uniforms {
             // Convert raw EV (slider value) to linear-light gain once per
             // frame; the WGSL shader reads this as a direct multiplier.
@@ -491,32 +497,31 @@ impl Primitive for ExposurePrimitive {
         target: &cosmic::iced::wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
-        let (_tex_view, Some(pipeline_obj), Some(bind_group)) =
-            (&pipeline.texture, &pipeline.render_pipeline, &pipeline.bind_group)
-        else {
+        let (_tex_view, Some(pipeline_obj), Some(bind_group)) = (
+            &pipeline.texture,
+            &pipeline.render_pipeline,
+            &pipeline.bind_group,
+        ) else {
             return;
         };
 
         {
-            let mut pass =
-                encoder.begin_render_pass(&cosmic::iced::wgpu::RenderPassDescriptor {
-                    label: Some("exposure render"),
-                    color_attachments: &[Some(
-                        cosmic::iced::wgpu::RenderPassColorAttachment {
-                            view: target,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: cosmic::iced::wgpu::Operations {
-                                load: cosmic::iced::wgpu::LoadOp::Load,
-                                store: cosmic::iced::wgpu::StoreOp::Store,
-                            },
-                        },
-                    )],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
+            let mut pass = encoder.begin_render_pass(&cosmic::iced::wgpu::RenderPassDescriptor {
+                label: Some("exposure render"),
+                color_attachments: &[Some(cosmic::iced::wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: cosmic::iced::wgpu::Operations {
+                        load: cosmic::iced::wgpu::LoadOp::Load,
+                        store: cosmic::iced::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
 
             #[allow(clippy::cast_precision_loss)]
             pass.set_viewport(
@@ -573,12 +578,13 @@ impl Pipeline for ExposurePipeline {
         let bind_group_layout = build_bind_group_layout(device);
         let render_pipeline = build_render_pipeline(device, &shader, &bind_group_layout);
 
-        let uniform_buf = device.create_buffer_init(&cosmic::iced::wgpu::util::BufferInitDescriptor {
-            label: Some("exposure uniforms"),
-            contents: bytemuck::bytes_of(&Uniforms::default()),
-            usage: cosmic::iced::wgpu::BufferUsages::UNIFORM
-                | cosmic::iced::wgpu::BufferUsages::COPY_DST,
-        });
+        let uniform_buf =
+            device.create_buffer_init(&cosmic::iced::wgpu::util::BufferInitDescriptor {
+                label: Some("exposure uniforms"),
+                contents: bytemuck::bytes_of(&Uniforms::default()),
+                usage: cosmic::iced::wgpu::BufferUsages::UNIFORM
+                    | cosmic::iced::wgpu::BufferUsages::COPY_DST,
+            });
 
         let sampler = device.create_sampler(&cosmic::iced::wgpu::SamplerDescriptor {
             address_mode_u: cosmic::iced::wgpu::AddressMode::ClampToEdge,
@@ -612,9 +618,9 @@ impl Pipeline for ExposurePipeline {
 fn load_shader(device: &cosmic::iced::wgpu::Device) -> cosmic::iced::wgpu::ShaderModule {
     device.create_shader_module(cosmic::iced::wgpu::ShaderModuleDescriptor {
         label: Some("exposure shader"),
-        source: cosmic::iced::wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-            include_str!("shader/exposure.wgsl"),
-        )),
+        source: cosmic::iced::wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+            "shader/exposure.wgsl"
+        ))),
     })
 }
 
@@ -628,9 +634,7 @@ fn build_bind_group_layout(
                 binding: 0,
                 visibility: cosmic::iced::wgpu::ShaderStages::FRAGMENT,
                 ty: cosmic::iced::wgpu::BindingType::Texture {
-                    sample_type: cosmic::iced::wgpu::TextureSampleType::Float {
-                        filterable: true,
-                    },
+                    sample_type: cosmic::iced::wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: cosmic::iced::wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -786,14 +790,14 @@ fn f32_to_half(value: f32) -> u16 {
     // Round-to-nearest-even.
     if round_part > 0x1000 || (round_part == 0x1000 && (half_mant & 1) != 0) {
         half_mant += 1;
-if half_mant >= 0x400 {
-        // Mantissa overflow → bump exponent (mantissa bits implicitly 0).
-        let new_exp = half_exp + 1;
-        if new_exp >= 31 {
-            return sign | 0x7c00;
+        if half_mant >= 0x400 {
+            // Mantissa overflow → bump exponent (mantissa bits implicitly 0).
+            let new_exp = half_exp + 1;
+            if new_exp >= 31 {
+                return sign | 0x7c00;
+            }
+            return sign | ((new_exp as u16) << 10);
         }
-        return sign | ((new_exp as u16) << 10);
-    }
     }
 
     sign | ((half_exp as u16) << 10) | (half_mant as u16)
@@ -828,7 +832,11 @@ mod tests {
         assert_eq!(f32_to_half(0.1), 0x2e66, "0.1");
         assert_eq!(f32_to_half(-0.1), 0xae66, "-0.1");
         assert_eq!(f32_to_half(0.000_488_281_25), 0x1000, "2^-11");
-        assert_eq!(f32_to_half(0.000_061_035_156_25), 0x0400, "smallest f16 normal ≈ 2^-14");
+        assert_eq!(
+            f32_to_half(0.000_061_035_156_25),
+            0x0400,
+            "smallest f16 normal ≈ 2^-14"
+        );
         // Values smaller than the smallest f16 normal range flush to zero;
         // we don't produce half-float subnormals.
         assert_eq!(
@@ -874,7 +882,10 @@ mod tests {
         for kc in [0.6_f32, 1.3] {
             let (ratio, exponent) = curve_remap(kc, 1.0, 1.0, shadow, mid, white);
             let t_mid = (ratio * mid.powf(exponent)).clamp(0.0, 1.0);
-            assert!((t_mid - mid).abs() < 1e-5, "contrast {kc}: T(mid) = {t_mid}");
+            assert!(
+                (t_mid - mid).abs() < 1e-5,
+                "contrast {kc}: T(mid) = {t_mid}"
+            );
         }
     }
 
@@ -884,7 +895,10 @@ mod tests {
         for kr in [0.6_f32, 1.3] {
             let (ratio, exponent) = curve_remap(1.0, kr, 1.0, shadow, mid, white);
             let t_white = (ratio * white.powf(exponent)).clamp(0.0, 1.0);
-            assert!((t_white - white).abs() < 1e-5, "rolloff {kr}: T(white) = {t_white}");
+            assert!(
+                (t_white - white).abs() < 1e-5,
+                "rolloff {kr}: T(white) = {t_white}"
+            );
         }
     }
 
@@ -987,13 +1001,8 @@ mod tests {
         let module = naga::front::wgsl::parse_str(source)
             .unwrap_or_else(|err| panic!("WGSL failed to parse: {err}"));
 
-        let stages: Vec<_> = module
-            .entry_points
-            .iter()
-            .map(|ep| ep.stage)
-            .collect();
+        let stages: Vec<_> = module.entry_points.iter().map(|ep| ep.stage).collect();
         assert!(stages.contains(&naga::ShaderStage::Vertex));
         assert!(stages.contains(&naga::ShaderStage::Fragment));
     }
 }
-

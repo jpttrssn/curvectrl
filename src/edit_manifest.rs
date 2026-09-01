@@ -129,8 +129,13 @@ impl RollManifest {
         if let Some(edit) = self.edits.get_mut(name) {
             edit.exposure_ev = exposure_ev;
         } else {
-            self.edits
-                .insert(name.to_owned(), EditData { exposure_ev, ..Default::default() });
+            self.edits.insert(
+                name.to_owned(),
+                EditData {
+                    exposure_ev,
+                    ..Default::default()
+                },
+            );
         }
     }
 
@@ -162,12 +167,30 @@ impl RollManifest {
     /// back to their identities.
     #[must_use]
     pub fn tone(&self, name: &str) -> ToneEdit {
-        self.edits.get(name).map_or_else(ToneEdit::identity, |edit| ToneEdit {
-            exposure_ev: edit.exposure_ev,
-            curve_contrast: edit.curve_contrast,
-            curve_rolloff: edit.curve_rolloff,
-            curve_shadows: edit.curve_shadows,
-        })
+        self.edits
+            .get(name)
+            .map_or_else(ToneEdit::identity, |edit| ToneEdit {
+                exposure_ev: edit.exposure_ev,
+                curve_contrast: edit.curve_contrast,
+                curve_rolloff: edit.curve_rolloff,
+                curve_shadows: edit.curve_shadows,
+            })
+    }
+
+    /// Replaces the full edit for `name` with `tone` (exposure + curve powers
+    /// in one step — copy/paste), updating an existing entry in place.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_tone(&mut self, name: &str, tone: ToneEdit) {
+        self.edits.insert(
+            name.to_owned(),
+            EditData {
+                exposure_ev: tone.exposure_ev,
+                curve_contrast: tone.curve_contrast,
+                curve_rolloff: tone.curve_rolloff,
+                curve_shadows: tone.curve_shadows,
+            },
+        );
     }
 }
 
@@ -247,7 +270,7 @@ mod tests {
     fn round_trip_preserves_edits_and_name() {
         let dir = temp_dir("roundtrip");
         std::fs::create_dir_all(&dir).unwrap();
-let mut manifest = RollManifest::default();
+        let mut manifest = RollManifest::default();
         manifest.set_exposure("IMG_0001.DNG", 0.42);
         manifest.set_exposure("IMG_0002.RAW", -0.75);
         manifest.set_curve("IMG_0001.DNG", 0.85, 1.15, 1.1);
@@ -429,6 +452,46 @@ let mut manifest = RollManifest::default();
         assert_eq!(tone.curve_contrast, 1.2);
         assert_eq!(tone.curve_rolloff, 0.8);
         assert_eq!(tone.curve_shadows, 0.9);
+    }
+
+    #[test]
+    fn set_tone_replaces_the_full_edit_in_one_step() {
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", 0.3);
+        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+
+        // A copy/paste replaces every field at once.
+        manifest.set_tone(
+            "a.DNG",
+            ToneEdit {
+                exposure_ev: -1.2,
+                curve_contrast: 0.7,
+                curve_rolloff: 1.4,
+                curve_shadows: 1.3,
+            },
+        );
+
+        let tone = manifest.tone("a.DNG");
+        assert_eq!(tone.exposure_ev, -1.2);
+        assert_eq!(tone.curve_contrast, 0.7);
+        assert_eq!(tone.curve_rolloff, 1.4);
+        assert_eq!(tone.curve_shadows, 1.3);
+        assert_eq!(manifest.edits.len(), 1);
+    }
+
+    #[test]
+    fn set_tone_creates_an_entry_on_a_fresh_file() {
+        let mut manifest = RollManifest::default();
+        manifest.set_tone(
+            "b.DNG",
+            ToneEdit {
+                exposure_ev: 0.4,
+                curve_contrast: 1.1,
+                curve_rolloff: 0.9,
+                curve_shadows: 1.0,
+            },
+        );
+        assert_eq!(manifest.tone("b.DNG").exposure_ev, 0.4);
     }
 
     #[test]

@@ -18,8 +18,7 @@ use cosmic::iced::core::renderer;
 use cosmic::iced::core::touch;
 use cosmic::iced::core::widget::{Operation, Tree, tree};
 use cosmic::iced::core::{
-    Clipboard, Element, Event, Layout, Length, Point, Rectangle, Shell, Size,
-    Vector, Widget,
+    Clipboard, Element, Event, Layout, Length, Point, Rectangle, Shell, Size, Vector, Widget,
 };
 
 /// Emits zoom/pan messages on mouse events over the detail preview.
@@ -83,10 +82,7 @@ impl<'a, Message, Theme, Renderer> DetailArea<'a, Message, Theme, Renderer> {
 
     /// The message to emit when the wheel is scrolled over the area.
     #[must_use]
-    pub fn on_scroll(
-        mut self,
-        on_scroll: impl Fn(mouse::ScrollDelta) -> Message + 'a,
-    ) -> Self {
+    pub fn on_scroll(mut self, on_scroll: impl Fn(mouse::ScrollDelta) -> Message + 'a) -> Self {
         self.on_scroll = Some(Box::new(on_scroll));
         self
     }
@@ -143,12 +139,9 @@ where
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content.as_widget_mut().operate(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            operation,
-        );
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
     fn update(
@@ -267,9 +260,7 @@ where
         );
 
         match (self.interaction, content_interaction) {
-            (Some(interaction), mouse::Interaction::None)
-                if cursor.is_over(layout.bounds()) =>
-            {
+            (Some(interaction), mouse::Interaction::None) if cursor.is_over(layout.bounds()) => {
                 interaction
             }
             _ => content_interaction,
