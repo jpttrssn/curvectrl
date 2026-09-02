@@ -36,3 +36,4 @@ menu-quit = Quit
 menu-select-all = Select all
 menu-copy-edits = Copy edits
 menu-paste-edits = Paste edits
+menu-show-editing = Show editing panel

@@ -498,6 +498,11 @@ pub enum Message {
     /// Quit the application, persisting any open edits first.
     Quit,
     ToggleContextPage(ContextPage),
+    /// Toggle the current page's context drawer (Ctrl+Space). Since the
+    /// keyboard subscription's filter closure cannot capture app state, this
+    /// defers the page choice to the update handler: editing while a detail
+    /// view is open, roll info otherwise.
+    ToggleContext,
     UpdateConfig(Config),
 }
 
@@ -727,6 +732,18 @@ impl cosmic::Application for AppModel {
                     menu::Item::Divider,
                     menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits),
                     menu::Item::Button(fl!("menu-paste-edits"), None, MenuAction::PasteEdits),
+                    menu::Item::Divider,
+                    // Show editing panel is only actionable while a detail view
+                    // (and its editing drawer) is open.
+                    if self.selected.is_some() {
+                        menu::Item::Button(fl!("menu-show-editing"), None, MenuAction::ShowEditing)
+                    } else {
+                        menu::Item::ButtonDisabled(
+                            fl!("menu-show-editing"),
+                            None,
+                            MenuAction::ShowEditing,
+                        )
+                    },
                 ],
             ),
         );
@@ -900,15 +917,16 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if !modifiers.control() && character == " " => Some(Message::ToggleFullscreen),
-                // Ctrl+Space opens the roll-info drawer (a modifying wildcard
-                // would otherwise catch the bare-space above).
+                // Ctrl+Space toggles the active page's context drawer (a
+                // modifying wildcard would otherwise catch the bare-space
+                // above). The page choice — editing vs roll info — is resolved
+                // in the update handler, since this closure cannot capture
+                // app state.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
                     modifiers,
                     ..
-                } if modifiers.control() && character == " " => {
-                    Some(Message::ToggleContextPage(ContextPage::RollInfo))
-                }
+                } if modifiers.control() && character == " " => Some(Message::ToggleContext),
                 // Ctrl+F reveals (and focuses) the search field.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
@@ -1470,6 +1488,20 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
+            Message::ToggleContext => {
+                // The default context-drawer toggle (Ctrl+Space) opens the
+                // editing panel while a detail view is open, or the roll-info
+                // drawer on the library page. Delegate to the page-specific
+                // toggles so their guards (e.g. a roll selection for roll info)
+                // still apply.
+                let page = if self.selected.is_some() {
+                    ContextPage::Editing
+                } else {
+                    ContextPage::RollInfo
+                };
+                self.update(Message::ToggleContextPage(page))
+            }
+
             Message::UpdateConfig(config) => {
                 self.config = config;
                 Task::none()
@@ -1586,9 +1618,6 @@ impl AppModel {
     /// tweaks to the outgoing file, loads the stored edits, updates both the
     /// detail selection and the grid highlight, and starts the decode chain.
     fn open_frame(&mut self, name: String) -> Task<cosmic::Action<Message>> {
-        // A fresh open (no frame selected yet) — but not a same-session
-        // re-open/pagination — shows the editing drawer immediately.
-        let opening = self.selected.is_none();
         if self.selected.as_deref() != Some(name.as_str()) {
             // Persist unsaved tweaks to the outgoing file first.
             self.persist_roll();
@@ -1622,14 +1651,10 @@ impl AppModel {
             self.reset_curve_shadows = stored_tone.curve_shadows;
         }
 
-        // Show the editing drawer as soon as a frame is first opened, so the
-        // controls are available immediately. A same-session paging to a
-        // neighbour file does not re-open it (it stays inside whatever mode
-        // the user is in, e.g. full-screen preview).
-        if opening {
-            self.context_page = ContextPage::Editing;
-            self.core.window.show_context = true;
-        }
+        // The editing drawer stays hidden on a fresh open; the user brings it
+        // up with Ctrl+Space or the Edit → Show editing panel menu when they
+        // want the controls. A same-session paging to a neighbour file likewise
+        // leaves whatever context state is current untouched.
 
         Task::batch([
             self.decode_detail_next(),
@@ -4137,6 +4162,7 @@ pub enum MenuAction {
     SelectAll,
     CopyEdits,
     PasteEdits,
+    ShowEditing,
     About,
     RollInfo,
 }
@@ -4152,6 +4178,7 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::SelectAll => Message::SelectAllFrames,
             MenuAction::CopyEdits => Message::CopyEdits,
             MenuAction::PasteEdits => Message::PasteEdits,
+            MenuAction::ShowEditing => Message::ToggleContextPage(ContextPage::Editing),
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
             MenuAction::RollInfo => Message::ToggleContextPage(ContextPage::RollInfo),
         }
