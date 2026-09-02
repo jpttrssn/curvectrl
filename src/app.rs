@@ -1600,8 +1600,14 @@ impl AppModel {
             self.frame_selected = Some(name.clone());
             // The opened frame becomes the primary of the multi-selection (and
             // the Shift+click anchor), so copy/paste batches stay consistent
-            // with what is on screen.
-            self.selected_frames.insert(name.clone());
+            // with what is on screen.  Shift+open extends; a plain open
+            // collapses the set to the single opened frame.
+            if self.shift_down {
+                self.selected_frames.insert(name.clone());
+            } else {
+                self.selected_frames.clear();
+                self.selected_frames.insert(name.clone());
+            }
             self.selection_anchor = Some(name.clone());
             self.clear_detail();
             self.exposure_ev = stored_tone.exposure_ev;
