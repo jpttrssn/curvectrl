@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! GPU exposure shader — renders mono image data with live EV adjustment.
+//! GPU detail shader — renders mono image data with live EV adjustment.
 //!
 //! The mono `Vec<f32>` is uploaded to the GPU once as an `R16Float` texture.
 //! Exposure and the tone curve are applied as shader uniforms (`2^EV` gain and
@@ -16,7 +16,7 @@ use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewpor
 // ---------------------------------------------------------------------------
 
 /// GPU-backed detail view image with live exposure adjustment.
-pub struct ExposureProgram {
+pub struct DetailProgram {
     mono: Vec<f32>,
     width: u32,
     height: u32,
@@ -24,7 +24,7 @@ pub struct ExposureProgram {
     /// slider change so the WGSL shader sees a linear-light gain.
     exposure: f32,
     /// Detail-view zoom in `log2` units: 1.0 = contain fit, each +1 doubles
-    /// the rendered scale (see [`ExposurePrimitive::prepare`]).
+    /// the rendered scale (see [`DetailPrimitive::prepare`]).
     zoom: f32,
     /// Pan offset of the image center from the widget center, in logical
     /// points; converted to physical pixels on the GPU side.
@@ -52,7 +52,7 @@ pub struct ExposureProgram {
     image_id: u64,
 }
 
-impl ExposureProgram {
+impl DetailProgram {
     /// Create a new program for the given mono image.
     ///
     /// `mono` is linear, inverted-positive pre-sRGB data (one `f32` per pixel,
@@ -115,7 +115,7 @@ impl ExposureProgram {
     }
 }
 
-impl Clone for ExposureProgram {
+impl Clone for DetailProgram {
     fn clone(&self) -> Self {
         Self {
             mono: self.mono.clone(),
@@ -135,9 +135,9 @@ impl Clone for ExposureProgram {
     }
 }
 
-impl std::fmt::Debug for ExposureProgram {
+impl std::fmt::Debug for DetailProgram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExposureProgram")
+        f.debug_struct("DetailProgram")
             .field("width", &self.width)
             .field("height", &self.height)
             .field("exposure", &self.exposure)
@@ -159,9 +159,9 @@ impl std::fmt::Debug for ExposureProgram {
 // iced::widget::shader::Program implementation
 // ---------------------------------------------------------------------------
 
-impl<M> Program<M> for ExposureProgram {
+impl<M> Program<M> for DetailProgram {
     type State = ();
-    type Primitive = ExposurePrimitive;
+    type Primitive = DetailPrimitive;
 
     fn draw(
         &self,
@@ -169,7 +169,7 @@ impl<M> Program<M> for ExposureProgram {
         _cursor: cosmic::iced::mouse::Cursor,
         _bounds: Rectangle,
     ) -> Self::Primitive {
-        ExposurePrimitive {
+        DetailPrimitive {
             mono: self.mono.clone(),
             exposure: self.exposure,
             zoom: self.zoom,
@@ -332,7 +332,7 @@ pub(crate) fn apply_curve(
 /// image is selected (iceD caches pipelines per type, so we cannot rely on
 /// `initialized` alone).
 #[derive(Debug, Clone)]
-pub struct ExposurePrimitive {
+pub struct DetailPrimitive {
     mono: Vec<f32>,
     exposure: f32,
     /// Detail-view zoom in `log2` units; 1.0 = contain fit.
@@ -356,8 +356,8 @@ pub struct ExposurePrimitive {
     image_id: u64,
 }
 
-impl Primitive for ExposurePrimitive {
-    type Pipeline = ExposurePipeline;
+impl Primitive for DetailPrimitive {
+    type Pipeline = DetailPipeline;
 
     fn prepare(
         &self,
@@ -368,7 +368,7 @@ impl Primitive for ExposurePrimitive {
         viewport: &Viewport,
     ) {
         // --- Rebuild texture + bind group if image identity changed ---
-        // `iced` caches the `ExposurePipeline` across image selections because
+        // `iced` caches the `DetailPipeline` across image selections because
         // both selections share the same pipeline type. `initialized` only
         // catches the very first frame; tracking `image_id` catches every
         // subsequent image swap too.
@@ -543,10 +543,10 @@ impl Primitive for ExposurePrimitive {
 // GPU pipeline (created once per image, stored in iced's primitive storage)
 // ---------------------------------------------------------------------------
 
-/// GPU resources shared across all `ExposurePrimitive` instances of the same
+/// GPU resources shared across all `DetailPrimitive` instances of the same
 /// image.  Created lazily on the first `prepare()` call (needs the mono data
 /// to build the texture).
-pub struct ExposurePipeline {
+pub struct DetailPipeline {
     texture: Option<cosmic::iced::wgpu::TextureView>,
     uniform_buf: cosmic::iced::wgpu::Buffer,
     sampler: cosmic::iced::wgpu::Sampler,
@@ -560,15 +560,15 @@ pub struct ExposurePipeline {
     current_image_id: Option<u64>,
 }
 
-impl std::fmt::Debug for ExposurePipeline {
+impl std::fmt::Debug for DetailPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExposurePipeline")
+        f.debug_struct("DetailPipeline")
             .field("initialized", &self.initialized)
             .finish_non_exhaustive()
     }
 }
 
-impl Pipeline for ExposurePipeline {
+impl Pipeline for DetailPipeline {
     fn new(
         device: &cosmic::iced::wgpu::Device,
         _queue: &cosmic::iced::wgpu::Queue,

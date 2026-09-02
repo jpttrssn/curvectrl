@@ -1102,6 +1102,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "curvectrl"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "libcosmic",
+ "naga",
+ "open",
+ "rawloader",
+ "rust-embed",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "xdgen",
+]
+
+[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1440,24 +1458,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
-]
-
-[[package]]
-name = "exposure"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "i18n-embed",
- "i18n-embed-fl",
- "libcosmic",
- "naga",
- "open",
- "rawloader",
- "rust-embed",
- "serde",
- "tokio",
- "toml 0.8.23",
- "xdgen",
 ]
 
 [[package]]

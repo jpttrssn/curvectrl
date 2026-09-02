@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=Exposure
+Name=CurveCtrl
 Comment=A film negative scanning and RAW image editor
 Type=Application
-Icon=io.github.jpttrssn.exposure
-Exec=exposure %F
+Icon=io.github.jpttrssn.curvectrl
+Exec=curvectrl %F
 Terminal=false
 StartupNotify=true
 Categories=COSMIC

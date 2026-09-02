@@ -1,7 +1,7 @@
 # Name of the application's binary.
-name := 'exposure'
+name := 'curvectrl'
 # The unique ID of the application.
-appid := 'io.github.jpttrssn.exposure'
+appid := 'io.github.jpttrssn.curvectrl'
 
 # Path to root file system, which defaults to `/`.
 rootdir := ''
@@ -65,7 +65,7 @@ install:
     install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{bin-dst}}
     install -Dm0644 {{ 'target' / 'xdgen' / 'app.desktop' }} {{desktop-dst}}
     install -Dm0644 {{ 'target' / 'xdgen' / 'app.metainfo.xml' }} {{appdata-dst}}
-    install -Dm0644 {{ 'resources' / 'icons' / 'hicolor' / 'scalable' / 'apps' / 'icon.svg' }} {{icon-svg-dst}}
+    install -Dm0644 {{ 'resources' / 'icons' / 'hicolor' / 'scalable' / 'apps' / (appid + '.svg') }} {{icon-svg-dst}}
 
 # Uninstalls installed files
 uninstall:

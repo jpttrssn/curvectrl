@@ -1,4 +1,4 @@
-app-title = Exposure
+app-title = CurveCtrl
 app-comment = A film negative scanning and RAW image editor
 app-keywords =
 about = About

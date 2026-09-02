@@ -4,9 +4,9 @@ mod app;
 mod config;
 mod detail_area;
 mod edit_manifest;
-mod exposure_shader;
 mod film;
 mod i18n;
+mod shader;
 
 fn main() -> cosmic::iced::Result {
     // Get the system's preferred languages.

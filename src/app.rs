@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
-use crate::exposure_shader;
+use crate::shader;
 use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
 use cosmic::Application;
@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
-const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/icon.svg");
+const APP_ICON: &[u8] =
+    include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.jpttrssn.curvectrl.svg");
 
 /// Maximum dimension of decoded RAW thumbnails, also the maximum Page 1 tile width.
 const THUMB_SIZE: f32 = 384.0;
@@ -167,7 +168,7 @@ pub struct AppModel {
     roll: RollManifest,
     /// GPU shader program for the detail view, rendering mono data with
     /// live exposure adjustment.  `None` while the decode is in flight.
-    detail_shader: Option<exposure_shader::ExposureProgram>,
+    detail_shader: Option<shader::DetailProgram>,
     /// File handed to the one permitted in-flight hi-res detail decode.
     detail_inflight: Option<String>,
     /// True once the native-resolution decode has been requested or found
@@ -216,7 +217,7 @@ pub struct AppModel {
     /// until the user copies — a paste with nothing copied is a no-op.
     clipboard: Option<edit_manifest::ToneEdit>,
     /// Monotonic counter incremented each time a new detail decode finishes;
-    /// stamped into [`ExposureProgram::image_id`] so the GPU pipeline
+    /// stamped into [`DetailProgram::image_id`] so the GPU pipeline
     /// recognises a new image and rebuilds its texture.
     next_image_id: u64,
     /// True while the detail view's editing drawer is hidden for a full-screen
@@ -274,7 +275,7 @@ struct Tile {
 
 /// A decoded detail-view overview: the linear pre-sRGB mono buffer plus its
 /// geometry, as delivered by [`decode_raw_detail`]. Exactly what an
-/// [`exposure_shader::ExposureProgram`] needs to (re)build without re-decoding
+/// [`shader::DetailProgram`] needs to (re)build without re-decoding
 /// the RAW. Cached by the detail LRU keyed on (roll dir, file name).
 #[derive(Debug, Clone)]
 struct DetailMono {
@@ -548,7 +549,7 @@ impl cosmic::Application for AppModel {
     type Message = Message;
 
     /// Unique identifier in RDNN (reverse domain name notation) format.
-    const APP_ID: &'static str = "dev.mmurphy.Test";
+    const APP_ID: &'static str = "io.github.jpttrssn.curvectrl";
 
     fn core(&self) -> &cosmic::Core {
         &self.core
@@ -667,16 +668,6 @@ impl cosmic::Application for AppModel {
             detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
             detail_preload_inflight: Vec::new(),
         };
-
-        // Seed the POC's original single roll directory so a fresh config
-        // shows the same frames the app always has, without any user action.
-        if app.config.rolls.is_empty()
-            && let Some(default) = default_library_dir()
-        {
-            app.config
-                .rolls
-                .push(default.to_string_lossy().into_owned());
-        }
 
         // Set the window title and scan the configured roll directories.
         let rolls = app.config.rolls.clone();
@@ -1903,7 +1894,7 @@ impl AppModel {
     ) {
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1);
-        self.detail_shader = Some(exposure_shader::ExposureProgram::new(
+        self.detail_shader = Some(shader::DetailProgram::new(
             mono,
             width,
             height,
@@ -2307,7 +2298,7 @@ impl AppModel {
                     }
                     let image_id = self.next_image_id;
                     self.next_image_id = self.next_image_id.wrapping_add(1);
-                    self.detail_shader = Some(exposure_shader::ExposureProgram::new(
+                    self.detail_shader = Some(shader::DetailProgram::new(
                         mono,
                         width,
                         height,
@@ -2386,14 +2377,6 @@ fn detail_trace(args: std::fmt::Arguments<'_>) {
     if std::env::var("EXPOSURE_TRACE_DETAIL").is_ok() {
         eprintln!("[detail] {args}");
     }
-}
-
-/// The default library directory a fresh install seeds, preserving the POC's
-/// original single-roll arrangement: the user's `~/Pictures/exposure`.
-fn default_library_dir() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|home| Path::new(&home).join("Pictures").join("exposure"))
 }
 
 /// Loads one roll's metadata: display name (directory leaf), cover file (first
@@ -3197,7 +3180,7 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
         (Some(_shader), _, _) => app
             .detail_shader
             .as_ref()
-            .map(exposure_shader::ExposureProgram::view)
+            .map(shader::DetailProgram::view)
             .unwrap()
             .into(),
         (None, _, _) => {
@@ -3908,8 +3891,8 @@ fn convert_thumbnail(
     // ordering exactly (curve first, then `2^EV`, then clamp/sRGB). At
     // the identity curve this is a no-op, so untouched renders stay
     // byte-identical to pre-curve ones.
-    let (shadow, mid, white) = exposure_shader::tone_anchors(&mono);
-    exposure_shader::apply_curve(
+    let (shadow, mid, white) = shader::tone_anchors(&mono);
+    shader::apply_curve(
         &mut mono,
         tone.curve_contrast,
         tone.curve_rolloff,

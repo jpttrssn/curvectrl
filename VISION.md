@@ -1,12 +1,12 @@
-# Exposure — Product Vision
+# CurveCtrl — Product Vision
 
 *Last updated: 2026-08-24 · Basis: repository audit at commit `97b417c`*
 
-## What Exposure Is
+## What CurveCtrl Is
 
-Exposure is a free-software (MPL-2.0) desktop application for film photographers who digitize their own negatives: a **film negative scanning and RAW image editor**, built natively for the COSMIC desktop environment. Point it at a folder of camera-scanned RAW frames and it renders them as proper photographic positives — not inverted-looking curiosities — using a pipeline designed around how film actually behaves: optical density, clear-film base, and per-stock tone curves.
+CurveCtrl is a free-software (MPL-2.0) desktop application for film photographers who digitize their own negatives: a **film negative scanning and RAW image editor**, built natively for the COSMIC desktop environment. Point it at a folder of camera-scanned RAW frames and it renders them as proper photographic positives — not inverted-looking curiosities — using a pipeline designed around how film actually behaves: optical density, clear-film base, and per-stock tone curves.
 
-Today Exposure is an early-stage, single-binary Rust app (~1,400 lines) whose first milestone is a high-fidelity contact sheet: it scans `~/Pictures/exposure`, decodes each RAW frame, reconstructs a monochrome negative at full sensor resolution, and shows inverted, calibrated positive thumbnails in a responsive grid. The longer arc is a complete darkroom: library browsing, non-destructive editing, and export for monochrome and color stocks alike.
+Today CurveCtrl is an early-stage, single-binary Rust app (~1,400 lines) whose first milestone is a high-fidelity contact sheet: point it at a folder of camera-scanned RAW frames and it decodes each RAW frame, reconstructs a monochrome negative at full sensor resolution, and shows inverted, calibrated positive thumbnails in a responsive grid. The longer arc is a complete darkroom: library browsing, non-destructive editing, and export for monochrome and color stocks alike.
 
 ## Who It Is For
 
@@ -17,7 +17,7 @@ Today Exposure is an early-stage, single-binary Rust app (~1,400 lines) whose fi
 
 ## Core Value Proposition
 
-Generic editors treat a scanned negative like an upside-down photo and leave you hand-wrestling curves. Exposure treats negatives as measurable physical objects:
+Generic editors treat a scanned negative like an upside-down photo and leave you hand-wrestling curves. CurveCtrl treats negatives as measurable physical objects:
 
 1. **Density-space inversion anchored on the film itself.** Each frame's clear-film base is measured statistically (p95 estimator, dust/outlier-robust) so black-point calibration is automatic and capture casts neutralize themselves — no per-image fiddling.
 2. **Grain-preserving reconstruction.** Bayer CFA classes are rescaled onto a common base at full sensor resolution instead of being demosaiced, keeping the grain texture and microcontrast that half-res interpolation smears away.
@@ -29,7 +29,7 @@ Generic editors treat a scanned negative like an upside-down photo and leave you
 
 Working today:
 
-- **Thumbnail library grid** — every regular file in `~/Pictures/exposure`, listed once at startup, displayed as square adaptive tiles (≤384 px) with progressive, one-at-a-time decoding and loading/failed states.
+- **Thumbnail library grid** — add a folder of RAW frames and every regular file in it is listed at startup, displayed as square adaptive tiles (≤384 px) with progressive, one-at-a-time decoding and loading/failed states.
 - **Monochrome RAW pipeline** — per-CFA-position black/white-level normalization → masked-border cropping → full-resolution bayer flattening (or Rec.709 luminance collapse for ≥3-sample pixels) → statistical clear-film base measurement with plausibility guard → optical-density-space inversion against the active stock profile (Ilford HP5+, proof of concept) → linear-light block-average downscale → gentle separable unsharp mask → sRGB encode → EXIF orientation fix.
 - **Film stock model** — `MonoStock` profile struct carrying calibrated parameters; per-channel inversion path retained and tested for future color stocks.
 - **COSMIC integration** — nav-bar pages, header menu, About drawer, persistent settings via cosmic-config, single-instance launch, Fluent localization with English fallback.
@@ -52,7 +52,7 @@ Planned (tracked in NOTES.md):
 | UI toolkit | libcosmic (git dependency on pop-os master, pinned by `Cargo.lock`) over iced; wgpu GPU-accelerated rendering |
 | RAW decoding | rawloader 0.37 |
 | Async runtime | tokio (`spawn_blocking` for CPU-heavy decode) |
-| Localization | i18n-embed + Fluent (`fl!` macro; `i18n/en/exposure.ftl`) |
+| Localization | i18n-embed + Fluent (`fl!` macro; `i18n/en/curvectrl.ftl`) |
 | Asset embedding | rust-embed |
 | Codegen | xdgen at build time → `app.desktop` + `app.metainfo.xml` from `resources/` templates |
 | Build/dev tooling | Cargo (`--locked` everywhere), just recipes (release, debug, vendored, install, check), rust-analyzer; mold/sccache recommended for iteration speed |
@@ -80,7 +80,7 @@ Known architectural debts, consciously tracked: no folder re-scan after startup,
 - **Manual visual QA**: perceptual constants (gamma 0.7, unsharp amount 0.4) are tuned against real HP5+ scans; the stock's base constant was calibrated from measured plateau data, not guessed. Decisions and gotchas are logged in NOTES.md.
 - No formal coverage percentage is enforced yet; the covered surface is the entire pure-pipeline core.
 
-## Where Exposure Is Heading
+## Where CurveCtrl Is Heading
 
 1. **From inversion POC to a stock-aware darkroom** — stock picker, per-channel color bases, calibration frames, and input transforms for color accuracy.
 2. **A trustworthy library** — refreshable/watched folders, visible error states, bounded caches, comfort at thousand-file scale.
