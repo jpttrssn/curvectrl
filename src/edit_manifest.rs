@@ -42,16 +42,25 @@ pub struct EditData {
     /// anchor), `1.0` = identity. Missing in older manifests stays `1.0`.
     #[serde(default = "default_curve_identity")]
     pub curve_shadows: f32,
+    /// Source-pixel crop margins removed from each edge. Missing in older
+    /// manifests stays the all-zero (no-crop) [`CropMargins::default`].
+    ///
+    /// A crop is a first-class edit that persists and renders everywhere, but
+    /// it is deliberately NOT part of [`ToneEdit`] so copy/paste never carries
+    /// a crop onto another frame.
+    #[serde(default)]
+    pub crop: CropMargins,
 }
 
 impl Default for EditData {
-    /// A fresh, un-edited entry: zero exposure, identity tone curve.
+    /// A fresh, un-edited entry: zero exposure, identity tone curve, no crop.
     fn default() -> Self {
         Self {
             exposure_ev: DEFAULT_EXPOSURE_EV,
             curve_contrast: DEFAULT_CURVE_CONTRAST,
             curve_rolloff: DEFAULT_CURVE_ROLLOFF,
             curve_shadows: DEFAULT_CURVE_SHADOWS,
+            crop: CropMargins::default(),
         }
     }
 }
@@ -96,6 +105,49 @@ impl ToneEdit {
     }
 }
 
+/// Source-pixel margins removed from each edge of a frame by a keyboard-driven
+/// crop, preserving the natural aspect ratio.
+///
+/// `top`/`right`/`bottom`/`left` are in source image pixels (raw photosites) and
+/// are applied at decode time, so a 1px margin trims 1 real sensor pixel
+/// regardless of display scale. The all-zero [`Default`] is identity (no crop).
+///
+/// Deliberately kept OUT of [`ToneEdit`]: copy/paste copies only tone, so a crop
+/// can never be pasted onto another frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CropMargins {
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub left: u32,
+}
+
+impl CropMargins {
+    /// The cropped width given the source width, as a non-negative [`u32`].
+    #[must_use]
+    pub fn cropped_width(self, source: u32) -> u32 {
+        source.saturating_sub(self.left).saturating_sub(self.right)
+    }
+
+    /// The cropped height given the source height, as a non-negative [`u32`].
+    #[must_use]
+    pub fn cropped_height(self, source: u32) -> u32 {
+        source.saturating_sub(self.top).saturating_sub(self.bottom)
+    }
+}
+
+/// Which edge a keyboard crop press trims. Only the four edges are exposed; a
+/// corner is built by trimming two adjoining edges sequentially. The anchor is
+/// auto-selected as the opposite edge's midpoint, and the perpendicular margins
+/// derive from the aspect ratio to keep the frame ratio-locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CropDirection {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
 /// A film roll directory's app-owned manifest: roll metadata plus per-file
 /// edits, keyed by file name within the roll. The directory itself is the
 /// scope, so equal file names across two rolls never collide.
@@ -114,7 +166,7 @@ pub struct RollManifest {
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: 4,
             name: None,
             edits: HashMap::new(),
         }
@@ -157,6 +209,7 @@ impl RollManifest {
                     curve_contrast: contrast,
                     curve_rolloff: rolloff,
                     curve_shadows: shadows,
+                    ..EditData::default()
                 },
             );
         }
@@ -165,6 +218,9 @@ impl RollManifest {
     /// The full edit for `name` as a single [`ToneEdit`], merging exposure
     /// and the curve powers. Files (or manifest fields) never touched fall
     /// back to their identities.
+    ///
+    /// The crop margins are intentionally NOT part of this aggregate: it is
+    /// the copy/paste payload, and a crop must never be copied/pasted.
     #[must_use]
     pub fn tone(&self, name: &str) -> ToneEdit {
         self.edits
@@ -180,8 +236,15 @@ impl RollManifest {
     /// Replaces the full edit for `name` with `tone` (exposure + curve powers
     /// in one step — copy/paste), updating an existing entry in place.
     ///
+    /// A paste never touches the target's crop: the crop margins survive
+    /// [`Self::set_tone`] unchanged (or stay default on a fresh file).
+    ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_tone(&mut self, name: &str, tone: ToneEdit) {
+        let existing = self
+            .edits
+            .get(name)
+            .map_or(CropMargins::default(), |edit| edit.crop);
         self.edits.insert(
             name.to_owned(),
             EditData {
@@ -189,8 +252,37 @@ impl RollManifest {
                 curve_contrast: tone.curve_contrast,
                 curve_rolloff: tone.curve_rolloff,
                 curve_shadows: tone.curve_shadows,
+                crop: existing,
             },
         );
+    }
+
+    /// The crop margins for `name`; files (or manifest fields) never touched
+    /// fall back to the all-zero (no-crop) default.
+    #[must_use]
+    pub fn crop(&self, name: &str) -> CropMargins {
+        self.edits
+            .get(name)
+            .map_or_else(CropMargins::default, |edit| edit.crop)
+    }
+
+    /// Records the crop margins for `name`, updating an existing entry in
+    /// place. Replaces the whole margins set at once (the keyboard trims build
+    /// it up via [`Self::set_crop_amount`]).
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_crop(&mut self, name: &str, crop: CropMargins) {
+        if let Some(edit) = self.edits.get_mut(name) {
+            edit.crop = crop;
+        } else {
+            self.edits.insert(
+                name.to_owned(),
+                EditData {
+                    crop,
+                    ..EditData::default()
+                },
+            );
+        }
     }
 }
 
@@ -306,7 +398,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.version, 4);
     }
 
     #[test]
@@ -521,5 +613,112 @@ mod tests {
 
         assert_eq!(manifest.edits.len(), 1);
         assert_eq!(manifest.tone("a.DNG").exposure_ev, -1.25);
+    }
+
+    #[test]
+    fn crop_round_trips_and_defaults_to_zero() {
+        let dir = temp_dir("crop-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        let crop = CropMargins {
+            top: 10,
+            right: 20,
+            bottom: 30,
+            left: 40,
+        };
+        manifest.set_crop("IMG_0001.DNG", crop);
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded, manifest);
+        assert_eq!(loaded.crop("IMG_0001.DNG"), crop);
+        // An untouched file has no crop.
+        assert_eq!(loaded.crop("IMG_0002.DNG"), CropMargins::default());
+    }
+
+    #[test]
+    fn legacy_manifest_without_crop_loads_zero_margins() {
+        let dir = temp_dir("legacy-crop");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A v1 manifest scripted before the crop field ever existed.
+        std::fs::write(
+            manifest_path(&dir),
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+        )
+        .unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.crop("a.DNG"), CropMargins::default());
+        // And the surviving tone fields still load.
+        assert_eq!(loaded.tone("a.DNG").exposure_ev, 0.75);
+    }
+
+    #[test]
+    fn crop_coexists_with_tone_edits_on_one_entry() {
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", 0.3);
+        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        let crop = CropMargins {
+            top: 5,
+            right: 6,
+            bottom: 7,
+            left: 8,
+        };
+        manifest.set_crop("a.DNG", crop);
+
+        assert_eq!(manifest.edits.len(), 1, "all edits on one entry");
+        assert_eq!(manifest.crop("a.DNG"), crop);
+        let tone = manifest.tone("a.DNG");
+        assert_eq!(tone.exposure_ev, 0.3);
+        assert_eq!(tone.curve_contrast, 1.2);
+    }
+
+    #[test]
+    fn paste_does_not_clobber_an_existing_crop() {
+        let mut manifest = RollManifest::default();
+        let crop = CropMargins {
+            top: 5,
+            right: 6,
+            bottom: 7,
+            left: 8,
+        };
+        manifest.set_crop("a.DNG", crop);
+        manifest.set_exposure("a.DNG", 0.3);
+
+        // Copy/paste writes a fresh ToneEdit onto the same file; the crop must
+        // survive untouched (crop is not part of the copy/paste payload).
+        manifest.set_tone(
+            "a.DNG",
+            ToneEdit {
+                exposure_ev: -1.2,
+                curve_contrast: 0.7,
+                curve_rolloff: 1.4,
+                curve_shadows: 1.3,
+            },
+        );
+
+        assert_eq!(manifest.crop("a.DNG"), crop, "paste keeps the target's crop");
+        assert_eq!(manifest.tone("a.DNG").exposure_ev, -1.2);
+    }
+
+    #[test]
+    fn set_crop_updates_in_place_and_creates_on_fresh_file() {
+        let mut manifest = RollManifest::default();
+        manifest.set_crop("a.DNG", CropMargins::default());
+        assert_eq!(manifest.crop("a.DNG"), CropMargins::default());
+
+        let crop = CropMargins {
+            top: 2,
+            right: 2,
+            bottom: 2,
+            left: 2,
+        };
+        manifest.set_crop("a.DNG", crop);
+        assert_eq!(manifest.edits.len(), 1);
+        assert_eq!(manifest.crop("a.DNG"), crop);
     }
 }

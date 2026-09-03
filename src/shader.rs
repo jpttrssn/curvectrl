@@ -11,6 +11,8 @@ use cosmic::iced::core::{Length, Rectangle};
 use cosmic::iced::wgpu::util::DeviceExt;
 use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewport};
 
+use crate::edit_manifest::CropMargins;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -20,6 +22,15 @@ pub struct DetailProgram {
     mono: Vec<f32>,
     width: u32,
     height: u32,
+    /// The full-resolution (post-masked-border, pre-downscale) display-oriented
+    /// source dimensions the crop margins are authored against, restored from
+    /// the downscaled texture + the sensor's true long edge at construction
+    /// (both share the same aspect, so the scale per axis is recovered). The
+    /// texture is a downscale of this; the shader maps source-pixel crop
+    /// margins onto the texture by `tex/src` per axis. At the native level-up
+    /// (texture == source) the scale collapses to 1 and the crop is exact.
+    src_w: u32,
+    src_h: u32,
     /// Raw EV value in stops; converted to `2^EV` once on the GPU side per
     /// slider change so the WGSL shader sees a linear-light gain.
     exposure: f32,
@@ -47,6 +58,18 @@ pub struct DetailProgram {
     /// Shadows power `ks`: the live tone curve pivots at `shadow`,
     /// `S(p) = shadow^(1-ks) * p^ks`. `1.0` = identity.
     shadows: f32,
+    /// Live source-pixel crop margins removed from each edge of the
+    /// full-resolution display-oriented frame. Applied as a uniform UV-remap
+    /// (no texture re-upload): at render time [`crop_uv_geometry`] scales them
+    /// onto the downscaled texture by `tex_axis/src_axis`, so the live trim and
+    /// the CPU thumbnail bake (which crops the same source-pixel margins onto
+    /// the print) stay in the same reference frame. A keyboard trim is instant.
+    /// `CropMargins::default()` (all zero) shows the full frame.
+    crop: CropMargins,
+    /// Whether the "view dimmed crop area" overlay is shown: the full
+    /// uncropped frame drawn on top of the zoomed crop with everything outside
+    /// the crop rectangle dimmed. View-only — never persisted or baked.
+    show_mask: bool,
     /// Monotonic id bumped by the app model on each new detail decode. Used
     /// to detect image changes and rebuild the GPU texture/bind group.
     image_id: u64,
@@ -56,16 +79,50 @@ impl DetailProgram {
     /// Create a new program for the given mono image.
     ///
     /// `mono` is linear, inverted-positive pre-sRGB data (one `f32` per pixel,
-    /// row-major, top-to-bottom). `exposure` is the raw EV value; the gain
-    /// sent to the GPU is `2^EV`. The view starts at contain fit (zoom 1.0,
-    /// no pan) with an identity tone curve. The
-    /// shadow/mid-gray/white-point pivots are measured from `mono` once here.
-    pub fn new(mono: Vec<f32>, width: u32, height: u32, exposure: f32, image_id: u64) -> Self {
+    /// row-major, top-to-bottom). `width`/`height` are the **texture** dims
+    /// (the downscale of the source, display-oriented). `src_long_edge` is the
+    /// sensor's true long edge AFTER masked-border cropping and BEFORE the
+    /// downscale — it restores the full-resolution display-oriented source dims
+    /// (`source_dimensions`) that the crop margins are authored against.
+    /// `exposure` is the raw EV value; the gain sent to the GPU is `2^EV`.
+    /// `crop` is the frame's stored source-pixel crop (all-zero for a fresh
+    /// frame). The view starts at contain fit (zoom 1.0, no pan) with an
+    /// identity tone curve. The shadow/mid-gray/white-point pivots are measured
+    /// from `mono` once here.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new(
+        mono: Vec<f32>,
+        width: u32,
+        height: u32,
+        exposure: f32,
+        crop: CropMargins,
+        image_id: u64,
+        src_long_edge: u32,
+    ) -> Self {
         let (shadow, mid, white) = tone_anchors(&mono);
+        // The texture shares the display source's aspect (resize_area +
+        // orientation preserve it within floor-rounding), so the two source
+        // axes are recovered from the long edge: the long-edged axis equals
+        // `src_long_edge`, the short axis scales its texture counterpart.
+        let (src_w, src_h) = if width >= height {
+            (
+                src_long_edge.max(1),
+                (((u64::from(height) * u64::from(src_long_edge)) + u64::from(width) / 2)
+                    / u64::from(width.max(1))) as u32,
+            )
+        } else {
+            (
+                (((u64::from(width) * u64::from(src_long_edge)) + u64::from(height) / 2)
+                    / u64::from(height.max(1))) as u32,
+                src_long_edge.max(1),
+            )
+        };
         Self {
             mono,
             width,
             height,
+            src_w,
+            src_h,
             exposure,
             zoom: 1.0,
             pan: (0.0, 0.0),
@@ -75,6 +132,8 @@ impl DetailProgram {
             contrast: 1.0,
             rolloff: 1.0,
             shadows: 1.0,
+            crop,
+            show_mask: false,
             image_id,
         }
     }
@@ -107,6 +166,35 @@ impl DetailProgram {
         self.shadows = shadows;
     }
 
+    /// Update the live crop margins (called on each keyboard trim).
+    ///
+    /// Only the four crop uniforms change — the uploaded texture stays intact.
+    /// The WGSL zoom-to-fits the CROPPED region into the widget; the overlay
+    /// full-frame layer (see [`Self::set_show_mask`]) dims outside the crop.
+    pub fn set_crop(&mut self, crop: CropMargins) {
+        self.crop = crop;
+    }
+
+    /// Show or hide the "view dimmed crop area" overlay (called on toggle).
+    ///
+    /// When on, the shader draws the full uncropped frame on top of the zoomed
+    /// crop (same zoom/pan) and dims everything outside the crop rectangle,
+    /// letting the user see where the crop lands over the whole negative.
+    /// View-only state: never persisted or applied to grid/cover bakes.
+    pub fn set_show_mask(&mut self, on: bool) {
+        self.show_mask = on;
+    }
+
+    /// The full-resolution display-oriented source dimensions the persisted
+    /// crop margins are authored against (the sensor's post-masked-border dims,
+    /// oriented, before any downscale). The crop keyboard math must bound its
+    /// trims against THIS frame — the downscaled texture dims would store a
+    /// texture-pixel crop the thumbnail bake mis-scales.
+    #[must_use]
+    pub fn source_dimensions(&self) -> (u32, u32) {
+        (self.src_w, self.src_h)
+    }
+
     /// Wrap in a `Shader` widget sized to fill the parent.
     pub fn view<M>(&self) -> Shader<M, Self> {
         Shader::new(self.clone())
@@ -121,6 +209,8 @@ impl Clone for DetailProgram {
             mono: self.mono.clone(),
             width: self.width,
             height: self.height,
+            src_w: self.src_w,
+            src_h: self.src_h,
             exposure: self.exposure,
             zoom: self.zoom,
             pan: self.pan,
@@ -130,6 +220,8 @@ impl Clone for DetailProgram {
             contrast: self.contrast,
             rolloff: self.rolloff,
             shadows: self.shadows,
+            crop: self.crop,
+            show_mask: self.show_mask,
             image_id: self.image_id,
         }
     }
@@ -140,6 +232,8 @@ impl std::fmt::Debug for DetailProgram {
         f.debug_struct("DetailProgram")
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("src_w", &self.src_w)
+            .field("src_h", &self.src_h)
             .field("exposure", &self.exposure)
             .field("zoom", &self.zoom)
             .field("pan", &self.pan)
@@ -149,6 +243,8 @@ impl std::fmt::Debug for DetailProgram {
             .field("contrast", &self.contrast)
             .field("rolloff", &self.rolloff)
             .field("shadows", &self.shadows)
+            .field("crop", &self.crop)
+            .field("show_mask", &self.show_mask)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
             .finish()
@@ -180,16 +276,49 @@ impl<M> Program<M> for DetailProgram {
             contrast: self.contrast,
             rolloff: self.rolloff,
             shadows: self.shadows,
+            crop: self.crop,
+            show_mask: self.show_mask,
             width: self.width,
             height: self.height,
+            src_w: self.src_w,
+            src_h: self.src_h,
             image_id: self.image_id,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tone-curve pure helpers (contrast/rolloff remap + anchor measurement)
+// Crop-geometry + tone-curve pure helpers
 // ---------------------------------------------------------------------------
+
+/// The live-crop sub-rectangle in **texture space** as `(origin, size)`, both
+/// `(x, y)` pairs, given the source-pixel crop margins, the downscaled texture
+/// dims (`tex_w`/`tex_h`) and the full-resolution display-oriented source dims
+/// (`src_w`/`src_h`) the margins are authored against. Each margin axis scales
+/// by `tex_axis/src_axis`, so a stored source-pixel crop removes the same
+/// *fraction of the frame* at any texture resolution (overview 2048 or native)
+/// and matches what the CPU thumbnail bake does. An all-zero crop yields origin
+/// `(0, 0)` and size equal to the texture — the identity no-op the WGSL remap
+/// leaves untouched.
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+fn crop_uv_geometry(
+    crop: CropMargins,
+    tex_w: u32,
+    tex_h: u32,
+    src_w: u32,
+    src_h: u32,
+) -> ((f32, f32), (f32, f32)) {
+    let sx = tex_w as f32 / src_w.max(1) as f32;
+    let sy = tex_h as f32 / src_h.max(1) as f32;
+    (
+        (crop.left as f32 * sx, crop.top as f32 * sy),
+        (
+            crop.cropped_width(src_w) as f32 * sx,
+            crop.cropped_height(src_h) as f32 * sy,
+        ),
+    )
+}
 
 /// Bins per axis for the anchor histogram. 4096 bins over [0,1] resolve the
 /// median and the 98th-percentile white point to ~2.4e-4 absolute — far finer
@@ -351,8 +480,17 @@ pub struct DetailPrimitive {
     rolloff: f32,
     /// Shadows power (pivots at `shadow`; 1.0 = identity).
     shadows: f32,
+    /// Live source-pixel crop margins removed from each edge (uniform UV-remap).
+    crop: CropMargins,
+    /// Whether the "view dimmed crop area" overlay is shown (full frame on top
+    /// of the zoomed crop, dimmed outside the crop rect).
+    show_mask: bool,
     width: u32,
     height: u32,
+    /// Full-resolution display-oriented source dims the crop margins are
+    /// authored against (see [`crop_uv_geometry`]).
+    src_w: u32,
+    src_h: u32,
     image_id: u64,
 }
 
@@ -451,6 +589,17 @@ impl Primitive for DetailPrimitive {
         let tex_w = self.width as f32;
         #[allow(clippy::cast_precision_loss)]
         let tex_h = self.height as f32;
+        // Live crop: the texture sub-rectangle to show. Origin is the removed
+        // left/top margins and size the kept region, mapped from the stored
+        // source-pixel crop onto the DOWNSCALED texture by `tex/src` per axis
+        // (see [`crop_uv_geometry`]); at the native level-up the texture IS the
+        // source and the map is 1:1. The WGSL contain-fits the crop into the
+        // widget (base view) and, when the dim overlay is on, also lays out the
+        // full texture to show the crop in context. An all-zero crop → origin 0
+        // and size == texture.
+        let (crop_origin, (crop_w, crop_h)) =
+            crop_uv_geometry(self.crop, self.width, self.height, self.src_w, self.src_h);
+        let (crop_l, crop_t) = crop_origin;
         // Live tone remap: contrast pivots at the measured mid-gray, highlight
         // rolloff at the measured white point, shadows at the measured shadow
         // anchor. Composed on the CPU into one `ratio · p^exp`; identity at
@@ -482,6 +631,12 @@ impl Primitive for DetailPrimitive {
             zoom: self.zoom,
             pan_x: self.pan.0 * sf,
             pan_y: self.pan.1 * sf,
+            crop_l,
+            crop_t,
+            crop_w,
+            crop_h,
+            // Whether to draw the full-frame dim overlay (see set_show_mask).
+            show_mask: if self.show_mask { 1.0 } else { 0.0 },
             // Tone curve: `clamp(ratio * p^exp, 0, 1)`, applied before the
             // exposure multiply.
             curve_ratio,
@@ -729,6 +884,17 @@ struct Uniforms {
     /// Pan offset in physical pixels (logical points × scale factor).
     pan_x: f32,
     pan_y: f32,
+    /// Live crop, in source pixels: the sub-rectangle origin (left/top margins
+    /// removed) and its size (source − removed margins). All zero/no-op when
+    /// `crop_w == tex_w` and `crop_l == 0`.
+    crop_l: f32,
+    crop_t: f32,
+    crop_w: f32,
+    crop_h: f32,
+    /// Non-zero when the "view dimmed crop area" overlay is shown: the shader
+    /// draws the full uncropped frame on top of the zoomed crop and dims
+    /// everything outside the crop rectangle.
+    show_mask: f32,
     /// Tone-curve ratio: contrast/rolloff/shadows power curves (pivoted at the
     /// image's measured mid-gray, white point, and shadow anchor) composed
     /// into a single `ratio·p^exp` pair. `(1.0, 1.0)` is the identity —
@@ -817,6 +983,102 @@ fn mono_to_half_bytes(mono: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_uv_geometry_zero_crop_is_identity() {
+        // Same source and texture dims → the margin mapping is a no-op.
+        let (origin, size) = crop_uv_geometry(CropMargins::default(), 400, 300, 400, 300);
+        assert_eq!(origin, (0.0, 0.0));
+        assert_eq!(size, (400.0, 300.0));
+    }
+
+    #[test]
+    fn crop_uv_geometry_offsets_origin_by_left_top_and_shrinks_size() {
+        // Source == texture (native): margins map 1:1 onto the texture.
+        let crop = CropMargins {
+            top: 10,
+            right: 5,
+            bottom: 30,
+            left: 15,
+        };
+        let (origin, size) = crop_uv_geometry(crop, 400, 300, 400, 300);
+        assert_eq!(origin, (15.0, 10.0));
+        assert_eq!(size, (380.0, 260.0));
+    }
+
+    #[test]
+    fn crop_uv_geometry_scales_source_px_onto_the_downscaled_texture() {
+        // A 6000x4000 source shown at a 0.1× 600x400 texture: a stored
+        // source-pixel crop (100 left, 50 top) must remove 10 and 5 texture
+        // pixels respectively so the live view and the thumbnail bake stay in
+        // the same reference frame. Before the src-aware fix each axis was
+        // treated as texture pixels, so the downscaled view truncated ~10× more
+        // than the bake revealed.
+        let crop = CropMargins {
+            top: 50,
+            right: 100,
+            bottom: 150,
+            left: 100,
+        };
+        let (origin, size) = crop_uv_geometry(crop, 600, 400, 6000, 4000);
+        assert_eq!(origin, (10.0, 5.0));
+        assert_eq!(size, (580.0, 380.0));
+    }
+
+    #[test]
+    fn crop_uv_geometry_scales_a_portrait_crop_onto_the_rotated_texture() {
+        // Rotate90 display source (4000x6000) downscaled to a 256x384 portrait
+        // texture (~0.064×, the THUMB-long-edge ratio is coincidental here).
+        let crop = CropMargins {
+            top: 300,
+            right: 0,
+            bottom: 300,
+            left: 0,
+        };
+        let (origin, size) = crop_uv_geometry(crop, 256, 384, 4000, 6000);
+        assert_eq!(origin, (0.0, 19.2));
+        assert_eq!(size, (256.0, 384.0 - 38.4));
+    }
+
+    #[test]
+    fn new_restores_display_source_dims_from_the_long_edge() {
+        // Landscape source: texture 600x400 (downscale of 6000x4000) → source
+        // long edge 6000 lands on the width axis.
+        let program = DetailProgram::new(
+            vec![0.0; 600 * 400],
+            600,
+            400,
+            0.0,
+            CropMargins::default(),
+            1,
+            6000,
+        );
+        assert_eq!(program.source_dimensions(), (6000, 4000));
+
+        // Portrait (rotated) source: texture 400x600 → long edge lands height.
+        let program = DetailProgram::new(
+            vec![0.0; 400 * 600],
+            400,
+            600,
+            0.0,
+            CropMargins::default(),
+            1,
+            6000,
+        );
+        assert_eq!(program.source_dimensions(), (4000, 6000));
+
+        // Native decode (texture == source): the long edge restores exactly.
+        let program = DetailProgram::new(
+            vec![0.0; 400 * 600],
+            400,
+            600,
+            0.0,
+            CropMargins::default(),
+            1,
+            600,
+        );
+        assert_eq!(program.source_dimensions(), (400, 600));
+    }
 
     #[test]
     fn f32_to_half_matches_canonical_values() {
