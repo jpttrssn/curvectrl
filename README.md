@@ -1,6 +1,10 @@
 # CurveCtrl
 
-A film negative scanning and RAW image editor
+A keyboard-centric photo library and RAW editor focused on digital camera scans of film rolls.
+
+The goal of this application is to keep editing quick and simple, so you can get on with taking more photos.
+
+Add your roll of RAW photos, choose a stock (for the initial inversion), edit the photos, export, done.
 
 ## Installation
 
