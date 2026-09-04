@@ -24,7 +24,7 @@ COSMIC desktop app (libcosmic, Rust edition 2024) for film negative scanning and
 
 ## Conventions
 
-- Every `.rs` file starts with `// SPDX-License-Identifier: MPL-2.0` (repo license is MPL-2.0).
+- Every `.rs` file starts with `// SPDX-License-Identifier: GPL-3.0-or-later` (repo license is GPL-3.0-or-later).
 - Distro packaging/vendoring flow is documented in README (`just vendor` → `just build-vendored`; `install` honors `rootdir`/`prefix`).
 - Expect ~130 clippy warnings from compiling libcosmic master from source; only warnings pointing into `src/` are actionable.
 

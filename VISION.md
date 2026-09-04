@@ -4,7 +4,7 @@
 
 ## What CurveCtrl Is
 
-CurveCtrl is a free-software (MPL-2.0) desktop application for film photographers who digitize their own negatives: a **film negative scanning and RAW image editor**, built natively for the COSMIC desktop environment. Point it at a folder of camera-scanned RAW frames and it renders them as proper photographic positives — not inverted-looking curiosities — using a pipeline designed around how film actually behaves: optical density, clear-film base, and per-stock tone curves.
+CurveCtrl is a free-software (GPL-3.0-or-later) desktop application for film photographers who digitize their own negatives: a **film negative scanning and RAW image editor**, built natively for the COSMIC desktop environment. Point it at a folder of camera-scanned RAW frames and it renders them as proper photographic positives — not inverted-looking curiosities — using a pipeline designed around how film actually behaves: optical density, clear-film base, and per-stock tone curves.
 
 Today CurveCtrl is an early-stage, single-binary Rust app (~1,400 lines) whose first milestone is a high-fidelity contact sheet: point it at a folder of camera-scanned RAW frames and it decodes each RAW frame, reconstructs a monochrome negative at full sensor resolution, and shows inverted, calibrated positive thumbnails in a responsive grid. The longer arc is a complete darkroom: library browsing, non-destructive editing, and export for monochrome and color stocks alike.
 

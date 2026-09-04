@@ -2,7 +2,7 @@
 name = "curvectrl"
 version = "0.1.0"
 edition = "2024"
-license = "MPL-2.0"
+license = "GPL-3.0-or-later"
 description = "A film negative scanning and RAW image editor"
 repository = "https://github.com/jpttrssn/curvectrl"
 

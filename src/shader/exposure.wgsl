@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 // Canonical fullscreen triangle: three NDC vertices whose triangle
 // clips to the entire viewport rectangle. The (-1,-1) corner is

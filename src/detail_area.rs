@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Input surface for the detail-view preview.
 //!
