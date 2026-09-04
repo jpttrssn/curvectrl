@@ -28,12 +28,18 @@ struct Uniforms {
     // Live keyboard crop, IN TEXTURE PIXELS (the source-pixel margins scaled by
     // tex/src per axis on the CPU): the sub-rectangle of the texture to show.
     // `crop_l`/`crop_t` is the region origin (left/top margins removed) and
-    // `crop_w`/`crop_h` its size (texture minus the removed margins). All four
-    // are zero/identity when there is no crop, reproducing the full frame.
+    // `crop_w`/`crop_h` its size (texture minus the removed margins). These
+    // stay in the EXIF-upright frame; the display rotation below composes
+    // AFTER them (the whole composed frame rotates). All four are zero/identity
+    // when there is no crop, reproducing the full frame.
     crop_l: f32,
     crop_t: f32,
     crop_w: f32,
     crop_h: f32,
+    // User display rotation as counter-clockwise 90° quarter-turns (0..3) on
+    // top of the EXIF-upright texture. 0.0 is identity; the Rust side keeps it
+    // in {0, 1, 2, 3} via `rotation & 3`.
+    rot: f32,
     // When non-zero, draw the "view dimmed crop area" overlay: the full uncropped
     // frame at its own contain-fit on top of the zoomed crop, dimming everything
     // outside the crop rectangle so the user can see where the crop lands. The
@@ -76,15 +82,17 @@ fn linear_to_srgb(c: f32) -> f32 {
 /// applying the detail view's zoom/pan transform and the live keyboard crop.
 ///
 /// The image scale is anchored to the CROPPED frame's contain-fit base:
-/// `scale = min(sc_w/crop_w, sc_h/crop_h) * 2^(zoom - 1)`. At `zoom == 1` the
+/// `scale = min(sc_w/dw, sc_h/dh) * 2^(zoom - 1)` where `(dw, dh)` are the
+/// crop dims as DISPLAYED — swapped by an odd rotation. At `zoom == 1` the
 /// remaining (uncropped-away) region contain-fits the widget, so trimming edges
 /// re-fits/zooms the kept content to fill the box. Each +1 zoom unit doubles the
 /// scale; the image stays centered, displaced by `pan` physical px.
 ///
-/// The sample position maps `rel` into the cropped sub-rectangle
+/// The sample position maps `rel` (over the rotated crop box) through
+/// [`rotate_uv`] into the EXIF-upright cropped sub-rectangle
 /// (`crop_l..crop_l+crop_w` × `crop_t..crop_t+crop_h`, in texture pixels), so the
 /// UV spans only the kept content. A zero crop (`crop_w == tex_w`, `crop_l == 0`)
-/// is exact identity.
+/// and zero rotation are exact identity.
 ///
 /// When `show_mask != 0.0`, [`overlay_sample`] additionally lays out the full
 /// uncropped frame on top (same zoom/pan, its own contain-fit on the full
@@ -97,6 +105,58 @@ struct ViewSample {
 
 fn in_bounds(uv: vec2<f32>) -> bool {
     return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+}
+
+/// Maps a point `(u, v)` over the DISPLAYED (rotated) frame back into the
+/// EXIF-upright texture's normalized `(tu, tv)` coordinates, for a cumulative
+/// counter-clockwise `rot` quarter-turns:
+///   rot 0 → (u,   v)
+///   rot 1 → (1-v, u)
+///   rot 2 → (1-u, 1-v)
+///   rot 3 → (v,   1-u)
+/// so after one CCW turn the texture's top edge lands on the display's left.
+/// `rot == 0` is the identity, keeping the untouched render byte-identical.
+/// (Mirror-tested in Rust as `rot_uv`.) `u`/`v` may leave [0, 1] while the
+/// image is letterboxed or panned; the caller's `in_bounds(rel)` gates that.
+fn rotate_uv(u: f32, v: f32, rot: f32) -> vec2<f32> {
+    if rot == 1.0 {
+        return vec2<f32>(1.0 - v, u);
+    }
+    if rot == 2.0 {
+        return vec2<f32>(1.0 - u, 1.0 - v);
+    }
+    if rot == 3.0 {
+        return vec2<f32>(v, 1.0 - u);
+    }
+    return vec2<f32>(u, v);
+}
+
+/// The dimensions a `w`×`h` frame presents after `rot` quarter turns: odd
+/// turns swap the axes (a landscape 3×2 displays as 2×3).
+fn rotated_dims(w: f32, h: f32, rot: f32) -> vec2<f32> {
+    if rot == 1.0 || rot == 3.0 {
+        return vec2<f32>(h, w);
+    }
+    return vec2<f32>(w, h);
+}
+
+/// The crop box (as fractions of the DISPLAYED frame) after `rot` quarter
+/// turns: rotating the full frame also rotates the EXIF-upright axis-aligned
+/// crop sub-rectangle into another axis-aligned sub-rectangle of the rotated
+/// frame. `u0/u1`/`v0/v1` are the crop's horizontal/vertical fraction bounds
+/// in the EXIF-upright frame; the returned `(du0, du1, dv0, dv1)` are the same
+/// bounds in the DISPLAYED frame (used by [`overlay_sample`]'s dim rect).
+fn crop_box_display(rot: f32, u0: f32, u1: f32, v0: f32, v1: f32) -> vec4<f32> {
+    if rot == 1.0 {
+        return vec4<f32>(v0, v1, 1.0 - u1, 1.0 - u0);
+    }
+    if rot == 2.0 {
+        return vec4<f32>(1.0 - u1, 1.0 - u0, 1.0 - v1, 1.0 - v0);
+    }
+    if rot == 3.0 {
+        return vec4<f32>(1.0 - v1, 1.0 - v0, u0, u1);
+    }
+    return vec4<f32>(u0, u1, v0, v1);
 }
 
 /// The full-frame "view dimmed crop area" overlay sample: `inside` is true when
@@ -112,45 +172,60 @@ struct OverlaySample {
 }
 
 fn overlay_sample(frag: vec2<f32>) -> OverlaySample {
-    // Contain both axes of the FULL source texture (independent of the base
-    // zoom-crop layout) with the same zoom/pan transform.
-    let contain = min(uniforms.sc_w / uniforms.tex_w, uniforms.sc_h / uniforms.tex_h);
+    let rot = uniforms.rot;
+    // Contain both axes of the FULL source texture as DISPLAYED (rotated),
+    // independent of the base zoom-crop layout, with the same zoom/pan.
+    let dims = rotated_dims(uniforms.tex_w, uniforms.tex_h, rot);
+    let contain = min(uniforms.sc_w / dims.x, uniforms.sc_h / dims.y);
     let scale = contain * exp2(uniforms.zoom - 1.0);
-    let rw = uniforms.tex_w * scale;
-    let rh = uniforms.tex_h * scale;
+    let rw = dims.x * scale;
+    let rh = dims.y * scale;
     let box_x = uniforms.sc_x + (uniforms.sc_w - rw) * 0.5 + uniforms.pan_x;
     let box_y = uniforms.sc_y + (uniforms.sc_h - rh) * 0.5 + uniforms.pan_y;
     let rel = vec2<f32>(
         (frag.x - box_x) / rw,
         (frag.y - box_y) / rh,
     );
-    // The cropped sub-rectangle expressed in this full-frame screen layout.
-    let cx0 = box_x + (uniforms.crop_l / uniforms.tex_w) * rw;
-    let cx1 = box_x + ((uniforms.crop_l + uniforms.crop_w) / uniforms.tex_w) * rw;
-    let cy0 = box_y + (uniforms.crop_t / uniforms.tex_h) * rh;
-    let cy1 = box_y + ((uniforms.crop_t + uniforms.crop_h) / uniforms.tex_h) * rh;
+    let upright = rotate_uv(rel.x, rel.y, rot);
+    // The cropped sub-rectangle expressed in this rotated full-frame screen
+    // layout (still axis-aligned after quarter turns; see crop_box_display).
+    let u0 = uniforms.crop_l / uniforms.tex_w;
+    let u1 = (uniforms.crop_l + uniforms.crop_w) / uniforms.tex_w;
+    let v0 = uniforms.crop_t / uniforms.tex_h;
+    let v1 = (uniforms.crop_t + uniforms.crop_h) / uniforms.tex_h;
+    let box = crop_box_display(rot, u0, u1, v0, v1);
+    let cx0 = box_x + box.x * rw;
+    let cx1 = box_x + box.y * rw;
+    let cy0 = box_y + box.z * rh;
+    let cy1 = box_y + box.w * rh;
     let in_crop_rect = frag.x >= cx0 && frag.x <= cx1 && frag.y >= cy0 && frag.y <= cy1;
     let inside = in_bounds(rel);
     let dim = select(1.0, 0.0, !inside || in_crop_rect);
-    return OverlaySample(rel, inside, dim);
+    return OverlaySample(upright, inside, dim);
 }
 
 fn view_uv(frag: vec2<f32>) -> ViewSample {
-    // Contain both axes of the CROPPED frame; trimming re-fits/zooms.
-    let contain = min(uniforms.sc_w / uniforms.crop_w, uniforms.sc_h / uniforms.crop_h);
+    let rot = uniforms.rot;
+    // Contain both axes of the CROPPED frame AS DISPLAYED (rotated); an odd
+    // rotation swaps which frame axis contains the widget. Trimming re-fits/
+    // zooms the kept content to fill the box at zoom 1.
+    let dims = rotated_dims(uniforms.crop_w, uniforms.crop_h, rot);
+    let contain = min(uniforms.sc_w / dims.x, uniforms.sc_h / dims.y);
     let scale = contain * exp2(uniforms.zoom - 1.0);
-    let rw = uniforms.crop_w * scale;
-    let rh = uniforms.crop_h * scale;
+    let rw = dims.x * scale;
+    let rh = dims.y * scale;
     let box_x = uniforms.sc_x + (uniforms.sc_w - rw) * 0.5 + uniforms.pan_x;
     let box_y = uniforms.sc_y + (uniforms.sc_h - rh) * 0.5 + uniforms.pan_y;
-    // Position over the crop box, then map into the cropped sub-rect UV.
+    // Position over the (rotated) crop box.
     let rel = vec2<f32>(
         (frag.x - box_x) / rw,
         (frag.y - box_y) / rh,
     );
+    // Map display → EXIF-upright crop sub-rect, then into texture UV.
+    let upright = rotate_uv(rel.x, rel.y, rot);
     let uv = vec2<f32>(
-        uniforms.crop_l / uniforms.tex_w + rel.x * (uniforms.crop_w / uniforms.tex_w),
-        uniforms.crop_t / uniforms.tex_h + rel.y * (uniforms.crop_h / uniforms.tex_h),
+        uniforms.crop_l / uniforms.tex_w + upright.x * (uniforms.crop_w / uniforms.tex_w),
+        uniforms.crop_t / uniforms.tex_h + upright.y * (uniforms.crop_h / uniforms.tex_h),
     );
     let inside = in_bounds(rel);
     return ViewSample(uv, inside);

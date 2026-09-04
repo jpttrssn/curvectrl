@@ -221,6 +221,10 @@ pub struct AppModel {
     /// Live keyboard crop margins for the detail view; loaded from the stored
     /// manifest per open and applied to the GPU shader as a uniform UV-remap.
     crop: edit_manifest::CropMargins,
+    /// Live display rotation for the detail view: cumulative counter-clockwise
+    /// 90° quarter-turns (`0`…`3`) on top of the EXIF orientation. Loaded from
+    /// the stored manifest per open and applied to the GPU shader as a uniform.
+    rotation: u8,
     /// Draft text for the four crop margin fields in the editing drawer. Kept
     /// as strings (not the committed margins) so typing doesn't fight the
     /// read-only view; committed to `crop` on each field's submit.
@@ -238,6 +242,10 @@ pub struct AppModel {
     reset_curve_shadows: f32,
     /// Crop as it was when the detail panel was opened; `ResetAll` restores it.
     reset_crop: edit_manifest::CropMargins,
+    /// Rotation as it was when the detail panel was opened; `ResetAll`
+    /// restores it. Tracked separately from [`Self::rotation`]'s zeroing in
+    /// [`Self::clear_detail`] like the other reset snapshots.
+    reset_rotation: u8,
     /// The last edit copied for paste (Ctrl+C), as a full [`ToneEdit`]. `None`
     /// until the user copies — a paste with nothing copied is a no-op.
     clipboard: Option<edit_manifest::ToneEdit>,
@@ -573,6 +581,10 @@ pub enum Message {
     /// Reset only the crop margins to zero (show the full frame), leaving the
     /// exposure and tone edits untouched, and persist the reset.
     ResetCrop,
+    /// Rotate the detail view counter-clockwise by one 90° quarter-turn and
+    /// persist immediately (the editing-drawer button; the keyboard routes the
+    /// same rotation through `EditAdjust::RotateCcw` with commit-on-release).
+    RotateCcw,
     /// Toggle the detail view's "view dimmed crop area" overlay: on shows the
     /// full uncropped frame on top of the zoomed crop with everything outside
     /// the crop dimmed; off shows the plain zoomed crop. View-only state.
@@ -623,6 +635,10 @@ pub enum EditAdjust {
         direction: edit_manifest::CropDirection,
         delta: i32,
     },
+    /// Rotate the display one quarter-turn counter-clockwise (a discrete step,
+    /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
+    /// magnitude, but the edit-key machinery still commits on release).
+    RotateCcw,
 }
 
 /// A tracked modifier key whose held state a frame click needs to decide its
@@ -758,12 +774,14 @@ impl cosmic::Application for AppModel {
             exposure_ev: 0.0,
             crop: edit_manifest::CropMargins::default(),
             crop_drafts: CropDrafts::from_margins(edit_manifest::CropMargins::default()),
+            rotation: 0,
             show_crop_mask: false,
             reset_exposure_ev: 0.0,
             reset_curve_contrast: 1.0,
             reset_curve_rolloff: 1.0,
             reset_curve_shadows: 1.0,
             reset_crop: edit_manifest::CropMargins::default(),
+            reset_rotation: 0,
             clipboard: None,
             next_image_id: 0,
             fullscreen: false,
@@ -1286,6 +1304,7 @@ impl cosmic::Application for AppModel {
                 self.curve_shadows = self.reset_curve_shadows;
                 self.crop = self.reset_crop;
                 self.crop_drafts = CropDrafts::from_margins(self.reset_crop);
+                self.rotation = self.reset_rotation;
                 if let Some(selected) = &self.selected {
                     self.roll.set_exposure(selected, self.reset_exposure_ev);
                     self.roll.set_curve(
@@ -1295,6 +1314,7 @@ impl cosmic::Application for AppModel {
                         self.reset_curve_shadows,
                     );
                     self.roll.set_crop(selected, self.reset_crop);
+                    self.roll.set_rotation(selected, self.reset_rotation);
                 }
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_exposure(self.reset_exposure_ev);
@@ -1304,6 +1324,7 @@ impl cosmic::Application for AppModel {
                         self.reset_curve_shadows,
                     );
                     shader.set_crop(self.reset_crop);
+                    shader.set_rotation(self.reset_rotation);
                 }
                 Task::none()
             }
@@ -1357,6 +1378,15 @@ impl cosmic::Application for AppModel {
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_crop(self.crop);
                 }
+                self.commit_edit()
+            }
+
+            // The editing-drawer rotate button: one CCW quarter-turn applied
+            // live (RAM + shader) and persisted immediately, mirroring the
+            // discrete crop commits (typed submit / reset) rather than the
+            // hold-then-release keyboard path.
+            Message::RotateCcw => {
+                self.apply_rotate_ccw();
                 self.commit_edit()
             }
 
@@ -1807,6 +1837,7 @@ impl AppModel {
             self.curve_shadows = stored_tone.curve_shadows;
             self.crop = self.roll.crop(name.as_str());
             self.crop_drafts = CropDrafts::from_margins(self.crop);
+            self.rotation = self.roll.rotation(name.as_str()) & 3;
             // Anchor the reset snapshot to the opened state (the stored
             // manifest values), so Reset reverts here rather than to identity.
             self.reset_exposure_ev = stored_tone.exposure_ev;
@@ -1814,6 +1845,7 @@ impl AppModel {
             self.reset_curve_rolloff = stored_tone.curve_rolloff;
             self.reset_curve_shadows = stored_tone.curve_shadows;
             self.reset_crop = self.crop;
+            self.reset_rotation = self.rotation;
         }
 
         // The editing drawer stays hidden on a fresh open; the user brings it
@@ -1929,7 +1961,12 @@ impl AppModel {
             return Task::none();
         }
 
-        let pending: Vec<(String, edit_manifest::ToneEdit, edit_manifest::CropMargins)> = self
+        let pending: Vec<(
+            String,
+            edit_manifest::ToneEdit,
+            edit_manifest::CropMargins,
+            u8,
+        )> = self
             .tiles
             .iter()
             .filter(|tile| matches!(tile.thumb, Thumb::Loading))
@@ -1938,7 +1975,8 @@ impl AppModel {
             .map(|tile| {
                 let tone = self.roll.tone(&tile.name);
                 let crop = self.roll.crop(&tile.name);
-                (tile.name.clone(), tone, crop)
+                let rotation = self.roll.rotation(&tile.name) & 3;
+                (tile.name.clone(), tone, crop, rotation)
             })
             .collect();
 
@@ -1962,8 +2000,8 @@ impl AppModel {
         self.thumb_inflight
             .extend(pending.iter().map(|(name, ..)| name.clone()));
 
-        Task::batch(pending.into_iter().map(move |(name, tone, crop)| {
-            cosmic::task::future(decode_thumbnail(dir.clone(), name, tone, crop))
+        Task::batch(pending.into_iter().map(move |(name, tone, crop, rotation)| {
+            cosmic::task::future(decode_thumbnail(dir.clone(), name, tone, crop, rotation))
         }))
     }
 
@@ -2137,6 +2175,7 @@ impl AppModel {
             height,
             self.exposure_ev,
             self.crop,
+            self.rotation,
             image_id,
             src_long_edge,
         ));
@@ -2144,6 +2183,7 @@ impl AppModel {
             shader.set_view(self.detail_zoom, self.detail_pan);
             shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
             shader.set_crop(self.crop);
+            shader.set_rotation(self.rotation);
         }
         // A cached overview that was already at native resolution needs no
         // level-up re-decode.
@@ -2261,6 +2301,7 @@ impl AppModel {
         self.exposure_ev = 0.0;
         self.crop = edit_manifest::CropMargins::default();
         self.crop_drafts = CropDrafts::from_margins(self.crop);
+        self.rotation = 0;
         self.show_crop_mask = false;
         // The reset snapshot mirrors the live edit values' lifecycle: reset
         // to identity on close; the next `ThumbnailActivated` re-syncs it.
@@ -2269,6 +2310,7 @@ impl AppModel {
         self.reset_curve_rolloff = 1.0;
         self.reset_curve_shadows = 1.0;
         self.reset_crop = edit_manifest::CropMargins::default();
+        self.reset_rotation = 0;
         // The full-screen preview dies with the detail view it belongs to.
         self.fullscreen = false;
     }
@@ -2387,6 +2429,27 @@ impl AppModel {
                     shader.set_crop(next);
                 }
             }
+            // A display rotation steps one quarter-turn counter-clockwise
+            // (authoring the composite of the crop + the EXIF-upright frame;
+            // the crop margins themselves are untouched). Live-only until the
+            // trim key's release commits, mirroring the numeric adjusts.
+            EditAdjust::RotateCcw => {
+                self.apply_rotate_ccw();
+            }
+        }
+    }
+
+    /// Rotates the open frame's display one quarter-turn counter-clockwise by
+    /// writing the RAM roll edit and the live GPU shader uniform. Shared by the
+    /// keyboard shortcut (via [`Self::apply_edit_adjust`]) and the editing
+    /// drawer button (which additionally persists via [`Self::commit_edit`]).
+    fn apply_rotate_ccw(&mut self) {
+        self.rotation = (self.rotation + 1) & 3;
+        if let Some(selected) = &self.selected {
+            self.roll.set_rotation(selected, self.rotation);
+        }
+        if let Some(shader) = &mut self.detail_shader {
+            shader.set_rotation(self.rotation);
         }
     }
 
@@ -2579,6 +2642,7 @@ impl AppModel {
                         height,
                         self.exposure_ev,
                         self.crop,
+                        self.rotation,
                         image_id,
                         src_long_edge,
                     ));
@@ -2591,6 +2655,8 @@ impl AppModel {
                             self.curve_rolloff,
                             self.curve_shadows,
                         );
+                        shader.set_crop(self.crop);
+                        shader.set_rotation(self.rotation);
                     }
                     // The level-up is one-shot: a decode that lands after the
                     // first shader IS the native one, and an overview that was
@@ -3188,6 +3254,14 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let crop_mask = widget::toggler(app.show_crop_mask)
         .on_toggle(|_| Message::ToggleCropMask)
         .label(fl!("crop-mask-toggle"));
+    // Display rotation controls: a cumulative counter-clockwise quarter-turn
+    // readout (0° / 90° / 180° / 270°) plus a button stepping it, on top of
+    // the EXIF orientation like the crop bake. The keyboard (`r`) routes the
+    // same step through the edit-key machinery; the button commits on press.
+    let rotate_label = widget::text(fl!("orientation-label"));
+    let rotate_readout = widget::text(format!("{}°", u32::from(app.rotation) * 90));
+    let rotate_button =
+        widget::button::standard(fl!("rotate-ccw")).on_press(Message::RotateCcw);
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
@@ -3210,6 +3284,10 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(crop_left)
         .push(crop_hint)
         .push(crop_mask)
+        .push(widget::divider::horizontal::default())
+        .push(rotate_label)
+        .push(rotate_readout)
+        .push(rotate_button)
         .push(widget::row::with_capacity(2)
             .push(reset_all)
             .push(reset_crop)
@@ -3815,7 +3893,9 @@ fn clamp_axis(edge: u32, opposite: u32, delta_px: i32, sum_limit: u32) -> u32 {
 /// key uses the coarse step; holding `Shift` selects the fine nudge step. The
 /// crop edges map to movement keys `h`/`j`/`k`/`l` (Left/Bottom/Top/Right): a
 /// bare edge key trims more (+`CROP_STEP_PX`), `Alt`+edge trims less
-/// (−, clamped ≥ 0), and `Shift`(+`Alt`)+edge nudges by ±1px. The `key` payload
+/// (−, clamped ≥ 0), and `Shift`(+`Alt`)+edge nudges by ±1px. `r` rotates the
+/// display one quarter-turn counter-clockwise (cumulative; modifiers ignored).
+/// The `key` payload
 /// is deliberately layout-stable: iced's `keyboard::listen` delivers the
 /// unmodified character (`key_without_modifiers`), and the iced fork never
 /// reports the `Shift`-produced symbols from the base keys used here, so nudge
@@ -3851,21 +3931,27 @@ fn edit_adjust_for(key: &str, alt: bool, shift: bool) -> Option<EditAdjust> {
         "j" => Some(crop(Bottom)),
         "k" => Some(crop(Top)),
         "l" => Some(crop(Right)),
+        // Rotate the display one quarter-turn counter-clockwise. A bare `r`
+        // fires on press and the edit-key release commits the persist + re-bake
+        // (the release arm matches through this same function, so `r` is
+        // covered); modifiers are ignored like the tone-adjacent keys.
+        "r" => Some(EditAdjust::RotateCcw),
         _ => None,
     }
 }
 
 /// Decodes a RAW frame from the open roll into a thumbnail message, baking in
-/// the given exposure and tone curve so the grid tile reflects the stored
-/// edits (grid == detail).
+/// the given exposure, tone curve and display rotation so the grid tile reflects
+/// the stored edits (grid == detail).
 async fn decode_thumbnail(
     dir: PathBuf,
     name: String,
     tone: edit_manifest::ToneEdit,
     crop: edit_manifest::CropMargins,
+    rotation: u8,
 ) -> Message {
     let result = decode_raw(dir, name.clone(), move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop)
+        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation)
     })
     .await;
 
@@ -3873,15 +3959,17 @@ async fn decode_thumbnail(
 }
 
 /// Decodes a roll's cover file into a thumbnail message, baking in the cover
-/// file's stored exposure and tone curve from the roll's manifest so the roll
-/// tile preview parallels the edited frame (grid == detail for covers too). A
-/// roll with no manifest (or an unedited cover) falls back to identity.
+/// file's stored exposure, tone curve and display rotation from the roll's
+/// manifest so the roll tile preview parallels the edited frame (grid == detail
+/// for covers too). A roll with no manifest (or an unedited cover) falls back
+/// to identity.
 async fn decode_cover(dir: PathBuf, name: String) -> Message {
     let manifest = edit_manifest::load_roll_manifest(&dir);
     let tone = manifest.tone(&name);
     let crop = manifest.crop(&name);
+    let rotation = manifest.rotation(&name) & 3;
     let result = decode_raw(dir.clone(), name, move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop)
+        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation)
     })
     .await;
 
@@ -4474,15 +4562,69 @@ fn crop_rgba(
     (out, cw, rows)
 }
 
+/// Rotates an RGBA buffer counter-clockwise by `turns` 90° quarter turns
+/// (`0`…`3`, masked to `& 3`), swapping the print dims on odd turns. The
+/// output naturally has the swapped dimensions (no re-fit is attempted):
+/// [`convert_thumbnail`] hands the already-downscaled thumbnail to the GPU at
+/// the same aspect, and the detail shader's rotated-fraction UV layout matches
+/// this exact pixel mapping, so the grid tile and the detail view stay in
+/// agreement. `0` (and any multiple of 4) is the identity — the untouched bake
+/// stays byte-identical.
+fn rotate_quarters(rgba: Vec<u8>, width: u32, height: u32, turns: u8) -> (Vec<u8>, u32, u32) {
+    let out_w = height;
+    let out_h = width;
+    let mut out = vec![0_u8; width as usize * height as usize * 4];
+    match turns & 3 {
+        0 => (rgba, width, height),
+        1 => {
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((y * width + x) as usize) * 4;
+                    let ox = y;
+                    let oy = width - 1 - x;
+                    let dst = ((oy * out_w + ox) as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            (out, out_w, out_h)
+        }
+        2 => {
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((y * width + x) as usize) * 4;
+                    let oy = height - 1 - y;
+                    let ox = width - 1 - x;
+                    let dst = ((oy * width + ox) as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            (out, width, height)
+        }
+        _ => {
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((y * width + x) as usize) * 4;
+                    let ox = height - 1 - y;
+                    let oy = x;
+                    let dst = ((oy * out_w + ox) as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            (out, out_w, out_h)
+        }
+    }
+}
+
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
 /// dimension exceeds `max_size`, baking the tone edit (`ToneEdit`: exposure,
-/// curve powers) into the pixels.
+/// curve powers) and the display rotation into the pixels.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn convert_thumbnail(
     image: &rawloader::RawImage,
     max_size: f32,
     tone: edit_manifest::ToneEdit,
     crop: edit_manifest::CropMargins,
+    rotation: u8,
 ) -> Result<Handle, ()> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
     // downscale straight from the sensor samples into a small linear negative.
@@ -4549,6 +4691,13 @@ fn convert_thumbnail(
         let scaled = scale_crop(crop, disp_w, disp_h, width, height);
         crop_rgba(rgba, width, height, scaled)
     };
+
+    // Bake the user's display rotation: quarter-turn the already EXIF-oriented
+    // (and cropped) print so the grid tile matches the rotated detail view.
+    // The crop margins are authored in the EXIF-upright source frame, so the
+    // rotation composes AFTER the crop sub-rect was taken — the same ordering
+    // as the detail shader's uniform rotate (`rotate_ccw(crop(orient(EXIF)))`).
+    let (rgba, width, height) = rotate_quarters(rgba, width, height, rotation);
 
     Ok(Handle::from_rgba(width, height, rgba))
 }
@@ -6047,5 +6196,63 @@ mod tests {
         let (out, w, h) = crop_rgba(rgba.clone(), 2, 2, crop);
         assert_eq!((w, h), (2, 2));
         assert_eq!(out, rgba);
+    }
+
+    #[test]
+    fn rotate_quarters_quarter_turns_a_square_grid_ccw() {
+        // A 2x2 RGBA grid; each pixel gray = its position (0..3).
+        let rgba: Vec<u8> = (0..4u8).flat_map(|p| [p, p, p, 255]).collect();
+        // One CCW turn keeps a square's dims but moves the original TOP edge
+        // to the display's LEFT column (shader `rot == 1`: (1-v, u) puts the
+        // display top-left at texture top-right, and the display left column
+        // walks the original top row right→left as it goes down).
+        let (out, w, h) = rotate_quarters(rgba.clone(), 2, 2, 1);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&out[0..4], &[1, 1, 1, 255], "top-left = source top-right");
+        assert_eq!(&out[8..12], &[0, 0, 0, 255], "bottom-left = source top-left");
+        // Two turns: pure 180° reversal, dims unchanged.
+        let (out, w, h) = rotate_quarters(rgba.clone(), 2, 2, 2);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&out[0..4], &[3, 3, 3, 255]);
+        assert_eq!(&out[12..16], &[0, 0, 0, 255]);
+        // Three turns (one CW): the original TOP edge lands on the display's
+        // RIGHT column, so the display top-left samples the source BOTTOM-left.
+        let (out, w, h) = rotate_quarters(rgba.clone(), 2, 2, 3);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&out[0..4], &[2, 2, 2, 255], "top-left = source bottom-left");
+        // Four turns wrap to the identity (mirrors `& 3` in the shader).
+        let (out, w, h) = rotate_quarters(rgba.clone(), 2, 2, 4);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(out, rgba);
+    }
+
+    #[test]
+    fn rotate_quarters_swaps_dims_on_an_odd_turn_and_composes_crop() {
+        // A 3-wide × 2-tall grid; pixel value = row-major index.
+        let mut rgba = Vec::new();
+        for p in 0..6u8 {
+            rgba.extend_from_slice(&[p, p, p, 255]);
+        }
+        let (out, w, h) = rotate_quarters(rgba.clone(), 3, 2, 1);
+        assert_eq!((w, h), (2, 3), "odd turn swaps the print dims");
+        // Output grid (2 wide × 3 tall): source 0 1 2 / 3 4 5 rotates CCW to
+        // 2 5 / 1 4 / 0 3. Mapping: source (x,y) → output (ox=y, oy=w−1−x).
+        assert_eq!(&out[0..4], &[2, 2, 2, 255], "output top-left = source top-right");
+        assert_eq!(&out[4..8], &[5, 5, 5, 255], "output top-right = source bottom-right");
+        assert_eq!(&out[8..12], &[1, 1, 1, 255], "output middle-left = source mid top");
+        assert_eq!(&out[16..20], &[0, 0, 0, 255], "output bottom-left = source top-left");
+        // Compose with a crop: quarter-turn the result of cropping a 3×3 frame
+        // to its 1-px margins (a 1×1 center pixel), like the bake's
+        // crop-then-rotate ordering.
+        let mut rgba = Vec::new();
+        for p in 0..9u8 {
+            rgba.extend_from_slice(&[p, p, p, 255]);
+        }
+        let (cropped, cw, ch) =
+            crop_rgba(rgba.clone(), 3, 3, Marg { top: 1, right: 1, bottom: 1, left: 1 });
+        assert_eq!((cw, ch), (1, 1));
+        let (out, w, h) = rotate_quarters(cropped, cw, ch, 1);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(&out[0..4], &[4, 4, 4, 255], "crop center pixel survives");
     }
 }

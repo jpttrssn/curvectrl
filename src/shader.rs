@@ -66,6 +66,12 @@ pub struct DetailProgram {
     /// the print) stay in the same reference frame. A keyboard trim is instant.
     /// `CropMargins::default()` (all zero) shows the full frame.
     crop: CropMargins,
+    /// User display rotation as cumulative counter-clockwise 90° quarter-turns
+    /// (`0`…`3`), applied ON TOP of the EXIF-upright texture as a uniform-only
+    /// UV remap (no texture re-upload). The crop sub-rectangle is authored in
+    /// the EXIF-upright frame and is rotated along with the display, so the
+    /// crop math is untouched. `0` = identity.
+    rotation: u8,
     /// Whether the "view dimmed crop area" overlay is shown: the full
     /// uncropped frame drawn on top of the zoomed crop with everything outside
     /// the crop rectangle dimmed. View-only — never persisted or baked.
@@ -86,16 +92,19 @@ impl DetailProgram {
     /// (`source_dimensions`) that the crop margins are authored against.
     /// `exposure` is the raw EV value; the gain sent to the GPU is `2^EV`.
     /// `crop` is the frame's stored source-pixel crop (all-zero for a fresh
-    /// frame). The view starts at contain fit (zoom 1.0, no pan) with an
-    /// identity tone curve. The shadow/mid-gray/white-point pivots are measured
-    /// from `mono` once here.
-    #[allow(clippy::cast_possible_truncation)]
+    /// frame). `rotation` is the cumulative counter-clockwise 90° quarter-turn
+    /// display rotation on top of the EXIF-upright texture (`0` = none). The
+    /// view starts at contain fit (zoom 1.0, no pan) with an identity tone
+    /// curve. The shadow/mid-gray/white-point pivots are measured from `mono`
+    /// once here.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     pub fn new(
         mono: Vec<f32>,
         width: u32,
         height: u32,
         exposure: f32,
         crop: CropMargins,
+        rotation: u8,
         image_id: u64,
         src_long_edge: u32,
     ) -> Self {
@@ -133,6 +142,7 @@ impl DetailProgram {
             rolloff: 1.0,
             shadows: 1.0,
             crop,
+            rotation,
             show_mask: false,
             image_id,
         }
@@ -173,6 +183,15 @@ impl DetailProgram {
     /// full-frame layer (see [`Self::set_show_mask`]) dims outside the crop.
     pub fn set_crop(&mut self, crop: CropMargins) {
         self.crop = crop;
+    }
+
+    /// Update the live display rotation (called on each rotate press/click).
+    ///
+    /// Only the one uniform changes — the uploaded texture stays intact. The
+    /// WGSL rotates the already-cropped display frame counter-clockwise by
+    /// `rotation & 3` quarter-turns; `0` is the identity (EXIF-upright).
+    pub fn set_rotation(&mut self, rotation: u8) {
+        self.rotation = rotation;
     }
 
     /// Show or hide the "view dimmed crop area" overlay (called on toggle).
@@ -221,6 +240,7 @@ impl Clone for DetailProgram {
             rolloff: self.rolloff,
             shadows: self.shadows,
             crop: self.crop,
+            rotation: self.rotation,
             show_mask: self.show_mask,
             image_id: self.image_id,
         }
@@ -244,6 +264,7 @@ impl std::fmt::Debug for DetailProgram {
             .field("rolloff", &self.rolloff)
             .field("shadows", &self.shadows)
             .field("crop", &self.crop)
+            .field("rotation", &self.rotation)
             .field("show_mask", &self.show_mask)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
@@ -277,6 +298,7 @@ impl<M> Program<M> for DetailProgram {
             rolloff: self.rolloff,
             shadows: self.shadows,
             crop: self.crop,
+            rotation: self.rotation,
             show_mask: self.show_mask,
             width: self.width,
             height: self.height,
@@ -482,6 +504,9 @@ pub struct DetailPrimitive {
     shadows: f32,
     /// Live source-pixel crop margins removed from each edge (uniform UV-remap).
     crop: CropMargins,
+    /// User display rotation (cumulative CCW 90° quarter-turns, `0`…`3`),
+    /// applied as a uniform UV remap on top of the cropped EXIF-upright frame.
+    rotation: u8,
     /// Whether the "view dimmed crop area" overlay is shown (full frame on top
     /// of the zoomed crop, dimmed outside the crop rect).
     show_mask: bool,
@@ -600,6 +625,9 @@ impl Primitive for DetailPrimitive {
         let (crop_origin, (crop_w, crop_h)) =
             crop_uv_geometry(self.crop, self.width, self.height, self.src_w, self.src_h);
         let (crop_l, crop_t) = crop_origin;
+        // Display rotation as a float quarter-turn count for the WGSL remap.
+        // `0.0` = identity; the WGSL keeps it in {0,1,2,3} by construction.
+        let rot = f32::from(self.rotation & 3);
         // Live tone remap: contrast pivots at the measured mid-gray, highlight
         // rolloff at the measured white point, shadows at the measured shadow
         // anchor. Composed on the CPU into one `ratio · p^exp`; identity at
@@ -635,6 +663,7 @@ impl Primitive for DetailPrimitive {
             crop_t,
             crop_w,
             crop_h,
+            rot,
             // Whether to draw the full-frame dim overlay (see set_show_mask).
             show_mask: if self.show_mask { 1.0 } else { 0.0 },
             // Tone curve: `clamp(ratio * p^exp, 0, 1)`, applied before the
@@ -886,11 +915,15 @@ struct Uniforms {
     pan_y: f32,
     /// Live crop, in source pixels: the sub-rectangle origin (left/top margins
     /// removed) and its size (source − removed margins). All zero/no-op when
-    /// `crop_w == tex_w` and `crop_l == 0`.
+    /// `crop_w == tex_w` and `crop_l == 0`. These are the EXIF-upright texture
+    /// coordinates; the display rotation below composes after them.
     crop_l: f32,
     crop_t: f32,
     crop_w: f32,
     crop_h: f32,
+    /// User display rotation as counter-clockwise 90° quarter-turns (`0`…`3`).
+    /// `0.0` is the identity: the EXIF-upright frame, byte-identical render.
+    rot: f32,
     /// Non-zero when the "view dimmed crop area" overlay is shown: the shader
     /// draws the full uncropped frame on top of the zoomed crop and dims
     /// everything outside the crop rectangle.
@@ -1050,6 +1083,7 @@ mod tests {
             400,
             0.0,
             CropMargins::default(),
+            0,
             1,
             6000,
         );
@@ -1062,6 +1096,7 @@ mod tests {
             600,
             0.0,
             CropMargins::default(),
+            0,
             1,
             6000,
         );
@@ -1074,10 +1109,66 @@ mod tests {
             600,
             0.0,
             CropMargins::default(),
+            0,
             1,
             600,
         );
         assert_eq!(program.source_dimensions(), (400, 600));
+    }
+
+    /// Mirrors the WGSL `rotate_uv`/`rotated_dims` display rotation: mapping a
+    /// point `(u, v)` over the DISPLAYED (rotated) frame back into the
+    /// EXIF-upright texture's `(tu, tv)` normalized coordinates, for a
+    /// cumulative counter-clockwise `rot` quarter-turns. The WGSL selection
+    /// chain must match this exactly; testing the Rust mirror catches
+    /// arithmetic contradictions even though the WGSL itself only parses here.
+    fn rot_uv(rot: u8, u: f32, v: f32) -> (f32, f32) {
+        match rot & 3 {
+            0 => (u, v),
+            1 => (1.0 - v, u),
+            2 => (1.0 - u, 1.0 - v),
+            _ => (v, 1.0 - u),
+        }
+    }
+
+    #[test]
+    fn rotated_dimensions_swap_axes_for_odd_turns() {
+        // An odd quarter-turn swaps which frame axis is the display horizontal:
+        // the contain-fit (and the thumbnail print) become as tall as the
+        // source was wide.
+        fn rotated_dims<W: Copy>(w: W, h: W, rot: u8) -> (W, W) {
+            match rot & 3 {
+                0 | 2 => (w, h),
+                _ => (h, w),
+            }
+        }
+        assert_eq!(rotated_dims(3_u32, 2_u32, 0), (3, 2));
+        assert_eq!(rotated_dims(3_u32, 2_u32, 1), (2, 3));
+        assert_eq!(rotated_dims(3_u32, 2_u32, 2), (3, 2));
+        assert_eq!(rotated_dims(3_u32, 2_u32, 3), (2, 3));
+    }
+
+    #[test]
+    fn rotate_uv_maps_display_quarter_turns_to_texture_uv() {
+        // Identity: the displayed (u, v) IS the texture coordinate.
+        assert_eq!(rot_uv(0, 0.25, 0.75), (0.25, 0.75));
+        // One CCW 90°: the texture's top edge lands on the display's left, so
+        // the display's LEFT (u=0) samples the texture's TOP row (tv=0) while
+        // moving right across the display walks the texture top→bottom.
+        assert_eq!(rot_uv(1, 0.0, 0.0), (1.0, 0.0));
+        assert_eq!(rot_uv(1, 0.0, 1.0), (0.0, 0.0));
+        assert_eq!(rot_uv(1, 1.0, 1.0), (0.0, 1.0));
+        assert_eq!(rot_uv(1, 1.0, 0.0), (1.0, 1.0));
+        // Two turns: pure 180° reversal of both axes.
+        assert_eq!(rot_uv(2, 0.25, 0.75), (0.75, 0.25));
+        // Three turns (one CW): the texture's top edge lands on the display's
+        // right; the display's right (u=1) samples the top row (tv=0).
+        assert_eq!(rot_uv(3, 1.0, 0.0), (0.0, 0.0));
+        assert_eq!(rot_uv(3, 1.0, 1.0), (1.0, 0.0));
+        assert_eq!(rot_uv(3, 0.0, 0.0), (0.0, 1.0));
+        // Four turns return to the identity, and the count wraps mod 4 the way
+        // the shader's `rotation & 3` write keeps it.
+        assert_eq!(rot_uv(4, 0.25, 0.75), (0.25, 0.75));
     }
 
     #[test]

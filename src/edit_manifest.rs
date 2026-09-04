@@ -50,6 +50,13 @@ pub struct EditData {
     /// a crop onto another frame.
     #[serde(default)]
     pub crop: CropMargins,
+    /// User-requested display rotation on TOP of the RAW's EXIF orientation:
+    /// cumulative counter-clockwise 90° quarter-turns (`0`…`3`). Only the
+    /// display (and export) of the frame, so the crop margins are still
+    /// authored in the EXIF-upright source frame and are NOT re-interpreted
+    /// here. Missing in older manifests stays `0` (no user rotation).
+    #[serde(default)]
+    pub rotation: u8,
 }
 
 impl Default for EditData {
@@ -61,6 +68,7 @@ impl Default for EditData {
             curve_rolloff: DEFAULT_CURVE_ROLLOFF,
             curve_shadows: DEFAULT_CURVE_SHADOWS,
             crop: CropMargins::default(),
+            rotation: 0,
         }
     }
 }
@@ -166,7 +174,7 @@ pub struct RollManifest {
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 4,
+            version: 5,
             name: None,
             edits: HashMap::new(),
         }
@@ -236,8 +244,9 @@ impl RollManifest {
     /// Replaces the full edit for `name` with `tone` (exposure + curve powers
     /// in one step — copy/paste), updating an existing entry in place.
     ///
-    /// A paste never touches the target's crop: the crop margins survive
-    /// [`Self::set_tone`] unchanged (or stay default on a fresh file).
+    /// A paste never touches the target's crop or rotation: the crop margins
+    /// and the user rotation survive [`Self::set_tone`] unchanged (or stay
+    /// default on a fresh file).
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_tone(&mut self, name: &str, tone: ToneEdit) {
@@ -245,6 +254,7 @@ impl RollManifest {
             .edits
             .get(name)
             .map_or(CropMargins::default(), |edit| edit.crop);
+        let rotation = self.edits.get(name).map_or(0, |edit| edit.rotation);
         self.edits.insert(
             name.to_owned(),
             EditData {
@@ -253,6 +263,7 @@ impl RollManifest {
                 curve_rolloff: tone.curve_rolloff,
                 curve_shadows: tone.curve_shadows,
                 crop: existing,
+                rotation,
             },
         );
     }
@@ -279,6 +290,31 @@ impl RollManifest {
                 name.to_owned(),
                 EditData {
                     crop,
+                    ..EditData::default()
+                },
+            );
+        }
+    }
+
+    /// The user rotation for `name`; files (or manifest fields) never touched
+    /// fall back to `0` (no rotation).
+    #[must_use]
+    pub fn rotation(&self, name: &str) -> u8 {
+        self.edits.get(name).map_or(0, |edit| edit.rotation)
+    }
+
+    /// Records the cumulative counter-clockwise 90° rotation for `name`,
+    /// updating an existing entry in place.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_rotation(&mut self, name: &str, rotation: u8) {
+        if let Some(edit) = self.edits.get_mut(name) {
+            edit.rotation = rotation;
+        } else {
+            self.edits.insert(
+                name.to_owned(),
+                EditData {
+                    rotation,
                     ..EditData::default()
                 },
             );
@@ -366,6 +402,7 @@ mod tests {
         manifest.set_exposure("IMG_0001.DNG", 0.42);
         manifest.set_exposure("IMG_0002.RAW", -0.75);
         manifest.set_curve("IMG_0001.DNG", 0.85, 1.15, 1.1);
+        manifest.set_rotation("IMG_0001.DNG", 1);
 
         save_roll_manifest(&dir, &manifest).unwrap();
 
@@ -398,7 +435,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 4);
+        assert_eq!(loaded.version, 5);
     }
 
     #[test]
@@ -678,7 +715,79 @@ mod tests {
     }
 
     #[test]
-    fn paste_does_not_clobber_an_existing_crop() {
+    fn rotation_round_trips_and_defaults_to_zero() {
+        let dir = temp_dir("rotation-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_rotation("IMG_0001.DNG", 2);
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded, manifest);
+        assert_eq!(loaded.rotation("IMG_0001.DNG"), 2);
+        // An untouched file has no user rotation.
+        assert_eq!(loaded.rotation("IMG_0002.DNG"), 0);
+    }
+
+    #[test]
+    fn legacy_manifest_without_rotation_loads_zero() {
+        let dir = temp_dir("legacy-rotation");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A v1 manifest scripted before the rotation field ever existed.
+        std::fs::write(
+            manifest_path(&dir),
+            "version = 4\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+        )
+        .unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.rotation("a.DNG"), 0);
+        // And the surviving tone fields still load.
+        assert_eq!(loaded.tone("a.DNG").exposure_ev, 0.75);
+    }
+
+    #[test]
+    fn rotation_coexists_with_tone_and_crop_on_one_entry() {
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", 0.3);
+        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        let crop = CropMargins {
+            top: 5,
+            right: 6,
+            bottom: 7,
+            left: 8,
+        };
+        manifest.set_crop("a.DNG", crop);
+        manifest.set_rotation("a.DNG", 3);
+
+        assert_eq!(manifest.edits.len(), 1, "all edits on one entry");
+        assert_eq!(manifest.rotation("a.DNG"), 3);
+        assert_eq!(manifest.crop("a.DNG"), crop);
+        let tone = manifest.tone("a.DNG");
+        assert_eq!(tone.exposure_ev, 0.3);
+        assert_eq!(tone.curve_contrast, 1.2);
+    }
+
+    #[test]
+    fn set_rotation_updates_in_place_and_creates_on_fresh_file() {
+        let mut manifest = RollManifest::default();
+        manifest.set_rotation("a.DNG", 0);
+        assert_eq!(manifest.rotation("a.DNG"), 0);
+
+        manifest.set_rotation("a.DNG", 1);
+        manifest.set_rotation("a.DNG", 2);
+        assert_eq!(manifest.edits.len(), 1);
+        assert_eq!(manifest.rotation("a.DNG"), 2);
+        // The fresh-file branch keeps the tone identities.
+        assert_eq!(manifest.tone("a.DNG"), ToneEdit::identity());
+    }
+
+    #[test]
+    fn paste_does_not_clobber_an_existing_crop_or_rotation() {
         let mut manifest = RollManifest::default();
         let crop = CropMargins {
             top: 5,
@@ -687,10 +796,12 @@ mod tests {
             left: 8,
         };
         manifest.set_crop("a.DNG", crop);
+        manifest.set_rotation("a.DNG", 3);
         manifest.set_exposure("a.DNG", 0.3);
 
-        // Copy/paste writes a fresh ToneEdit onto the same file; the crop must
-        // survive untouched (crop is not part of the copy/paste payload).
+        // Copy/paste writes a fresh ToneEdit onto the same file; the crop and
+        // the rotation must survive untouched (neither is part of the
+        // copy/paste payload).
         manifest.set_tone(
             "a.DNG",
             ToneEdit {
@@ -702,6 +813,7 @@ mod tests {
         );
 
         assert_eq!(manifest.crop("a.DNG"), crop, "paste keeps the target's crop");
+        assert_eq!(manifest.rotation("a.DNG"), 3, "paste keeps the target's rotation");
         assert_eq!(manifest.tone("a.DNG").exposure_ev, -1.2);
     }
 
