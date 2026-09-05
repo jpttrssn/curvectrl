@@ -13,6 +13,14 @@ i18n-embed = { version = "0.16", features = [
     "desktop-requester",
 ] }
 i18n-embed-fl = "0.10"
+# PNG encoding for lossless export (`png` feature only — the same image 0.25.10
+# the tree already pulls for decode, so no new crates enter the lock).
+image = { version = "0.25", default-features = false, features = ["png"] }
+jpeg-encoder = "0.7"
+# Direct `png` access for export so the master can tag a `pHYs` density chunk
+# (`image::save_buffer_with_format` exposes no density API). Already in the lock
+# via image 0.25 → png 0.18, so `--locked` compiles nothing new.
+png = "0.18"
 open = "5.3.2"
 rawloader = "0.37.2"
 rust-embed = "8.8.0"

@@ -9,13 +9,14 @@ use crate::fl;
 use cosmic::Application;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
+use cosmic::iced::futures::SinkExt;
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{ContentFit, Length, Point, Subscription};
 use cosmic::prelude::*;
-use cosmic::widget::{self, about::About, icon, image::Handle, menu};
+use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -265,6 +266,19 @@ pub struct AppModel {
     /// so a frame already being preloaded (or already cached) is never spawned
     /// twice. Independent of the single critical detail slot.
     detail_preload_inflight: Vec<(PathBuf, String)>,
+    /// Completion toasts shown over the window (e.g. the export summary).
+    /// Auto-dismissing: each toast is removed when its [`Message::ToastClose`]
+    /// fires after the toast's duration.
+    toasts: toaster::Toasts<Message>,
+    /// Whether the native folder dialog is currently open. The portal dialog is
+    /// modal and blocks this window's input, but a second `ExportRequested`
+    /// could still fire during the async gap before the dialog appears, so a
+    /// flag prevents stacking two dialogs.
+    export_pending: bool,
+    /// Live export progress as `(done, total)` frames, or `None` while no batch
+    /// is running. Drives the header's circular progress ring; the stream task
+    /// clears it via [`Message::ExportDone`] when the batch finishes.
+    export_progress: Option<(usize, usize)>,
 }
 
 /// Draft text (source-pixel strings) for the four crop margin fields in the
@@ -600,6 +614,31 @@ pub enum Message {
     /// Consume an input event without acting on it, blocking the grid
     /// beneath the detail view's input surface.
     Ignore,
+    /// The user asked to export: open the native folder dialog (File → Export…
+    /// or the bare `e` key).
+    ExportRequested,
+    /// One export frame finished: `done` of `total` frames are written (or
+    /// skipped), driving the header's circular progress ring. Ticks may drop
+    /// under channel backpressure without harm — the batch still completes.
+    ExportProgress {
+        done: usize,
+        total: usize,
+    },
+    /// The folder dialog finished: `Some((dest, options))` exports the batch into
+    /// `dest` with `options`, `None` means the dialog was cancelled.
+    ExportChosen(Option<(PathBuf, ExportOptions)>),
+    /// The export batch finished, carrying how many frames succeeded, how many
+    /// were skipped (already present when overwrite was off), how many failed,
+    /// and the destination folder for the completion toast.
+    ExportDone {
+        ok: usize,
+        skipped: usize,
+        failed: usize,
+        dest: PathBuf,
+    },
+    /// A toast's duration elapsed (or its close button was pressed): dismiss
+    /// it from the toaster.
+    ToastClose(toaster::ToastId),
     /// Quit the application, persisting any open edits first.
     Quit,
     ToggleContextPage(ContextPage),
@@ -647,6 +686,161 @@ pub enum EditAdjust {
 pub enum Mod {
     Ctrl,
     Shift,
+}
+
+/// A curated export preset: the default combination of format, bit depth, and
+/// size for a destination (cloud backup, further processing, the web).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportPreset {
+    /// Cloud: JPEG, quality 90, native resolution — the classic "hand these to
+    /// an archive service" output.
+    Cloud,
+    /// Master: lossless 16-bit PNG at native resolution, so an external editor
+    /// gets the full dynamic range to work with.
+    Master,
+    /// Web: JPEG, quality 82, long edge capped at 2048 px.
+    Web,
+}
+
+impl ExportPreset {
+    /// The user-visible label for the preset, as shown in the dialog's format
+    /// dropdown.
+    #[must_use]
+    fn choice_label(self) -> String {
+        match self {
+            Self::Cloud => fl!("export-choice-jpeg-90"),
+            Self::Web => fl!("export-choice-jpeg-82"),
+            Self::Master => fl!("export-choice-png-16"),
+        }
+    }
+}
+
+/// The export container format: the sRGB-baked frame is either lossy-compressed
+/// as a JPEG (the `jpeg-encoder` path) or written losslessly as a PNG via the
+/// raw `png` crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportFormat {
+    Jpeg,
+    Png,
+}
+
+impl ExportFormat {
+    /// The filename extension for the format (`jpg` / `png`).
+    #[must_use]
+    fn ext(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+        }
+    }
+}
+
+/// Long-edge limit for the export decode. Original keeps native resolution;
+/// the numbered variants downscale the frame before baking (sharing the
+/// decoded buffer with the overview renderer).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ExportSize {
+    #[default]
+    Original,
+    LongEdge2048,
+}
+
+impl ExportSize {
+    /// The target long edge in pixels, or `0` for native resolution.
+    #[must_use]
+    fn long_edge(self) -> u32 {
+        match self {
+            Self::Original => 0,
+            Self::LongEdge2048 => 2048,
+        }
+    }
+}
+
+/// The full export parameter set: seeded by a preset on open, then adjustable
+/// through the dialog's controls until Save. Behavior is driven entirely by
+/// these fields — the preset that seeded them is not stored (the dropdown's
+/// format choice resolves straight to the options in `options_for_choice`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExportOptions {
+    format: ExportFormat,
+    quality: u8,
+    size: ExportSize,
+    /// Pixel density tagged in the output header: 0 writes none (the encode
+    /// crate's default), otherwise JPEG tags JFIF dots-per-inch and PNG tags a
+    /// `pHYs` pixels-per-meter value. Pure metadata — pixel data is untouched.
+    ppi: u16,
+    /// Whether an existing `<stem>.<ext>` in the destination is replaced. The
+    /// dialog's overwrite checkbox defaults to `false`: frames whose file
+    /// already exists are skipped rather than re-encoded.
+    overwrite: bool,
+}
+
+impl ExportOptions {
+    /// The options a preset imports, and the exact combo the dialog's format
+    /// dropdown restores for its key.
+    #[must_use]
+    fn for_preset(preset: ExportPreset) -> Self {
+        match preset {
+            ExportPreset::Cloud => Self {
+                format: ExportFormat::Jpeg,
+                quality: 90,
+                size: ExportSize::Original,
+                ppi: 300,
+                overwrite: false,
+            },
+            ExportPreset::Master => Self {
+                format: ExportFormat::Png,
+                quality: 100,
+                size: ExportSize::Original,
+                ppi: 300,
+                overwrite: false,
+            },
+            ExportPreset::Web => Self {
+                format: ExportFormat::Jpeg,
+                quality: 82,
+                size: ExportSize::LongEdge2048,
+                ppi: 72,
+                overwrite: false,
+            },
+        }
+    }
+}
+
+/// Resolves a key returned by the dialog's format choice back into the
+/// export options that key stands for. Unknown keys (or a dialog backend that
+/// dropped the choice) fall back to the first preset.
+#[must_use]
+fn options_for_choice(key: &str) -> ExportOptions {
+    let preset = match key {
+        "jpeg-82" => ExportPreset::Web,
+        "png-16" => ExportPreset::Master,
+        // "jpeg-90" and any unknown key (a backend that dropped the choice)
+        // fall back to the first preset.
+        _ => ExportPreset::Cloud,
+    };
+    ExportOptions::for_preset(preset)
+}
+
+/// The dialog's "format" choice: the three export presets as one dropdown,
+/// defaulting to the first (JPEG 90% full-res). The response returns the
+/// selected key, which [`options_for_choice`] resolves back into options.
+#[must_use]
+fn export_format_choice() -> cosmic::dialog::file_chooser::Choice {
+    let jpeg_90 = ExportPreset::Cloud.choice_label();
+    let jpeg_82 = ExportPreset::Web.choice_label();
+    let png_16 = ExportPreset::Master.choice_label();
+    cosmic::dialog::file_chooser::Choice::new("format", &fl!("export-choice-label"), "jpeg-90")
+        .insert("jpeg-90", &jpeg_90)
+        .insert("jpeg-82", &jpeg_82)
+        .insert("png-16", &png_16)
+}
+
+/// The dialog's "overwrite" checkbox, defaulting to unchecked (existing
+/// `<stem>.<ext>` files are kept rather than replaced). The response returns
+/// its state as the string `"true"` / `"false"`.
+#[must_use]
+fn export_overwrite_choice() -> cosmic::dialog::file_chooser::Choice {
+    cosmic::dialog::file_chooser::Choice::boolean("overwrite", &fl!("export-overwrite"), false)
 }
 
 /// Create a COSMIC application from the app model
@@ -723,6 +917,17 @@ impl cosmic::Application for AppModel {
                     },
                     MenuAction::PasteEdits,
                 ),
+                // Bare `e` exports the current selection; the key_binds map has
+                // hint text for the menu bar, while the true trigger lives in
+                // the global keyboard subscription (NoModifier KeyBinds are
+                // label-only in this cosmic menu API).
+                (
+                    menu::KeyBind {
+                        modifiers: vec![],
+                        key: keyboard::Key::Character("e".into()),
+                    },
+                    MenuAction::Export,
+                ),
             ]),
             // Optional configuration file for an application.
             config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
@@ -787,6 +992,9 @@ impl cosmic::Application for AppModel {
             fullscreen: false,
             detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
             detail_preload_inflight: Vec::new(),
+            toasts: toaster::Toasts::new(Message::ToastClose),
+            export_pending: false,
+            export_progress: None,
         };
 
         // Set the window title and scan the configured roll directories.
@@ -821,6 +1029,16 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-remove-roll"), None, MenuAction::RemoveRoll)
         };
 
+        // Export is only actionable when there is at least one frame to write
+        // inside the open roll; while a batch runs it is disabled (a second
+        // export cannot overlap the running one).
+        let exporting = self.export_progress.is_some();
+        let export = if exporting || !self.has_export_targets() {
+            menu::Item::ButtonDisabled(fl!("menu-export"), None, MenuAction::Export)
+        } else {
+            menu::Item::Button(fl!("menu-export"), None, MenuAction::Export)
+        };
+
         let file_menu = menu::Tree::with_children(
             menu::root(fl!("menu-file")).apply(Element::from),
             menu::items(
@@ -828,6 +1046,8 @@ impl cosmic::Application for AppModel {
                 vec![
                     menu::Item::Button(fl!("menu-add-roll"), None, MenuAction::AddRoll),
                     remove_roll,
+                    menu::Item::Divider,
+                    export,
                     menu::Item::Divider,
                     menu::Item::Button(fl!("menu-quit"), None, MenuAction::Quit),
                 ],
@@ -885,7 +1105,8 @@ impl cosmic::Application for AppModel {
         // The editing drawer is no longer toggled from a header button — it
         // opens automatically with the detail view (see `open_frame`) and is
         // hidden/revealed by the spacebar full-screen preview — so the header
-        // end packs only the search control.
+        // end packs only the search control and (while a batch runs) the
+        // export progress ring.
 
         // Search filters the current view's entries (roll names on the library
         // page, frame names in a roll). Mirroring cosmic-files, the input is
@@ -907,7 +1128,21 @@ impl cosmic::Application for AppModel {
                 .into()
         };
 
-        vec![search]
+        // The COSMIC-Files-style export indicator sits at the far right of the
+        // header: a small circular determinate progress ring that exists only
+        // while a batch is running — zero screen space when idle. Hovering
+        // shows which frame the batch is on.
+        let mut end = vec![search];
+        if let Some((done, total)) = self.export_progress {
+            let ring = cosmic::widget::determinate_circular(export_fraction(done, total)).size(18.0);
+            let ring = cosmic::widget::tooltip(
+                ring,
+                widget::text(fl!("export-progress", done = done, total = total)),
+                cosmic::widget::tooltip::Position::Bottom,
+            );
+            end.push(ring.into());
+        }
+        end
     }
 
     /// Display a context drawer if the context page is requested.
@@ -973,12 +1208,15 @@ impl cosmic::Application for AppModel {
             None => library_view(self),
         };
 
-        widget::column::with_capacity(1)
+        let content: Element<_> = widget::column::with_capacity(1)
             .push(content)
             .spacing(cosmic::theme::spacing().space_s)
             .height(Length::Fill)
             .width(Length::Fill)
-            .into()
+            .into();
+
+        // Overlay the toaster (completion toasts) on top of the whole window.
+        toaster::toaster(&self.toasts, content)
     }
 
     /// Register subscriptions for this application.
@@ -1064,6 +1302,16 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if modifiers.control() && character == "v" => Some(Message::PasteEdits),
+                // Bare `e` (no modifiers) opens the export destination picker
+                // for the current selection. Reached only when no focused text
+                // input swallowed the key first (search/crop fields capture
+                // bare characters), and placed before the editing-key wildcard
+                // so `e` never routes into an edit adjust.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "e" => Some(Message::ExportRequested),
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
                 // step. The handler no-ops unless a detail view is open, so
@@ -1722,6 +1970,107 @@ impl cosmic::Application for AppModel {
 
             Message::Ignore => Task::none(),
 
+            Message::ExportRequested => {
+                // Never stack a second dialog onto a pending one: the portal
+                // dialog is modal once visible, but a stray keyboard or menu
+                // double-fire can still land in the async gap before it shows.
+                if self.export_pending {
+                    return Task::none();
+                }
+                // A batch already running means a new export would queue behind
+                // it; refuse the dialog outright rather than open one that
+                // resolves into a no-op (the menu item is disabled to match).
+                if self.export_progress.is_some() {
+                    return Task::none();
+                }
+                // The keyboard `e` trigger fires on any page; without a selected
+                // frame inside an open roll there is nothing to export (the File
+                // menu item is disabled to match).
+                if !self.has_export_targets() {
+                    return Task::none();
+                }
+                self.export_pending = true;
+
+                let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
+                    .title(fl!("export-title"))
+                    .accept_label(fl!("export-pick-folder"))
+                    .choice(export_format_choice())
+                    .choice(export_overwrite_choice())
+                    .open_folder();
+
+                cosmic::task::future(async move {
+                    match dialog.await {
+                        Ok(response) => {
+                            // The chosen folder is the destination; every frame
+                            // keeps its own `<stem>.<ext>`.
+                            let Ok(dest) = response.url().to_file_path() else {
+                                return Message::ExportChosen(None);
+                            };
+                            // The response lists the selected (id, value) pairs:
+                            // the "format" choice carries the preset key and the
+                            // "overwrite" checkbox carries its state. A backend
+                            // that dropped a choice falls back to the defaults.
+                            let key = response
+                                .choices()
+                                .iter()
+                                .find(|(id, _)| id == "format")
+                                .map_or("jpeg-90", |(_, value)| value.as_str());
+                            let mut options = options_for_choice(key);
+                            options.overwrite = response
+                                .choices()
+                                .iter()
+                                .find(|(id, _)| id == "overwrite")
+                                .is_some_and(|(_, value)| value == "true");
+                            Message::ExportChosen(Some((dest, options)))
+                        }
+                        // Cancelled (or a portal failure) is a no-op.
+                        Err(_) => Message::ExportChosen(None),
+                    }
+                })
+            }
+
+            Message::ExportChosen(result) => {
+                self.export_pending = false;
+                match result {
+                    Some((dest, options)) => self.begin_export(dest, options),
+                    None => Task::none(),
+                }
+            }
+
+            Message::ExportProgress { done, total } => {
+                self.export_progress = Some((done, total));
+                Task::none()
+            }
+
+            Message::ExportDone { ok, skipped, failed, dest } => {
+                // The batch is over: hide the header ring before the summary
+                // toast lands.
+                self.export_progress = None;
+                let toast = if failed == 0 && skipped == 0 {
+                    toaster::Toast::new(fl!(
+                        "export-done",
+                        count = ok,
+                        dir = dest.display().to_string()
+                    ))
+                } else if failed == 0 {
+                    toaster::Toast::new(fl!(
+                        "export-done-skipped",
+                        count = ok,
+                        dir = dest.display().to_string(),
+                        skipped = skipped
+                    ))
+                } else {
+                    let total = ok + failed;
+                    toaster::Toast::new(fl!("export-failed", count = total, failed = failed))
+                };
+                self.toasts.push(toast).map(cosmic::Action::App)
+            }
+
+            Message::ToastClose(id) => {
+                self.toasts.remove(id);
+                Task::none()
+            }
+
             Message::EditSave => {
                 // Slider release (and the close/flush points) commit the
                 // dragged edit: persist the manifest, then re-bake the active
@@ -1735,7 +2084,9 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::PasteEdits => self.paste_edits(),
+            Message::PasteEdits => {
+                self.paste_edits()
+            }
 
             Message::Quit => {
                 // Flush any in-progress edit to disk, then ask the window to
@@ -1857,6 +2208,89 @@ impl AppModel {
             self.decode_detail_next(),
             self.preload_detail_neighbors(&name),
         ])
+    }
+
+    /// The frames the next export should target: every multi-selected frame
+    /// when the user has built a multi-selection, otherwise just the focused/
+    /// highlighted frame (which also mirrors the open detail frame). Empty when
+    /// no roll is open or nothing is focused.
+    fn export_targets(&self) -> Vec<String> {
+        if self.active.is_none() {
+            return Vec::new();
+        }
+        if self.selected_frames.is_empty() {
+            return self.frame_selected.iter().cloned().collect();
+        }
+        // Deterministic order for the export so a re-run writes files in the
+        // same sequence (a HashSet has no stable order).
+        let mut names: Vec<String> = self.selected_frames.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Whether [`Self::export_targets`] would yield at least one frame.
+    fn has_export_targets(&self) -> bool {
+        self.active.is_some()
+            && (self.frame_selected.is_some() || !self.selected_frames.is_empty())
+    }
+
+    /// Exports every target frame into `dest`, one file per frame named
+    /// `<stem>.<ext>` per the given options (JPEG or lossless PNG, native or
+    /// downscaled), decoding and baking each on the blocking worker pool.
+    /// Streams [`Message::ExportProgress`] per finished frame (driving the
+    /// header ring) plus a final [`Message::ExportDone`] summary, which clears
+    /// the ring. Edits are read from the in-memory manifest — the same source
+    /// the grid and detail view render from.
+    fn begin_export(&mut self, dest: PathBuf, options: ExportOptions) -> Task<cosmic::Action<Message>> {
+        let Some(dir) = self.active.clone() else {
+            return Task::none();
+        };
+        let names = self.export_targets();
+        if names.is_empty() {
+            return Task::none();
+        }
+        // A batch is already running: refuse a second one (the disabled menu
+        // item and the ExportRequested guard also block this path).
+        if self.export_progress.is_some() {
+            return Task::none();
+        }
+        // Snapshot each frame's stored edits up front (the manifest is shared and
+        // could change while the batch runs, but a snapshot keeps the export of
+        // one batch internally consistent). This reads the same in-memory
+        // manifest the grid and detail view render from, so an export always
+        // matches what is on screen — even for an edit that has been applied
+        // but not yet flushed to the on-disk manifest.
+        let frames: Vec<(String, edit_manifest::ToneEdit, edit_manifest::CropMargins, u8)> = names
+            .into_iter()
+            .map(|name| {
+                let tone = self.roll.tone(&name);
+                let crop = self.roll.crop(&name);
+                let rotation = self.roll.rotation(&name) & 3;
+                (name, tone, crop, rotation)
+            })
+            .collect();
+        let total = frames.len();
+        self.export_progress = Some((0, total));
+
+        // Stream from an async channel so the UI sees per-frame ticks. After
+        // each frame the sender pushes an `ExportProgress` message (dropping
+        // harmlessly if the UI is behind on backpressure), and the final
+        // `ExportDone` is awaited *through* the channel so it can never be
+        // lost — the ring is guaranteed a matching completion message.
+        cosmic::task::stream(cosmic::iced::stream::channel(1, async move |mut sender| {
+            let mut tick = |done: usize, _total: usize| {
+                let _ = sender.try_send(Message::ExportProgress { done, total });
+            };
+            let (ok, skipped, failed) = export_frames(dir, dest.clone(), frames, options, &mut tick).await;
+            let _ = sender
+                .send(Message::ExportDone {
+                    ok,
+                    skipped,
+                    failed,
+                    dest,
+                })
+                .await;
+        }))
     }
 
     /// The column count arrow-key navigation should use: the exact grid count
@@ -2766,10 +3200,23 @@ async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
     loaded
 }
 
-/// Scans a roll directory once: returns the first regular non-dot file name in
-/// sorted order — the roll's cover, if it has any negatives yet — alongside the
-/// count of frame files (both `None`/0 for a missing or empty directory). A
-/// single pass covers the cover thumbnail and the metadata-drawer frame count.
+/// Whether `name` looks like an output of this app's exporter (JPEG or PNG)
+/// rather than a source negative. Negatives are RAW files (none of them use
+/// these extensions), while exporting a roll into its own folder would
+/// otherwise make every shipped file show back up as a fake frame — and,
+/// without this, even become the roll's cover, which no scan ever searches
+/// this directory for.
+#[must_use]
+fn is_export_artifact(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png"))
+}
+
+/// Scans a roll directory once: returns the first regular non-dot frame file
+/// name in sorted order — the roll's cover, if it has any negatives yet —
+/// alongside the count of frame files (both `None`/0 for a missing or empty
+/// directory). A single pass covers the cover thumbnail and the
+/// metadata-drawer frame count. Export artifacts (JPEG/PNG) are not frames.
 async fn roll_cover_and_count(dir: &Path) -> (Option<String>, usize) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return (None, 0);
@@ -2780,6 +3227,7 @@ async fn roll_cover_and_count(dir: &Path) -> (Option<String>, usize) {
         if entry.file_type().await.is_ok_and(|ty| ty.is_file())
             && let Some(name) = entry.file_name().into_string().ok()
             && !name.starts_with('.')
+            && !is_export_artifact(&name)
         {
             files.push(name);
         }
@@ -2791,7 +3239,8 @@ async fn roll_cover_and_count(dir: &Path) -> (Option<String>, usize) {
 }
 
 /// Scans a roll directory for its frame files and returns their sorted names.
-/// Dotfiles (including the edit manifest) are never shown as tiles.
+/// Dotfiles (including the edit manifest) and export artifacts (JPEG/PNG) are
+/// never shown as tiles.
 async fn load_files_in(dir: PathBuf) -> Vec<String> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
@@ -2802,6 +3251,7 @@ async fn load_files_in(dir: PathBuf) -> Vec<String> {
         if entry.file_type().await.is_ok_and(|ty| ty.is_file())
             && let Some(name) = entry.file_name().into_string().ok()
             && !name.starts_with('.')
+            && !is_export_artifact(&name)
         {
             files.push(name);
         }
@@ -2883,6 +3333,44 @@ fn open_roll_picker() -> Task<cosmic::Action<Message>> {
         }
     })
 }
+
+
+/// The exported file name for a frame: the source file name with its extension
+/// replaced by the format's (e.g. `img_0001.cr2` → `img_0001.jpg` or
+/// `img_0001.png`). A file name with no extension simply gains the extension; a
+/// hidden leading dot is part of the stem.
+#[must_use]
+fn export_name(name: &str, format: ExportFormat) -> PathBuf {
+    let mut out = PathBuf::from(name);
+    out.set_extension(format.ext());
+    out
+}
+
+/// A same-directory sibling for an atomic export write: the encode goes to
+/// `dest`'s `.tmp` neighbor and is renamed over `dest` once it is fully on
+/// disk. Same filesystem, so the rename is atomic — a failed or interrupted
+/// export leaves any pre-existing `dest` untouched instead of truncating it.
+#[must_use]
+fn temp_export_path(dest: &Path) -> PathBuf {
+    let mut name = dest
+        .file_name()
+        .map_or_else(|| "export".to_owned(), |n| n.to_string_lossy().into_owned());
+    name.push_str(".tmp");
+    dest.with_file_name(name)
+}
+
+/// The determinate fraction (0.0..=1.0) an export batch has reached after
+/// `done` of `total` frames, for the header's progress ring.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // frame counts are far below f32's exact range
+fn export_fraction(done: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        done as f32 / total as f32
+    }
+}
+
 
 /// The index arrow-key navigation moves the selection to: `selected` as an
 /// index into the visible cells (None = nothing selected yet), `len` visible
@@ -3043,6 +3531,7 @@ fn reveal_target_y(
     let max = (content_height - viewport_height).max(0.0);
     Some(target.clamp(0.0, max))
 }
+
 
 /// Renders the library page: a responsive grid of selectable cells. The Add
 /// Roll tile is always the first cell; when no rolls (or no matches) remain, a
@@ -4066,6 +4555,236 @@ async fn decode_raw_detail(
     .unwrap_or(Err(()))
 }
 
+/// Exports every listed frame into `dest` per the given options, sequentially,
+/// so only one full-resolution decode is in flight at a time (bounded transient
+/// memory). After each frame — written, skipped, or failed — `progress` is
+/// called with the running `(done, total)` counts so the caller can stream
+/// live progress to the UI. Returns how many frames succeeded, how many were
+/// skipped (their output already existed and overwrite was off), and how many
+/// failed.
+async fn export_frames(
+    dir: PathBuf,
+    dest: PathBuf,
+    frames: Vec<(String, edit_manifest::ToneEdit, edit_manifest::CropMargins, u8)>,
+    options: ExportOptions,
+    mut progress: impl FnMut(usize, usize) + Send,
+) -> (usize, usize, usize) {
+    let mut ok = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    let total = frames.len();
+    let mut done = 0;
+    for (name, tone, crop, rotation) in frames {
+        let target = dest.join(export_name(&name, options.format));
+        // With overwrite off, an already-present file is kept as-is: the frame
+        // is skipped before any decode.
+        if !options.overwrite && target.exists() {
+            skipped += 1;
+        } else if export_one(dir.clone(), name, target, tone, crop, rotation, options)
+            .await
+            .is_ok()
+        {
+            ok += 1;
+        } else {
+            failed += 1;
+        }
+        done += 1;
+        progress(done, total);
+    }
+    (ok, skipped, failed)
+}
+
+/// Decodes a frame (at native resolution, or downscaled when the size option
+/// caps the long edge) and writes `dest` per the options: a JPEG at the chosen
+/// quality, or a lossless 16-bit grayscale PNG. The stored tone curve,
+/// exposure, crop, and display rotation are baked into the pixels — the same
+/// edit pipeline as the detail view and thumbnails, just at the chosen scale
+/// (the overview/native downscale is skipped for `Original`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+async fn export_one(
+    dir: PathBuf,
+    name: String,
+    dest: PathBuf,
+    tone: edit_manifest::ToneEdit,
+    crop: edit_manifest::CropMargins,
+    rotation: u8,
+    options: ExportOptions,
+) -> Result<(), ()> {
+    let max_edge = options.size.long_edge();
+    // Oriented linear mono (already masked-border cropped, inverted,
+    // unsharpened — the exact detail-view decode), at the size option's long
+    // edge or full native resolution. `src_long_edge` is the pre-downscale
+    // long edge, so the factor pins how far below native the print is.
+    let (mut mono, width, height, src_long_edge) =
+        decode_raw_detail(dir, name, if max_edge == 0 { u32::MAX } else { max_edge }).await?;
+
+    // The crop margins are authored in display-upright source pixels; scale
+    // them onto the (possibly downscaled) print. When the decode was already
+    // at native resolution the factor is 1.0 and this is the identity.
+    let factor = if max_edge > 0 && src_long_edge > max_edge {
+        max_edge as f32 / src_long_edge as f32
+    } else {
+        1.0
+    };
+    let source_w = (width as f32 / factor).round() as u32;
+    let source_h = (height as f32 / factor).round() as u32;
+    let crop = scale_crop(crop, source_w, source_h, width, height);
+
+    // Bake the stored tone curve, then the exposure gain, then sRGB-encode —
+    // the same ordering as the detail shader and `convert_thumbnail`.
+    let (shadow, mid, white) = shader::tone_anchors(&mono);
+    shader::apply_curve(
+        &mut mono,
+        tone.curve_contrast,
+        tone.curve_rolloff,
+        tone.curve_shadows,
+        shadow,
+        mid,
+        white,
+    );
+    apply_exposure(&mut mono, tone.exposure_ev);
+
+    for value in &mut mono {
+        *value = srgb_encode(*value);
+    }
+
+    match options.format {
+        ExportFormat::Jpeg => export_jpeg(mono, width, height, crop, rotation, &dest, options),
+        ExportFormat::Png => export_png(mono, width, height, crop, rotation, &dest, options),
+    }
+}
+
+/// Writes `dest` as a quality-`options` JPEG, quantizing the sRGB mono buffer
+/// to a single luminance channel (same shared bake as `export_png`). When
+/// `options.ppi` is non-zero the JFIF header tags that dots-per-inch density.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn export_jpeg(
+    mono: Vec<f32>,
+    width: u32,
+    height: u32,
+    crop: edit_manifest::CropMargins,
+    rotation: u8,
+    dest: &Path,
+    options: ExportOptions,
+) -> Result<(), ()> {
+    let mut rgba = Vec::with_capacity(mono.len() * 4);
+    for &value in &mono {
+        let level = (value * 255.0).round() as u8;
+        rgba.extend_from_slice(&[level, level, level, 255]);
+    }
+    // Free the linear mono before the (similar-sized) steps below.
+    drop(mono);
+
+    let (rgba, width, height) = bake_geometry(rgba, width, height, crop, rotation);
+
+    // Negatives render monochrome: all four channels carry the same level, so
+    // drop to a single luminance channel. Revisit once color negatives are
+    // supported (see NOTES.md).
+    let mut gray: Vec<u8> = Vec::with_capacity(width as usize * height as usize);
+    for px in rgba.chunks(4) {
+        gray.push(px[0]);
+    }
+    drop(rgba);
+
+    // The JPEG header fields are u16; exports are far below that, so the
+    // conversion can only fail for absurd geometry — bail before creating any
+    // temp file.
+    let width = u16::try_from(width).map_err(|_| ())?;
+    let height = u16::try_from(height).map_err(|_| ())?;
+
+    // Encode to a same-directory temp file, then rename over `dest` only once
+    // the stream is fully written: a mid-encode failure must not truncate (or,
+    // with overwrite on, replace) an existing file.
+    let tmp = temp_export_path(dest);
+    let file = std::fs::File::create(&tmp).map_err(|_| ())?;
+    let mut encoder = jpeg_encoder::Encoder::new(file, options.quality);
+    // The default header is a bare (1,1) pixel-aspect-ratio; tag a real density
+    // so print/layout tools scale the file by its intended PPI.
+    if options.ppi != 0 {
+        encoder.set_density(jpeg_encoder::PixelDensity::dpi(options.ppi));
+    }
+    // `encode` consumes the encoder (flush-on-drop), so its output is complete
+    // by the time it returns; only then is the temp renamed into place.
+    let result = encoder.encode(&gray, width, height, jpeg_encoder::ColorType::Luma);
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+        return result.map_err(|_| ());
+    }
+    std::fs::rename(&tmp, dest).map_err(|_| ())
+}
+
+/// Writes `dest` as a lossless 16-bit grayscale PNG via the `png` crate,
+/// quantizing the sRGB mono buffer to `u16` luminance samples (big-endian —
+/// the byte order the PNG container requires, written as-is by the raw `png`
+/// crate). When `options.ppi` is non-zero a `pHYs` chunk tags that density in
+/// pixels-per-meter.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn export_png(
+    mono: Vec<f32>,
+    width: u32,
+    height: u32,
+    crop: edit_manifest::CropMargins,
+    rotation: u8,
+    dest: &Path,
+    options: ExportOptions,
+) -> Result<(), ()> {
+    let mut rgba = Vec::with_capacity(mono.len() * 4);
+    for &value in &mono {
+        let level = (value * 65535.0).round() as u16;
+        rgba.extend_from_slice(&[level, level, level, u16::MAX]);
+    }
+    drop(mono);
+    let (rgba, width, height) = bake_geometry16(rgba, width, height, crop, rotation);
+
+    // Negatives render monochrome: all four channels carry the same level, so
+    // drop to a single luminance channel. Revisit once color negatives are
+    // supported (see NOTES.md). Samples are stored big-endian — the byte order
+    // the PNG container requires; the raw `png` crate writes them as-is (the
+    // `image` wrapper used to re-swap them for us, hence the earlier
+    // native-endian notes).
+    let mut gray = Vec::with_capacity(width as usize * height as usize * 2);
+    for px in rgba.chunks(4) {
+        gray.extend_from_slice(&px[0].to_be_bytes());
+    }
+    drop(rgba);
+
+    // Encode to a same-directory temp file, then rename over `dest` only once
+    // every byte is on disk: a mid-encode failure must not truncate (or, with
+    // overwrite on, replace) an existing file.
+    let tmp = temp_export_path(dest);
+    let file = std::fs::File::create(&tmp).map_err(|_| ())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Sixteen);
+    // The samples are sRGB-encoded; a `sRGB` chunk makes that interpretation
+    // deterministic for color-managed consumers (print pipelines especially),
+    // instead of relying on an unstated viewer default.
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    // `pHYs` stores pixels per meter (1 in = 0.0254 m), unlike JFIF's per-inch.
+    if options.ppi != 0 {
+        let ppm = (f32::from(options.ppi) / 0.0254).round() as u32;
+        encoder.set_pixel_dims(Some(png::PixelDimensions {
+            xppu: ppm,
+            yppu: ppm,
+            unit: png::Unit::Meter,
+        }));
+    }
+    let mut writer = encoder.write_header().map_err(|_| ())?;
+    if writer.write_image_data(&gray).is_err() {
+        drop(writer);
+        std::fs::remove_file(&tmp).ok();
+        return Err(());
+    }
+    // `finish` writes the IEND trailer and consumes the writer; its dropped
+    // BufWriter flushes any residual bytes, so the temp file is complete on
+    // success and only then renamed into place.
+    if writer.finish().is_err() {
+        std::fs::remove_file(&tmp).ok();
+        return Err(());
+    }
+    std::fs::rename(&tmp, dest).map_err(|_| ())
+}
+
 /// Runs a RAW decode plus conversion on a blocking worker thread so the UI
 /// never stalls on CPU-heavy work.
 async fn decode_raw<F>(dir: PathBuf, name: String, convert: F) -> Result<Handle, ()>
@@ -4615,6 +5334,121 @@ fn rotate_quarters(rgba: Vec<u8>, width: u32, height: u32, turns: u8) -> (Vec<u8
     }
 }
 
+/// Applies the export geometry to an RGBA print: crops to `crop` (scaled by the
+/// caller to the print's native dims) then quarter-turns to `rotation`, matching
+/// the thumbnail/detail ordering (crop-then-rotate). Shared by the JPEG and PNG
+/// export encoders so both bake the same framing.
+fn bake_geometry(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    crop: edit_manifest::CropMargins,
+    rotation: u8,
+) -> (Vec<u8>, u32, u32) {
+    let (rgba, width, height) = if crop == edit_manifest::CropMargins::default() {
+        (rgba, width, height)
+    } else {
+        crop_rgba(rgba, width, height, crop)
+    };
+    rotate_quarters(rgba, width, height, rotation)
+}
+
+/// The 16-bit analogue of [`rotate_quarters`]: rotates an RGBA buffer of `u16`
+/// samples counter-clockwise by `turns` 90° quarter turns, swapping the print
+/// dims on odd turns. Used by the 16-bit PNG export path.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rotate_quarters16(rgba: Vec<u16>, width: u32, height: u32, turns: u8) -> (Vec<u16>, u32, u32) {
+    let out_w = height;
+    let out_h = width;
+    let mut out = vec![0_u16; width as usize * height as usize * 4];
+    match turns & 3 {
+        0 => (rgba, width, height),
+        1 => {
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((y * width + x) as usize) * 4;
+                    let ox = y;
+                    let oy = width - 1 - x;
+                    let dst = ((oy * out_w + ox) as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            (out, out_w, out_h)
+        }
+        2 => {
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((y * width + x) as usize) * 4;
+                    let oy = height - 1 - y;
+                    let ox = width - 1 - x;
+                    let dst = ((oy * width + ox) as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            (out, width, height)
+        }
+        _ => {
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((y * width + x) as usize) * 4;
+                    let ox = height - 1 - y;
+                    let oy = x;
+                    let dst = ((oy * out_w + ox) as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            (out, out_w, out_h)
+        }
+    }
+}
+
+/// Convenience for [`rotate_quarters`] vs [`rotate_quarters16`]: the export
+/// path picks the deeper buffer's rotation directly.
+fn bake_geometry16(
+    rgba: Vec<u16>,
+    width: u32,
+    height: u32,
+    crop: edit_manifest::CropMargins,
+    rotation: u8,
+) -> (Vec<u16>, u32, u32) {
+    let (rgba, width, height) = if crop == edit_manifest::CropMargins::default() {
+        (rgba, width, height)
+    } else {
+        crop_rgba16(rgba, width, height, crop)
+    };
+    rotate_quarters16(rgba, width, height, rotation)
+}
+
+/// The 16-bit analogue of [`crop_rgba`]: crops an RGBA buffer of `u16` samples
+/// to the given margins (which the caller scaled to the print's dims), letting
+/// a degenerate crop leave the frame unchanged.
+fn crop_rgba16(
+    rgba: Vec<u16>,
+    width: u32,
+    height: u32,
+    crop: edit_manifest::CropMargins,
+) -> (Vec<u16>, u32, u32) {
+    let cw = crop.cropped_width(width);
+    let ch = crop.cropped_height(height);
+    if cw == 0 || ch == 0 {
+        return (rgba, width, height);
+    }
+    let mut out = Vec::with_capacity((cw * ch) as usize * 4);
+    let mut rows = 0u32;
+    let top = crop.top.min(height.saturating_sub(ch));
+    for y in top..top.saturating_add(ch) {
+        let row = y as usize * width as usize + crop.left as usize;
+        let start = row * 4;
+        if start >= rgba.len() {
+            break;
+        }
+        let end = (start + cw as usize * 4).min(rgba.len());
+        out.extend_from_slice(&rgba[start..end]);
+        rows += 1;
+    }
+    (out, cw, rows)
+}
+
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
 /// dimension exceeds `max_size`, baking the tone edit (`ToneEdit`: exposure,
 /// curve powers) and the display rotation into the pixels.
@@ -4926,6 +5760,7 @@ pub enum MenuAction {
     CopyEdits,
     PasteEdits,
     ShowEditing,
+    Export,
     About,
     RollInfo,
 }
@@ -4942,6 +5777,7 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::CopyEdits => Message::CopyEdits,
             MenuAction::PasteEdits => Message::PasteEdits,
             MenuAction::ShowEditing => Message::ToggleContextPage(ContextPage::Editing),
+            MenuAction::Export => Message::ExportRequested,
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
             MenuAction::RollInfo => Message::ToggleContextPage(ContextPage::RollInfo),
         }
@@ -6254,5 +7090,217 @@ mod tests {
         let (out, w, h) = rotate_quarters(cropped, cw, ch, 1);
         assert_eq!((w, h), (1, 1));
         assert_eq!(&out[0..4], &[4, 4, 4, 255], "crop center pixel survives");
+    }
+
+    #[test]
+    fn export_name_replaces_the_source_extension() {
+        assert_eq!(
+            export_name("img_0001.cr2", ExportFormat::Jpeg).to_string_lossy(),
+            "img_0001.jpg"
+        );
+        assert_eq!(
+            export_name("img_0001.cr2", ExportFormat::Png).to_string_lossy(),
+            "img_0001.png"
+        );
+        assert_eq!(
+            export_name("img_0001.nef", ExportFormat::Jpeg).to_string_lossy(),
+            "img_0001.jpg"
+        );
+        // No extension in the name: the format's extension is simply appended.
+        assert_eq!(
+            export_name("IMG_0001", ExportFormat::Jpeg).to_string_lossy(),
+            "IMG_0001.jpg"
+        );
+        // A dotfile: the hidden leading dot is part of the stem.
+        assert_eq!(
+            export_name(".hidden.cr2", ExportFormat::Jpeg).to_string_lossy(),
+            ".hidden.jpg"
+        );
+    }
+
+    #[test]
+    fn export_presets_define_the_expected_defaults() {
+        // Cloud: JPEG q90 at native resolution, tagged 300 dpi for print.
+        let cloud = ExportOptions::for_preset(ExportPreset::Cloud);
+        assert_eq!(cloud.format, ExportFormat::Jpeg);
+        assert_eq!(cloud.quality, 90);
+        assert_eq!(cloud.size, ExportSize::Original);
+        assert_eq!(cloud.ppi, 300);
+        // Master: lossless 16-bit PNG at native resolution, tagged 300 dpi.
+        let master = ExportOptions::for_preset(ExportPreset::Master);
+        assert_eq!(master.format, ExportFormat::Png);
+        assert_eq!(master.size, ExportSize::Original);
+        assert_eq!(master.ppi, 300);
+        // Web: JPEG q82 downscaled to a 2048px long edge, tagged 72 dpi.
+        let web = ExportOptions::for_preset(ExportPreset::Web);
+        assert_eq!(web.format, ExportFormat::Jpeg);
+        assert_eq!(web.quality, 82);
+        assert_eq!(web.size, ExportSize::LongEdge2048);
+        assert_eq!(web.ppi, 72);
+        // Overwriting is off by default (the dialog checkbox defaults to "no").
+        assert!(!cloud.overwrite && !master.overwrite && !web.overwrite);
+    }
+
+    #[test]
+    fn export_artifacts_are_identified_by_extension() {
+        // Outputs of this app's exporter must never be mistaken for negatives.
+        assert!(is_export_artifact("img_0001.jpg"));
+        assert!(is_export_artifact("IMG_0002.JPEG"));
+        assert!(is_export_artifact("scan.png"));
+        assert!(!is_export_artifact("img_0001.cr2"));
+        assert!(!is_export_artifact("IMG_0002.nef"));
+        assert!(!is_export_artifact("scan.dng"));
+        assert!(!is_export_artifact(".hidden"));
+        assert!(!is_export_artifact("no_extension"));
+    }
+
+    #[test]
+    fn options_for_choice_resolves_the_dropdown_keys() {
+        // Each file-picker format choice key maps to its preset's options.
+        let cloud = options_for_choice("jpeg-90");
+        assert_eq!(cloud.format, ExportFormat::Jpeg);
+        assert_eq!(cloud.quality, 90);
+        let web = options_for_choice("jpeg-82");
+        assert_eq!(web.quality, 82);
+        assert_eq!(web.size, ExportSize::LongEdge2048);
+        let master = options_for_choice("png-16");
+        assert_eq!(master.format, ExportFormat::Png);
+        // An unknown key (or a backend that dropped the choice) falls back to
+        // the first preset.
+        let fallback = options_for_choice("nonsense");
+        assert_eq!(fallback.format, ExportFormat::Jpeg);
+        assert_eq!(fallback.quality, 90);
+    }
+
+    #[test]
+    fn png_export_writes_grayscale_16bit_round_trip() {
+        // 2x2 solid mid-gray frame. 0.5 is exactly representable at 16-bit
+        // (32768), so decoding the written PNG and checking that value pins
+        // both the color type and the sample byte order: the raw `png` crate
+        // writes big-endian samples as-is, and the old little-endian buffer
+        // swapped every sample (0x8000 was stored and read back as 0x0080 = 128).
+        let mono = vec![0.5, 0.5, 0.5, 0.5];
+        let dest = std::env::temp_dir().join(format!(
+            "curvectrl_png_smoke_{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+        let result = export_png(
+            mono,
+            2,
+            2,
+            Marg::default(),
+            0,
+            &dest,
+            ExportOptions {
+                format: ExportFormat::Png,
+                quality: 100,
+                size: ExportSize::Original,
+                ppi: 72,
+                overwrite: false,
+            },
+        );
+        let bytes = std::fs::read(&dest).unwrap();
+        std::fs::remove_file(&dest).ok();
+        assert_eq!(result, Ok(()));
+
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(image.color(), image::ColorType::L16);
+        assert_eq!(
+            image.as_luma16().unwrap().get_pixel(0, 0).0[0],
+            32768,
+            "mid-gray round-trips at 16-bit in native byte order"
+        );
+
+        // The 72 dpi request must produce a real pHYs chunk (2835 px/m). `read_info`
+        // walks metadata up to the first IDAT (pHYs sits there); the bare
+        // `read_header_info` stops at IHDR with the chunk fields still `None`.
+        let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+        let reader = decoder.read_info().expect("png header parses");
+        let dims = reader
+            .info()
+            .pixel_dims
+            .expect("a 72 dpi request tags a pHYs chunk");
+        assert_eq!(dims.xppu, 2835);
+        assert_eq!(dims.yppu, 2835);
+        assert_eq!(dims.unit, png::Unit::Meter);
+
+        // The export always tags the samples as sRGB, so color-managed
+        // consumers interpret them deterministically rather than guessing.
+        assert_eq!(
+            reader.info().srgb,
+            Some(png::SrgbRenderingIntent::Perceptual)
+        );
+    }
+
+    #[test]
+    fn jpeg_export_tags_the_jfif_density() {
+        // 2x2 solid mid-gray through `export_jpeg` with the Web preset's 72 dpi.
+        // The JFIF APP0 header should read: "JFIF\0" + version 1.2 + unit 01
+        // (dots per inch) + Xdensity 72 (00 48 BE) + Ydensity 72.
+        let mono = vec![0.5; 4];
+        let dest = std::env::temp_dir().join(format!(
+            "curvectrl_jpeg_dpi_{}.jpg",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+        let result = export_jpeg(
+            mono,
+            2,
+            2,
+            Marg::default(),
+            0,
+            &dest,
+            ExportOptions {
+                format: ExportFormat::Jpeg,
+                quality: 82,
+                size: ExportSize::LongEdge2048,
+                ppi: 72,
+                overwrite: false,
+            },
+        );
+        let bytes = std::fs::read(&dest).unwrap();
+        std::fs::remove_file(&dest).ok();
+        assert_eq!(result, Ok(()));
+
+        let expected = [b'J', b'F', b'I', b'F', 0x00, 0x01, 0x02, 0x01, 0x00, 0x48, 0x00, 0x48];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "JFIF header must tag 72 dpi"
+        );
+    }
+
+    #[test]
+    fn jpeg_encoder_smoke_writes_quality_90_soi() {
+        // Grayscale, matching the export path's Luma encode.
+        let mut gray = Vec::with_capacity(16 * 16);
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                gray.push(x * 16 ^ y * 16);
+            }
+        }
+
+        // A unique temp path per run so parallel test threads never collide.
+        let mut dest = std::env::temp_dir();
+        dest.push(format!(
+            "curvectrl_jpeg_smoke_{}.jpg",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+
+        let encoder = jpeg_encoder::Encoder::new_file(&dest, 90).unwrap();
+        encoder
+            .encode(&gray, 16, 16, jpeg_encoder::ColorType::Luma)
+            .unwrap();
+
+        let bytes = std::fs::read(&dest).unwrap();
+        std::fs::remove_file(&dest).ok();
+
+        // A JPEG stream always starts with the SOI marker FF D8 FF.
+        assert!(bytes.len() > 4, "encoded stream has payload");
+        assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF]);
     }
 }
