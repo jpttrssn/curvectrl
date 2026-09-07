@@ -115,7 +115,7 @@ pub struct AppModel {
     /// The library cell single-clicked (or arrow-key selected) on the library
     /// page: either the always-first Add Roll tile or a real roll. `None`
     /// (initial state) until the user selects a cell; drives the selected-tile
-    /// highlight, the `Ctrl+Space` metadata drawer, and Enter/arrow navigation.
+    /// highlight, the `Space` metadata drawer, and Enter/arrow navigation.
     library_selection: Option<LibrarySelection>,
     /// Frame-grid highlight: the tile single-clicked (or last opened / paged
     /// to) inside an open roll. Distinct from `selected` (the opened detail
@@ -254,9 +254,6 @@ pub struct AppModel {
     /// stamped into [`DetailProgram::image_id`] so the GPU pipeline
     /// recognises a new image and rebuilds its texture.
     next_image_id: u64,
-    /// True while the detail view's editing drawer is hidden for a full-screen
-    /// preview (toggled by spacebar). Only meaningful while `selected` is set.
-    fullscreen: bool,
     /// LRU of decoded detail overviews keyed by (roll dir, file name), so
     /// returning to a recently-viewed frame doesn't re-decode the RAW. Survives
     /// roll switches and detail close; eviction is global (see
@@ -565,10 +562,6 @@ pub enum Message {
     /// made while it was held (persist + re-bake), mirroring the slider's
     /// release commit instead of committing per auto-repeated press.
     EditKeyReleased,
-    /// Toggle the full-screen preview: hide the editing drawer (spacebar) so
-    /// the detail view fills the window; toggling again (or pressing Escape)
-    /// restores the drawer.
-    ToggleFullscreen,
     /// Wheel-scroll zoom in the detail view; payload is the change in zoom
     /// units (log2 of the scale ratio), positive = zoom in, negative = out.
     DetailZoom(f32),
@@ -644,7 +637,7 @@ pub enum Message {
     /// Quit the application, persisting any open edits first.
     Quit,
     ToggleContextPage(ContextPage),
-    /// Toggle the current page's context drawer (Ctrl+Space). Since the
+    /// Toggle the current page's context drawer (bare Space). Since the
     /// keyboard subscription's filter closure cannot capture app state, this
     /// defers the page choice to the update handler: editing while a detail
     /// view is open, roll info otherwise.
@@ -893,10 +886,10 @@ impl cosmic::Application for AppModel {
             key_binds: HashMap::from([
                 (
                     menu::KeyBind {
-                        modifiers: vec![menu::key_bind::Modifier::Ctrl],
+                        modifiers: vec![],
                         key: keyboard::Key::Character(" ".into()),
                     },
-                    MenuAction::RollInfo,
+                    MenuAction::Details,
                 ),
                 (
                     menu::KeyBind {
@@ -991,7 +984,6 @@ impl cosmic::Application for AppModel {
             reset_rotation: 0,
             clipboard: None,
             next_image_id: 0,
-            fullscreen: false,
             detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
             detail_preload_inflight: Vec::new(),
             toasts: toaster::Toasts::new(Message::ToastClose),
@@ -1022,9 +1014,11 @@ impl cosmic::Application for AppModel {
 
     /// Elements to pack at the start of the header bar.
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        // Remove roll is only actionable when a roll is selected in the
-        // library; otherwise it shows disabled on the menu.
-        let roll_selected = matches!(&self.library_selection, Some(LibrarySelection::Roll(_)));
+        // Remove roll is only actionable on the rolls view when a roll is
+        // selected; inside a roll (or with the add tile / nothing selected) it
+        // shows disabled on the menu.
+        let roll_selected = self.active.is_none()
+            && matches!(&self.library_selection, Some(LibrarySelection::Roll(_)));
         let remove_roll = if roll_selected {
             menu::Item::Button(fl!("menu-remove-roll"), None, MenuAction::RemoveRoll)
         } else {
@@ -1056,6 +1050,22 @@ impl cosmic::Application for AppModel {
             ),
         );
 
+        // Copy/paste edits are only actionable while a frame selection exists
+        // (a focused/highlighted frame or an open detail view); on the library
+        // page no frame is ever selected, even when a roll is. Paste
+        // additionally needs a non-empty edit clipboard to apply.
+        let frame_context = self.frame_selected.is_some() || self.selected.is_some();
+        let copy_edits = if frame_context {
+            menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits)
+        } else {
+            menu::Item::ButtonDisabled(fl!("menu-copy-edits"), None, MenuAction::CopyEdits)
+        };
+        let paste_edits = if frame_context && self.clipboard.is_some() {
+            menu::Item::Button(fl!("menu-paste-edits"), None, MenuAction::PasteEdits)
+        } else {
+            menu::Item::ButtonDisabled(fl!("menu-paste-edits"), None, MenuAction::PasteEdits)
+        };
+
         let edit_menu = menu::Tree::with_children(
             menu::root(fl!("menu-edit")).apply(Element::from),
             menu::items(
@@ -1063,23 +1073,24 @@ impl cosmic::Application for AppModel {
                 vec![
                     menu::Item::Button(fl!("menu-select-all"), None, MenuAction::SelectAll),
                     menu::Item::Divider,
-                    menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits),
-                    menu::Item::Button(fl!("menu-paste-edits"), None, MenuAction::PasteEdits),
-                    menu::Item::Divider,
-                    // Show editing panel is only actionable while a detail view
-                    // (and its editing drawer) is open.
-                    if self.selected.is_some() {
-                        menu::Item::Button(fl!("menu-show-editing"), None, MenuAction::ShowEditing)
-                    } else {
-                        menu::Item::ButtonDisabled(
-                            fl!("menu-show-editing"),
-                            None,
-                            MenuAction::ShowEditing,
-                        )
-                    },
+                    copy_edits,
+                    paste_edits,
                 ],
             ),
         );
+
+        // The generic Details item opens the context drawer: the editing panel
+        // while a detail view is open, or the roll-info drawer on the library
+        // page. It stays enabled exactly where the drawer can open — a detail
+        // view, or a roll selected on the library page (the RollInfo guards
+        // make it a no-op everywhere else).
+        let details_enabled = self.selected.is_some()
+            || (self.active.is_none() && matches!(&self.library_selection, Some(LibrarySelection::Roll(_))));
+        let details = if details_enabled {
+            menu::Item::Button(fl!("menu-details"), None, MenuAction::Details)
+        } else {
+            menu::Item::ButtonDisabled(fl!("menu-details"), None, MenuAction::Details)
+        };
 
         let view_menu = menu::Tree::with_children(
             menu::root(fl!("menu-view")).apply(Element::from),
@@ -1087,7 +1098,7 @@ impl cosmic::Application for AppModel {
                 &self.key_binds,
                 vec![
                     menu::Item::Button(fl!("about"), None, MenuAction::About),
-                    menu::Item::Button(fl!("menu-roll-info"), None, MenuAction::RollInfo),
+                    details,
                 ],
             ),
         );
@@ -1107,7 +1118,7 @@ impl cosmic::Application for AppModel {
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
         // The editing drawer is no longer toggled from a header button — it
         // opens automatically with the detail view (see `open_frame`) and is
-        // hidden/revealed by the spacebar full-screen preview — so the header
+        // hidden/revealed by the Space context-drawer toggle — so the header
         // end packs only the search control and (while a batch runs) the
         // export progress ring.
 
@@ -1261,25 +1272,16 @@ impl cosmic::Application for AppModel {
                     keyboard::key::Named::Shift => Some(Message::ModifierUp(Mod::Shift)),
                     _ => None,
                 },
-                // The spacebar carries no Named variant in this iced fork, so
-                // it arrives as a character — matched by payload. A bare
-                // space (no modifiers) toggles the full-screen preview; the
-                // handler no-ops when no detail view is open.
+                // The spacebar carries no Named variant in this iced fork, so it arrives
+                // as a character — matched by payload. A bare space (no
+                // modifiers) toggles the active page's context drawer, which
+                // replaced the old Ctrl+Space binding (the full-screen
+                // preview feature that used bare Space was removed).
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
                     modifiers,
                     ..
-                } if !modifiers.control() && character == " " => Some(Message::ToggleFullscreen),
-                // Ctrl+Space toggles the active page's context drawer (a
-                // modifying wildcard would otherwise catch the bare-space
-                // above). The page choice — editing vs roll info — is resolved
-                // in the update handler, since this closure cannot capture
-                // app state.
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if modifiers.control() && character == " " => Some(Message::ToggleContext),
+                } if !modifiers.control() && character == " " => Some(Message::ToggleContext),
                 // Ctrl+F reveals (and focuses) the search field.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
@@ -1399,13 +1401,11 @@ impl cosmic::Application for AppModel {
                     return Task::none();
                 }
                 if self.selected.is_some() {
-                    // First Escape in full-screen preview only exits full-screen
-                    // (restoring the editing drawer); a second Escape then closes
-                    // the detail view back to the grid.
-                    if self.fullscreen {
-                        self.fullscreen = false;
-                        self.context_page = ContextPage::Editing;
-                        self.core.window.show_context = true;
+                    // Escape closes an open context drawer (the editing panel)
+                    // first; the detail view itself survives until the next
+                    // Escape.
+                    if self.core.window.show_context {
+                        self.core_mut().set_show_context(false);
                         return Task::none();
                     }
                     // Close the detail view; the frame highlight survives so
@@ -1415,13 +1415,12 @@ impl cosmic::Application for AppModel {
                     // Without a selection the editing drawer has nothing to
                     // show; close it so it does not linger empty.
                     self.close_editing();
-                } else if self.frame_selected.is_some() {
-                    // No detail open: Escape first clears the grid highlight...
-                    self.frame_selected = None;
                 } else {
-                    // ...then backs out of the roll entirely, resetting every
+                    // On the bare grid there is no intermediate de-select step:
+                    // Escape backs out of the roll entirely, resetting every
                     // detail- and roll-page field so nothing from the closed
-                    // roll leaks into the library (edits were already flushed
+                    // roll leaks into the library (the frame highlight is
+                    // dropped as part of the reset; edits were already flushed
                     // by `persist_roll` at the top of this arm).
                     self.active = None;
                     self.selected = None;
@@ -1677,7 +1676,8 @@ impl cosmic::Application for AppModel {
                 }
                 self.rolls.push(roll);
                 self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
-                self.select_first_visible_roll();
+                // The selection already points at the new roll (`RollAdded`),
+                // so the card just lands alongside the others.
                 self.decode_covers()
             }
 
@@ -1695,13 +1695,23 @@ impl cosmic::Application for AppModel {
             Message::AddRoll => open_roll_picker(),
 
             Message::RollAdded(dir) => {
-                // Persist the new roll; the library page owns the roll list.
-                if self.active.is_none() && !self.rolls.iter().any(|roll| roll.dir == dir) {
+                // The library list is app-wide: persist the new roll no matter
+                // where the folder picker was invoked from.
+                if !self.rolls.iter().any(|roll| roll.dir == dir) {
                     self.config.rolls.push(dir.to_string_lossy().into_owned());
                     self.persist_config();
                 }
-                // Scan the chosen directory for its cover and display name.
-                cosmic::task::future(async move { Message::RollInfoLoaded(load_roll(dir).await) })
+                // Mark the new roll selected (the selection survives roll exit,
+                // so backing out lands on it). The cover scan for the card
+                // continues in parallel.
+                self.library_selection = Some(LibrarySelection::Roll(dir.clone()));
+                let scan_dir = dir.clone();
+                let card =
+                    cosmic::task::future(async move { Message::RollInfoLoaded(load_roll(scan_dir).await) });
+                // Drill straight into the new roll's frame grid, from wherever
+                // the app was when the roller was chosen.
+                let open = self.open_roll(dir);
+                Task::batch([card, open])
             }
 
             Message::RollSelected(dir) => {
@@ -1930,24 +1940,6 @@ impl cosmic::Application for AppModel {
                 self.decode_next()
             }
 
-            Message::ToggleFullscreen => {
-                // Full-screen preview only applies to a detail view; on the
-                // library page (or the bare grid) spacebar does nothing.
-                if self.selected.is_none() {
-                    return Task::none();
-                }
-                self.fullscreen = !self.fullscreen;
-                if self.fullscreen {
-                    // Hide the editing drawer so the preview fills the window.
-                    self.core_mut().set_show_context(false);
-                } else {
-                    // Back to the editing drawer mode.
-                    self.context_page = ContextPage::Editing;
-                    self.core.window.show_context = true;
-                }
-                Task::none()
-            }
-
             Message::ToggleContextPage(context_page) => {
                 // The metadata drawer needs a library *roll* selection; without
                 // one (no selection, or the Add Roll tile) the toggle is a no-op
@@ -1971,7 +1963,7 @@ impl cosmic::Application for AppModel {
             }
 
             Message::ToggleContext => {
-                // The default context-drawer toggle (Ctrl+Space) opens the
+                // The default context-drawer toggle (bare Space) opens the
                 // editing panel while a detail view is open, or the roll-info
                 // drawer on the library page. Delegate to the page-specific
                 // toggles so their guards (e.g. a roll selection for roll info)
@@ -2241,7 +2233,7 @@ impl AppModel {
         }
 
         // The editing drawer stays hidden on a fresh open; the user brings it
-        // up with Ctrl+Space or the Edit → Show editing panel menu when they
+        // up with Space or the View → Details… menu when they
         // want the controls. A same-session paging to a neighbour file likewise
         // leaves whatever context state is current untouched.
 
@@ -2798,8 +2790,6 @@ impl AppModel {
         self.reset_curve_shadows = 1.0;
         self.reset_crop = edit_manifest::CropMargins::default();
         self.reset_rotation = 0;
-        // The full-screen preview dies with the detail view it belongs to.
-        self.fullscreen = false;
     }
 
     /// Writes the in-memory roll edits to the open roll's manifest file on disk.
@@ -5837,10 +5827,9 @@ pub enum MenuAction {
     SelectAll,
     CopyEdits,
     PasteEdits,
-    ShowEditing,
     Export,
     About,
-    RollInfo,
+    Details,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -5854,10 +5843,9 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::SelectAll => Message::SelectAllFrames,
             MenuAction::CopyEdits => Message::CopyEdits,
             MenuAction::PasteEdits => Message::PasteEdits,
-            MenuAction::ShowEditing => Message::ToggleContextPage(ContextPage::Editing),
             MenuAction::Export => Message::ExportRequested,
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
-            MenuAction::RollInfo => Message::ToggleContextPage(ContextPage::RollInfo),
+            MenuAction::Details => Message::ToggleContext,
         }
     }
 }
