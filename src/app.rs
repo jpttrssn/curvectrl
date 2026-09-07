@@ -3,14 +3,14 @@
 use crate::config::Config;
 use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
-use crate::shader;
 use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
 use crate::fl;
+use crate::shader;
 use cosmic::Application;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
-use cosmic::iced::futures::SinkExt;
 use cosmic::iced::alignment::{Horizontal, Vertical};
+use cosmic::iced::futures::SinkExt;
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
@@ -328,14 +328,16 @@ impl CropDrafts {
     }
 }
 
-/// The selectable cell on the library page: either the always-first Add Roll
-/// tile or a real roll. Modeling both with a single type makes the selection,
-/// highlight, keyboard navigation, and the open action uniform across the grid
-/// — the add tile is selected and Entered exactly like a roll card.
+/// The selectable cell on the library page: either the leading Add Roll tile
+/// (shown only while no search is active) or a real roll. Modeling both with a
+/// single type makes the selection, highlight, keyboard navigation, and the
+/// open action uniform across the grid — the add tile is selected and Entered
+/// exactly like a roll card.
 #[derive(Debug, Clone, PartialEq)]
 enum LibrarySelection {
-    /// The Add Roll tile (grid cell 0). Enter / double-click opens the folder
-    /// picker; it has no directory or metadata of its own.
+    /// The Add Roll tile (grid cell 0 while no search is active). Enter /
+    /// double-click opens the folder picker; it has no directory or metadata
+    /// of its own.
     AddRoll,
     /// A real roll card, by its directory.
     Roll(PathBuf),
@@ -1095,7 +1097,8 @@ impl cosmic::Application for AppModel {
         // cosmic runtime — matching how cosmic-files wires its menu bar.
         let menu_bar = menu::bar(vec![file_menu, edit_menu, view_menu])
             .window_id_maybe(self.core().main_window_id())
-            .on_surface_action(Message::Surface);
+            .on_surface_action(Message::Surface)
+            .item_width(menu::ItemWidth::Uniform(250));
 
         vec![menu_bar.into()]
     }
@@ -1134,7 +1137,8 @@ impl cosmic::Application for AppModel {
         // shows which frame the batch is on.
         let mut end = vec![search];
         if let Some((done, total)) = self.export_progress {
-            let ring = cosmic::widget::determinate_circular(export_fraction(done, total)).size(18.0);
+            let ring =
+                cosmic::widget::determinate_circular(export_fraction(done, total)).size(18.0);
             let ring = cosmic::widget::tooltip(
                 ring,
                 widget::text(fl!("export-progress", done = done, total = total)),
@@ -1335,7 +1339,8 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if !modifiers.control()
-                    && edit_adjust_for(character.as_str(), modifiers.alt(), modifiers.shift()).is_some() =>
+                    && edit_adjust_for(character.as_str(), modifiers.alt(), modifiers.shift())
+                        .is_some() =>
                 {
                     Some(Message::EditKeyReleased)
                 }
@@ -1662,6 +1667,7 @@ impl cosmic::Application for AppModel {
                         self.core_mut().set_show_context(false);
                     }
                 }
+                self.select_first_visible_roll();
                 self.decode_covers()
             }
 
@@ -1671,6 +1677,7 @@ impl cosmic::Application for AppModel {
                 }
                 self.rolls.push(roll);
                 self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
+                self.select_first_visible_roll();
                 self.decode_covers()
             }
 
@@ -1780,9 +1787,10 @@ impl cosmic::Application for AppModel {
                 }
 
                 // Library grid: move the selection over every visible cell —
-                // the always-first Add Roll tile, then the filtered rolls — and
-                // reveal it out of the viewport. The add tile is always a valid
-                // destination, so there is no empty-match early return.
+                // the leading Add Roll tile (only when no search is active),
+                // then the filtered rolls — and reveal it out of the viewport.
+                // While a search is active the Add Roll tile is hidden, so an
+                // empty match set yields no destination at all.
                 let cells = library_cells(&self.rolls, self.search.as_deref().unwrap_or(""));
                 let selected = library_cell_index(self.library_selection.as_ref(), &cells);
                 let len = cells.len();
@@ -1869,6 +1877,19 @@ impl cosmic::Application for AppModel {
                         thumb: Thumb::Loading,
                     })
                     .collect();
+
+                // Pre-select the first visible frame so the grid always has a
+                // highlight (the detail view stays closed; Enter opens it).
+                if let Some(first) =
+                    filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""))
+                        .into_iter()
+                        .next()
+                {
+                    self.frame_selected = Some(first.name.clone());
+                    self.selected_frames.clear();
+                    self.selected_frames.insert(first.name.clone());
+                    self.selection_anchor = Some(first.name.clone());
+                }
 
                 self.decode_next()
             }
@@ -2042,7 +2063,12 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::ExportDone { ok, skipped, failed, dest } => {
+            Message::ExportDone {
+                ok,
+                skipped,
+                failed,
+                dest,
+            } => {
                 // The batch is over: hide the header ring before the summary
                 // toast lands.
                 self.export_progress = None;
@@ -2084,9 +2110,7 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::PasteEdits => {
-                self.paste_edits()
-            }
+            Message::PasteEdits => self.paste_edits(),
 
             Message::Quit => {
                 // Flush any in-progress edit to disk, then ask the window to
@@ -2127,6 +2151,23 @@ impl AppModel {
             self.set_window_title(fl!("app-title"), id)
         } else {
             Task::none()
+        }
+    }
+
+    /// Ensures the library page always has a selection once rolls exist:
+    /// whenever nothing is selected, highlight the first visible roll
+    /// (respecting an active search). No-op while a roll is open, while no roll
+    /// is visible, or when a selection already exists.
+    fn select_first_visible_roll(&mut self) {
+        if self.active.is_some() || self.library_selection.is_some() {
+            return;
+        }
+        let cells = library_cells(&self.rolls, self.search.as_deref().unwrap_or(""));
+        if let Some(LibraryCell::Roll(roll)) = cells
+            .iter()
+            .find(|cell| matches!(cell, LibraryCell::Roll(_)))
+        {
+            self.library_selection = Some(LibrarySelection::Roll(roll.dir.clone()));
         }
     }
 
@@ -2230,8 +2271,7 @@ impl AppModel {
 
     /// Whether [`Self::export_targets`] would yield at least one frame.
     fn has_export_targets(&self) -> bool {
-        self.active.is_some()
-            && (self.frame_selected.is_some() || !self.selected_frames.is_empty())
+        self.active.is_some() && (self.frame_selected.is_some() || !self.selected_frames.is_empty())
     }
 
     /// Exports every target frame into `dest`, one file per frame named
@@ -2241,7 +2281,11 @@ impl AppModel {
     /// header ring) plus a final [`Message::ExportDone`] summary, which clears
     /// the ring. Edits are read from the in-memory manifest — the same source
     /// the grid and detail view render from.
-    fn begin_export(&mut self, dest: PathBuf, options: ExportOptions) -> Task<cosmic::Action<Message>> {
+    fn begin_export(
+        &mut self,
+        dest: PathBuf,
+        options: ExportOptions,
+    ) -> Task<cosmic::Action<Message>> {
         let Some(dir) = self.active.clone() else {
             return Task::none();
         };
@@ -2260,7 +2304,12 @@ impl AppModel {
         // manifest the grid and detail view render from, so an export always
         // matches what is on screen — even for an edit that has been applied
         // but not yet flushed to the on-disk manifest.
-        let frames: Vec<(String, edit_manifest::ToneEdit, edit_manifest::CropMargins, u8)> = names
+        let frames: Vec<(
+            String,
+            edit_manifest::ToneEdit,
+            edit_manifest::CropMargins,
+            u8,
+        )> = names
             .into_iter()
             .map(|name| {
                 let tone = self.roll.tone(&name);
@@ -2281,7 +2330,8 @@ impl AppModel {
             let mut tick = |done: usize, _total: usize| {
                 let _ = sender.try_send(Message::ExportProgress { done, total });
             };
-            let (ok, skipped, failed) = export_frames(dir, dest.clone(), frames, options, &mut tick).await;
+            let (ok, skipped, failed) =
+                export_frames(dir, dest.clone(), frames, options, &mut tick).await;
             let _ = sender
                 .send(Message::ExportDone {
                     ok,
@@ -2425,18 +2475,19 @@ impl AppModel {
         rebake_trace(format_args!(
             "decode_next: spawning {} [{:?}]",
             pending.len(),
-            pending
-                .iter()
-                .map(|(n, ..)| n.as_str())
-                .collect::<Vec<_>>()
+            pending.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
         ));
 
         self.thumb_inflight
             .extend(pending.iter().map(|(name, ..)| name.clone()));
 
-        Task::batch(pending.into_iter().map(move |(name, tone, crop, rotation)| {
-            cosmic::task::future(decode_thumbnail(dir.clone(), name, tone, crop, rotation))
-        }))
+        Task::batch(
+            pending
+                .into_iter()
+                .map(move |(name, tone, crop, rotation)| {
+                    cosmic::task::future(decode_thumbnail(dir.clone(), name, tone, crop, rotation))
+                }),
+        )
     }
 
     /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] roll-cover
@@ -2492,9 +2543,11 @@ impl AppModel {
         }
         tasks.push(self.decode_next());
         if let Some(active) = self.active.as_ref() {
-            let Some(roll) = self.rolls.iter_mut().find(|roll| {
-                roll.dir == *active && roll.cover.as_deref() == Some(name.as_str())
-            }) else {
+            let Some(roll) = self
+                .rolls
+                .iter_mut()
+                .find(|roll| roll.dir == *active && roll.cover.as_deref() == Some(name.as_str()))
+            else {
                 return Task::batch(tasks);
             };
             roll.thumb = Thumb::Loading;
@@ -3007,6 +3060,9 @@ impl AppModel {
                 self.core_mut().set_show_context(false);
             }
         }
+        // Keep a selection alive: fall back to the first remaining roll when
+        // more exist.
+        self.select_first_visible_roll();
         Task::none()
     }
 
@@ -3296,13 +3352,18 @@ impl LibraryCell<'_> {
 /// then the rolls whose name matches the query. Since the add tile is always
 /// present, the returned slice is never empty.
 fn library_cells<'a>(rolls: &'a [Roll], query: &str) -> Vec<LibraryCell<'a>> {
-    std::iter::once(LibraryCell::AddRoll)
-        .chain(
-            filtered_rolls(rolls, query)
-                .into_iter()
-                .map(LibraryCell::Roll),
-        )
-        .collect()
+    // The Add Roll tile leads the grid only while no search is active: while
+    // searching, only the matching rolls are shown (and `cells` may be empty).
+    let mut cells: Vec<LibraryCell<'a>> = Vec::with_capacity(rolls.len().saturating_add(1));
+    if query.trim().is_empty() {
+        cells.push(LibraryCell::AddRoll);
+    }
+    cells.extend(
+        filtered_rolls(rolls, query)
+            .into_iter()
+            .map(LibraryCell::Roll),
+    );
+    cells
 }
 
 /// The index of `selection` within `cells`, if it names a cell in the set.
@@ -3333,7 +3394,6 @@ fn open_roll_picker() -> Task<cosmic::Action<Message>> {
         }
     })
 }
-
 
 /// The exported file name for a frame: the source file name with its extension
 /// replaced by the format's (e.g. `img_0001.cr2` → `img_0001.jpg` or
@@ -3370,7 +3430,6 @@ fn export_fraction(done: usize, total: usize) -> f32 {
         done as f32 / total as f32
     }
 }
-
 
 /// The index arrow-key navigation moves the selection to: `selected` as an
 /// index into the visible cells (None = nothing selected yet), `len` visible
@@ -3532,7 +3591,6 @@ fn reveal_target_y(
     Some(target.clamp(0.0, max))
 }
 
-
 /// Renders the library page: a responsive grid of selectable cells. The Add
 /// Roll tile is always the first cell; when no rolls (or no matches) remain, a
 /// centered hint overlays the empty space beside the still-present add tile.
@@ -3541,8 +3599,8 @@ fn library_view(app: &AppModel) -> Element<'_, Message> {
 
     let cells = library_cells(&app.rolls, app.search.as_deref().unwrap_or(""));
     let selected_index = library_cell_index(app.library_selection.as_ref(), &cells);
-    // The hint overlays only when no real roll remains (the add tile is always
-    // present, so `cells` can never be empty on its own).
+    // The hint overlays only when a search filters every real roll away (the
+    // Add Roll tile is hidden while searching, so `cells` can be empty).
     let empty = !cells
         .iter()
         .any(|cell| matches!(cell, LibraryCell::Roll(_)));
@@ -3565,21 +3623,19 @@ fn library_view(app: &AppModel) -> Element<'_, Message> {
         .on_scroll(Message::GridViewport)
         .height(Length::Fill);
 
-    if !empty {
+    // A truly empty library shows no hint (the Add Roll tile alone is
+    // self-explanatory), and a grid with matching rolls shows none either —
+    // only the search-mismatch case (rolls exist but none match) overlays.
+    if app.rolls.is_empty() || !empty {
         return body.into();
     }
 
-    // Nothing matches: keep the add tile visible and hint at the result over
-    // the space the grid leaves empty.
-    let hint = widget::container(widget::text(if app.rolls.is_empty() {
-        fl!("no-rolls")
-    } else {
-        fl!("no-rolls-found")
-    }))
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .align_x(Horizontal::Center)
-    .align_y(Vertical::Center);
+    // Nothing matches: keep the hint over the space the grid leaves empty.
+    let hint = widget::container(widget::text(fl!("no-rolls-found")))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center);
 
     let mut page = Stack::with_capacity(2);
     page = page.push(body);
@@ -3732,10 +3788,26 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // the perpendicular pair to preserve the aspect ratio, matching the
     // keyboard trim. The fields are seeded from the draft strings (not the
     // committed margins) so typing doesn't fight the read-only view.
-    let crop_top = crop_margin_field(fl!("crop-top"), app.crop_drafts.get(edit_manifest::CropDirection::Top), edit_manifest::CropDirection::Top);
-    let crop_right = crop_margin_field(fl!("crop-right"), app.crop_drafts.get(edit_manifest::CropDirection::Right), edit_manifest::CropDirection::Right);
-    let crop_bottom = crop_margin_field(fl!("crop-bottom"), app.crop_drafts.get(edit_manifest::CropDirection::Bottom), edit_manifest::CropDirection::Bottom);
-    let crop_left = crop_margin_field(fl!("crop-left"), app.crop_drafts.get(edit_manifest::CropDirection::Left), edit_manifest::CropDirection::Left);
+    let crop_top = crop_margin_field(
+        fl!("crop-top"),
+        app.crop_drafts.get(edit_manifest::CropDirection::Top),
+        edit_manifest::CropDirection::Top,
+    );
+    let crop_right = crop_margin_field(
+        fl!("crop-right"),
+        app.crop_drafts.get(edit_manifest::CropDirection::Right),
+        edit_manifest::CropDirection::Right,
+    );
+    let crop_bottom = crop_margin_field(
+        fl!("crop-bottom"),
+        app.crop_drafts.get(edit_manifest::CropDirection::Bottom),
+        edit_manifest::CropDirection::Bottom,
+    );
+    let crop_left = crop_margin_field(
+        fl!("crop-left"),
+        app.crop_drafts.get(edit_manifest::CropDirection::Left),
+        edit_manifest::CropDirection::Left,
+    );
     let crop_hint = widget::text(fl!("crop-hint"));
     // View-only toggle: on shows the full uncropped frame on top of the zoomed
     // crop with everything outside the crop dimmed (to see where the crop
@@ -3749,8 +3821,7 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // same step through the edit-key machinery; the button commits on press.
     let rotate_label = widget::text(fl!("orientation-label"));
     let rotate_readout = widget::text(format!("{}°", u32::from(app.rotation) * 90));
-    let rotate_button =
-        widget::button::standard(fl!("rotate-ccw")).on_press(Message::RotateCcw);
+    let rotate_button = widget::button::standard(fl!("rotate-ccw")).on_press(Message::RotateCcw);
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
@@ -3777,10 +3848,12 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(rotate_label)
         .push(rotate_readout)
         .push(rotate_button)
-        .push(widget::row::with_capacity(2)
-            .push(reset_all)
-            .push(reset_crop)
-            .spacing(space_s))
+        .push(
+            widget::row::with_capacity(2)
+                .push(reset_all)
+                .push(reset_crop)
+                .spacing(space_s),
+        )
         .spacing(space_s)
         .width(Length::Fill)
         .into()
@@ -4328,9 +4401,10 @@ fn crop_limits(width: u32, height: u32) -> (f64, u32, u32) {
     // rounding of the perpendicular pair never collides with the edge.
     const MIN_LEFT: u32 = 2;
     let ar = f64::from(width) / f64::from(height.max(1));
-    let sum_limit_vertical = ((((f64::from(width) - f64::from(MIN_LEFT)) / ar).floor()
+    let sum_limit_vertical = ((((f64::from(width) - f64::from(MIN_LEFT)) / ar)
+        .floor()
         .min(f64::from(height) - f64::from(MIN_LEFT)))
-        .max(0.0)) as u32;
+    .max(0.0)) as u32;
     let sum_limit_horizontal = (((f64::from(height) - f64::from(MIN_LEFT)) * ar)
         .floor()
         .min(f64::from(width) - f64::from(MIN_LEFT))
@@ -4359,7 +4433,12 @@ fn recenter_perpendicular(
             (total / 2, crop.right, total - total / 2, crop.left)
         }
     };
-    edit_manifest::CropMargins { top: t, right: r, bottom: b, left: l }
+    edit_manifest::CropMargins {
+        top: t,
+        right: r,
+        bottom: b,
+        left: l,
+    }
 }
 
 /// Clamps a single edge margin after applying `delta_px`, keeping the edge in
@@ -4368,9 +4447,7 @@ fn recenter_perpendicular(
 fn clamp_axis(edge: u32, opposite: u32, delta_px: i32, sum_limit: u32) -> u32 {
     let max = sum_limit.saturating_sub(opposite);
     let raw = i64::from(edge) + i64::from(delta_px);
-    raw.clamp(0, i64::from(max))
-        .try_into()
-        .unwrap_or(u32::MAX)
+    raw.clamp(0, i64::from(max)).try_into().unwrap_or(u32::MAX)
 }
 
 /// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
@@ -4399,11 +4476,7 @@ fn edit_adjust_for(key: &str, alt: bool, shift: bool) -> Option<EditAdjust> {
         EDIT_STEP_CURVE
     };
     let crop = |direction| {
-        let step = if shift {
-            CROP_NUDGE_PX
-        } else {
-            CROP_STEP_PX
-        };
+        let step = if shift { CROP_NUDGE_PX } else { CROP_STEP_PX };
         let delta = if alt { -step } else { step };
         EditAdjust::Crop { direction, delta }
     };
@@ -4565,7 +4638,12 @@ async fn decode_raw_detail(
 async fn export_frames(
     dir: PathBuf,
     dest: PathBuf,
-    frames: Vec<(String, edit_manifest::ToneEdit, edit_manifest::CropMargins, u8)>,
+    frames: Vec<(
+        String,
+        edit_manifest::ToneEdit,
+        edit_manifest::CropMargins,
+        u8,
+    )>,
     options: ExportOptions,
     mut progress: impl FnMut(usize, usize) + Send,
 ) -> (usize, usize, usize) {
@@ -4600,7 +4678,11 @@ async fn export_frames(
 /// exposure, crop, and display rotation are baked into the pixels — the same
 /// edit pipeline as the detail view and thumbnails, just at the chosen scale
 /// (the overview/native downscale is skipped for `Original`).
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 async fn export_one(
     dir: PathBuf,
     name: String,
@@ -5236,11 +5318,7 @@ fn scale_crop(
 /// The display-upright dimensions of a sensor whose post-masked-border dims
 /// are `(cw, ch)`: any orientation that swaps the print axes (90°/270°
 /// rotation, transpose) maps the display horizontal onto the sensor vertical.
-fn display_source_dims(
-    cw: u32,
-    ch: u32,
-    orientation: rawloader::Orientation,
-) -> (u32, u32) {
+fn display_source_dims(cw: u32, ch: u32, orientation: rawloader::Orientation) -> (u32, u32) {
     use rawloader::Orientation;
     match orientation {
         Orientation::Rotate90
@@ -5834,15 +5912,24 @@ mod tests {
         // Rolls follow in filtered order.
         assert!(matches!(cells[1], LibraryCell::Roll(r) if r.name == "Alpha"));
         assert!(matches!(cells[2], LibraryCell::Roll(r) if r.name == "Beta"));
+        // A whitespace-only query is an inactive search: the add tile stays.
+        assert_eq!(library_cells(&rolls, "   ").len(), 3);
     }
 
     #[test]
-    fn library_cells_never_empty_even_with_no_matches() {
-        // No rolls at all: still the add tile.
+    fn library_cells_hide_the_add_tile_while_searching() {
+        let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
+
+        // A non-empty query drops the Add Roll tile: only matches remain.
+        let cells = library_cells(&rolls, "beta");
+        assert_eq!(cells.len(), 1);
+        assert!(matches!(cells[0], LibraryCell::Roll(r) if r.name == "Beta"));
+
+        // A query matching nothing yields an entirely empty cell set.
+        let cells = library_cells(&rolls, "zzz");
+        assert!(cells.is_empty());
+        // No rolls at all: still the add tile while idle.
         assert_eq!(library_cells(&[], "").len(), 1);
-        // A query matching nothing still yields the add tile.
-        let rolls = vec![roll("/a", "Alpha")];
-        assert_eq!(library_cells(&rolls, "zzz").len(), 1);
     }
 
     #[test]
@@ -6629,31 +6716,52 @@ mod tests {
         // more (+step); Alt trims less (−step); Shift(+Alt) nudges by 1px.
         assert_eq!(
             edit_adjust_for("h", false, false),
-            Some(EditAdjust::Crop { direction: Left, delta: CROP_STEP_PX })
+            Some(EditAdjust::Crop {
+                direction: Left,
+                delta: CROP_STEP_PX
+            })
         );
         assert_eq!(
             edit_adjust_for("j", false, false),
-            Some(EditAdjust::Crop { direction: Bottom, delta: CROP_STEP_PX })
+            Some(EditAdjust::Crop {
+                direction: Bottom,
+                delta: CROP_STEP_PX
+            })
         );
         assert_eq!(
             edit_adjust_for("k", false, false),
-            Some(EditAdjust::Crop { direction: Top, delta: CROP_STEP_PX })
+            Some(EditAdjust::Crop {
+                direction: Top,
+                delta: CROP_STEP_PX
+            })
         );
         assert_eq!(
             edit_adjust_for("l", false, false),
-            Some(EditAdjust::Crop { direction: Right, delta: CROP_STEP_PX })
+            Some(EditAdjust::Crop {
+                direction: Right,
+                delta: CROP_STEP_PX
+            })
         );
         assert_eq!(
             edit_adjust_for("h", true, false),
-            Some(EditAdjust::Crop { direction: Left, delta: -CROP_STEP_PX })
+            Some(EditAdjust::Crop {
+                direction: Left,
+                delta: -CROP_STEP_PX
+            })
         );
         assert_eq!(
             edit_adjust_for("h", false, true),
-            Some(EditAdjust::Crop { direction: Left, delta: CROP_NUDGE_PX })
+            Some(EditAdjust::Crop {
+                direction: Left,
+                delta: CROP_NUDGE_PX
+            })
         );
         assert_eq!(
             edit_adjust_for("h", true, true),
-            Some(EditAdjust::Crop { direction: Left, delta: -CROP_NUDGE_PX })
+            Some(EditAdjust::Crop {
+                direction: Left,
+                delta: -CROP_NUDGE_PX
+            })
         );
     }
 
@@ -6724,7 +6832,10 @@ mod tests {
         // (w − left − right) / (h − top − bottom) must equal w / h, non-degenerate.
         let cw = m.cropped_width(w);
         let ch = m.cropped_height(h);
-        assert!(cw > 0 && ch > 0, "crop collapses to a degenerate frame: {m:?}");
+        assert!(
+            cw > 0 && ch > 0,
+            "crop collapses to a degenerate frame: {m:?}"
+        );
         let left = f64::from(m.left);
         let right = f64::from(m.right);
         let top = f64::from(m.top);
@@ -6919,17 +7030,30 @@ mod tests {
     #[test]
     fn set_crop_edge_zeroes_to_identity() {
         for dir in [Dir::Top, Dir::Bottom, Dir::Left, Dir::Right] {
-            assert_eq!(set_crop_edge(Marg::default(), dir, 0, 400, 300), Marg::default());
+            assert_eq!(
+                set_crop_edge(Marg::default(), dir, 0, 400, 300),
+                Marg::default()
+            );
         }
     }
 
     #[test]
     fn scale_crop_scales_margins_onto_the_print() {
         // 4000x2000 source printed at 400x200 scales each axis by 1/10.
-        let crop = Marg { top: 10, right: 20, bottom: 30, left: 40 };
+        let crop = Marg {
+            top: 10,
+            right: 20,
+            bottom: 30,
+            left: 40,
+        };
         assert_eq!(
             scale_crop(crop, 4000, 2000, 400, 200),
-            Marg { top: 1, right: 2, bottom: 3, left: 4 }
+            Marg {
+                top: 1,
+                right: 2,
+                bottom: 3,
+                left: 4
+            }
         );
     }
 
@@ -6939,12 +7063,22 @@ mod tests {
         // (400 wide, 2000 tall): the caller resolves those display dims before
         // scaling, so the print's horizontal axis (400) maps to the source
         // horizontal and the vertical margins compress by 400→200 / 2000.
-        let crop = Marg { top: 10, right: 20, bottom: 30, left: 40 };
+        let crop = Marg {
+            top: 10,
+            right: 20,
+            bottom: 30,
+            left: 40,
+        };
         let (disp_w, disp_h) = display_source_dims(2000, 400, rawloader::Orientation::Rotate90);
         assert_eq!((disp_w, disp_h), (400, 2000));
         assert_eq!(
             scale_crop(crop, disp_w, disp_h, 400, 200),
-            Marg { top: 1, right: 20, bottom: 3, left: 40 }
+            Marg {
+                top: 1,
+                right: 20,
+                bottom: 3,
+                left: 40
+            }
         );
     }
 
@@ -6979,11 +7113,18 @@ mod tests {
         // remove ≈ 6.4 print px per side — NOT ~1 px, which is what happens
         // when the crop is instead treated as overview-texture pixels and the
         // bake scales it against the full sensor.
-        let crop = Marg { top: 0, right: 100, bottom: 0, left: 100 };
-        let (disp_w, disp_h) =
-            display_source_dims(6000, 4000, rawloader::Orientation::Normal);
+        let crop = Marg {
+            top: 0,
+            right: 100,
+            bottom: 0,
+            left: 100,
+        };
+        let (disp_w, disp_h) = display_source_dims(6000, 4000, rawloader::Orientation::Normal);
         let scaled = scale_crop(crop, disp_w, disp_h, 384, 256);
-        assert_eq!((scaled.left, scaled.right, scaled.top, scaled.bottom), (6, 6, 0, 0));
+        assert_eq!(
+            (scaled.left, scaled.right, scaled.top, scaled.bottom),
+            (6, 6, 0, 0)
+        );
     }
 
     #[test]
@@ -6992,13 +7133,20 @@ mod tests {
         // horizontal in source vertical terms — resolved display dims handle
         // the swap, so the same 100-px side crop and a 100-px top trim land at
         // the same print fractions as the landscape case.
-        let crop = Marg { top: 100, right: 100, bottom: 0, left: 0 };
-        let (disp_w, disp_h) =
-            display_source_dims(6000, 4000, rawloader::Orientation::Rotate90);
+        let crop = Marg {
+            top: 100,
+            right: 100,
+            bottom: 0,
+            left: 0,
+        };
+        let (disp_w, disp_h) = display_source_dims(6000, 4000, rawloader::Orientation::Rotate90);
         assert_eq!((disp_w, disp_h), (4000, 6000));
         // Portrait print of a 6000-long sensor at THUMB_SIZE: 256x384.
         let scaled = scale_crop(crop, disp_w, disp_h, 256, 384);
-        assert_eq!((scaled.left, scaled.right, scaled.top, scaled.bottom), (0, 6, 6, 0));
+        assert_eq!(
+            (scaled.left, scaled.right, scaled.top, scaled.bottom),
+            (0, 6, 6, 0)
+        );
     }
 
     #[test]
@@ -7008,7 +7156,12 @@ mod tests {
         for p in 0..16u8 {
             rgba.extend_from_slice(&[p, p, p, 255]);
         }
-        let crop = Marg { top: 1, right: 1, bottom: 1, left: 1 };
+        let crop = Marg {
+            top: 1,
+            right: 1,
+            bottom: 1,
+            left: 1,
+        };
         let (out, w, h) = crop_rgba(rgba, 4, 4, crop);
         assert_eq!((w, h), (2, 2));
         assert_eq!(&out[0..4], &[5, 5, 5, 255], "top-left = source row1 col1");
@@ -7028,7 +7181,12 @@ mod tests {
     #[test]
     fn crop_rgba_rejects_an_overrunning_crop_unchanged() {
         let rgba: Vec<u8> = (0..4u8).flat_map(|p| [p, p, p, 255]).collect();
-        let crop = Marg { top: 0, right: 0, bottom: 0, left: 100 };
+        let crop = Marg {
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 100,
+        };
         let (out, w, h) = crop_rgba(rgba.clone(), 2, 2, crop);
         assert_eq!((w, h), (2, 2));
         assert_eq!(out, rgba);
@@ -7045,7 +7203,11 @@ mod tests {
         let (out, w, h) = rotate_quarters(rgba.clone(), 2, 2, 1);
         assert_eq!((w, h), (2, 2));
         assert_eq!(&out[0..4], &[1, 1, 1, 255], "top-left = source top-right");
-        assert_eq!(&out[8..12], &[0, 0, 0, 255], "bottom-left = source top-left");
+        assert_eq!(
+            &out[8..12],
+            &[0, 0, 0, 255],
+            "bottom-left = source top-left"
+        );
         // Two turns: pure 180° reversal, dims unchanged.
         let (out, w, h) = rotate_quarters(rgba.clone(), 2, 2, 2);
         assert_eq!((w, h), (2, 2));
@@ -7073,10 +7235,26 @@ mod tests {
         assert_eq!((w, h), (2, 3), "odd turn swaps the print dims");
         // Output grid (2 wide × 3 tall): source 0 1 2 / 3 4 5 rotates CCW to
         // 2 5 / 1 4 / 0 3. Mapping: source (x,y) → output (ox=y, oy=w−1−x).
-        assert_eq!(&out[0..4], &[2, 2, 2, 255], "output top-left = source top-right");
-        assert_eq!(&out[4..8], &[5, 5, 5, 255], "output top-right = source bottom-right");
-        assert_eq!(&out[8..12], &[1, 1, 1, 255], "output middle-left = source mid top");
-        assert_eq!(&out[16..20], &[0, 0, 0, 255], "output bottom-left = source top-left");
+        assert_eq!(
+            &out[0..4],
+            &[2, 2, 2, 255],
+            "output top-left = source top-right"
+        );
+        assert_eq!(
+            &out[4..8],
+            &[5, 5, 5, 255],
+            "output top-right = source bottom-right"
+        );
+        assert_eq!(
+            &out[8..12],
+            &[1, 1, 1, 255],
+            "output middle-left = source mid top"
+        );
+        assert_eq!(
+            &out[16..20],
+            &[0, 0, 0, 255],
+            "output bottom-left = source top-left"
+        );
         // Compose with a crop: quarter-turn the result of cropping a 3×3 frame
         // to its 1-px margins (a 1×1 center pixel), like the bake's
         // crop-then-rotate ordering.
@@ -7084,8 +7262,17 @@ mod tests {
         for p in 0..9u8 {
             rgba.extend_from_slice(&[p, p, p, 255]);
         }
-        let (cropped, cw, ch) =
-            crop_rgba(rgba.clone(), 3, 3, Marg { top: 1, right: 1, bottom: 1, left: 1 });
+        let (cropped, cw, ch) = crop_rgba(
+            rgba.clone(),
+            3,
+            3,
+            Marg {
+                top: 1,
+                right: 1,
+                bottom: 1,
+                left: 1,
+            },
+        );
         assert_eq!((cw, ch), (1, 1));
         let (out, w, h) = rotate_quarters(cropped, cw, ch, 1);
         assert_eq!((w, h), (1, 1));
@@ -7265,7 +7452,9 @@ mod tests {
         std::fs::remove_file(&dest).ok();
         assert_eq!(result, Ok(()));
 
-        let expected = [b'J', b'F', b'I', b'F', 0x00, 0x01, 0x02, 0x01, 0x00, 0x48, 0x00, 0x48];
+        let expected = [
+            b'J', b'F', b'I', b'F', 0x00, 0x01, 0x02, 0x01, 0x00, 0x48, 0x00, 0x48,
+        ];
         assert!(
             bytes.windows(expected.len()).any(|w| w == expected),
             "JFIF header must tag 72 dpi"
