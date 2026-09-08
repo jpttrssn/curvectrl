@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use crate::film::FilmPreset;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -169,6 +170,10 @@ pub struct RollManifest {
     /// Edits keyed by file name within the roll.
     #[serde(default)]
     pub edits: HashMap<String, EditData>,
+    /// The roll's film-inversion preset, stored as its choice key. Absent means
+    /// the default [`FilmPreset::None`] (a non-negative/regular-RAW roll).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 impl Default for RollManifest {
@@ -177,6 +182,7 @@ impl Default for RollManifest {
             version: 5,
             name: None,
             edits: HashMap::new(),
+            preset: None,
         }
     }
 }
@@ -315,9 +321,33 @@ impl RollManifest {
                 name.to_owned(),
                 EditData {
                     rotation,
-                    ..EditData::default()
+                    ..Default::default()
                 },
             );
+        }
+    }
+
+    /// The film-inversion preset recorded for this roll. A manifest with no
+    /// preset key recorded (or an unknown key) falls back to the default
+    /// [`FilmPreset::None`].
+    #[must_use]
+    pub fn preset(&self) -> FilmPreset {
+        self.preset
+            .as_deref()
+            .map_or_else(FilmPreset::default, FilmPreset::from_key)
+    }
+
+    /// Records the film-inversion preset for the roll. Only a non-default
+    /// preset is written: [`FilmPreset::Hp5Plus`] stores its choice key,
+    /// [`FilmPreset::None`] clears it back to the implicit default (the key
+    /// disappears on the next save, which keeps the default manifest clean for
+    /// raw scans).
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_preset(&mut self, preset: FilmPreset) {
+        match preset {
+            FilmPreset::Hp5Plus => self.preset = Some(preset.choice_key().to_owned()),
+            FilmPreset::None => self.preset = None,
         }
     }
 }
@@ -832,5 +862,78 @@ mod tests {
         manifest.set_crop("a.DNG", crop);
         assert_eq!(manifest.edits.len(), 1);
         assert_eq!(manifest.crop("a.DNG"), crop);
+    }
+
+    #[test]
+    fn preset_absent_loads_default_none() {
+        // A manifest predating the preset field (or a default roll) renders as
+        // a non-inverted scan: nothing recorded → FilmPreset::None.
+        let mut manifest = RollManifest::default();
+        assert_eq!(manifest.preset(), FilmPreset::None);
+
+        manifest.set_exposure("a.DNG", 0.5);
+        assert_eq!(manifest.preset(), FilmPreset::None);
+
+        let dir = temp_dir("preset-absent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(manifest_path(&dir), "version = 5\n").unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.preset(), FilmPreset::None);
+    }
+
+    #[test]
+    fn preset_round_trips_non_default_and_coexists_with_edits() {
+        let dir = temp_dir("preset-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_preset(FilmPreset::Hp5Plus);
+        manifest.set_exposure("IMG_0001.DNG", 0.42);
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
+    }
+
+    #[test]
+    fn set_preset_default_clears_the_stored_key() {
+        let mut manifest = RollManifest::default();
+        manifest.set_preset(FilmPreset::Hp5Plus);
+        assert_eq!(manifest.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(manifest.preset.as_deref(), Some("hp5"));
+
+        // Switching back to the default clears the key so a save omits it.
+        manifest.set_preset(FilmPreset::None);
+        assert_eq!(manifest.preset(), FilmPreset::None);
+        assert_eq!(manifest.preset, None);
+    }
+
+    #[test]
+    fn unknown_preset_key_resolves_to_default() {
+        let dir = temp_dir("preset-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(manifest_path(&dir), "version = 5\npreset = \"delta\"\n").unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.preset(), FilmPreset::None);
+    }
+
+    #[test]
+    fn preset_key_string_loads_verbatim() {
+        let dir = temp_dir("preset-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(manifest_path(&dir), "version = 5\npreset = \"hp5\"\n").unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
     }
 }

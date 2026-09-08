@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
-use crate::film::{ACTIVE_STOCK, MIN_PLAUSIBLE_BASE, invert_gray, measure_base};
+use crate::film::{ACTIVE_STOCK, FilmPreset, MIN_PLAUSIBLE_BASE, invert_gray, measure_base, normalize_positive};
 use crate::fl;
 use crate::shader;
 use cosmic::Application;
@@ -258,7 +258,7 @@ pub struct AppModel {
     /// returning to a recently-viewed frame doesn't re-decode the RAW. Survives
     /// roll switches and detail close; eviction is global (see
     /// [`DETAIL_CACHE_CAPACITY`]). Only overview (2048px) buffers are stored.
-    detail_cache: LruCache<(PathBuf, String), DetailMono>,
+    detail_cache: LruCache<(PathBuf, FilmPreset, String), DetailMono>,
     /// (roll dir, file name) handed to the bounded neighbor preload decodes,
     /// so a frame already being preloaded (or already cached) is never spawned
     /// twice. Independent of the single critical detail slot.
@@ -354,6 +354,10 @@ pub struct Roll {
     /// Number of regular non-dot files in the roll directory, surfaced in the
     /// roll-info metadata drawer.
     pub frame_count: usize,
+    /// The film-inversion preset this roll's frames render with. The single
+    /// in-memory source of truth for decodes; persisted to the roll's edit
+    /// manifest (see [`edit_manifest::RollManifest::preset`]).
+    pub preset: FilmPreset,
     /// Decoded cover thumbnail state.
     pub thumb: Thumb,
 }
@@ -369,7 +373,8 @@ struct Tile {
 /// A decoded detail-view overview: the linear pre-sRGB mono buffer plus its
 /// geometry, as delivered by [`decode_raw_detail`]. Exactly what an
 /// [`shader::DetailProgram`] needs to (re)build without re-decoding
-/// the RAW. Cached by the detail LRU keyed on (roll dir, file name).
+/// the RAW. Cached by the detail LRU keyed on (roll dir, film preset, file
+/// name), so a preset change never serves a stale inversion.
 #[derive(Debug, Clone)]
 struct DetailMono {
     mono: Vec<f32>,
@@ -380,7 +385,8 @@ struct DetailMono {
     src_long_edge: u32,
 }
 
-/// A fixed-capacity least-recently-used map keyed by (roll dir, file name).
+/// A fixed-capacity least-recently-used map keyed by (roll dir, film preset,
+/// file name).
 ///
 /// Backed by a `HashMap` for O(1) lookup plus a `VecDeque` of keys as the
 /// recency index: `get` moves the key to the back, `insert` pops the front
@@ -438,6 +444,25 @@ where
         self.map.contains_key(key)
     }
 
+    /// Drops every entry whose key no longer passes `keep`, returning the
+    /// removed values so the caller can release (drop) them eagerly. The
+    /// recency order of the surviving entries is preserved. Used to clear one
+    /// roll's cached overviews when its film preset changes.
+    fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) -> Vec<V> {
+        let mut dropped = Vec::new();
+        self.order.retain(|key| {
+            if keep(key) {
+                true
+            } else {
+                if let Some(value) = self.map.remove(key) {
+                    dropped.push(value);
+                }
+                false
+            }
+        });
+        dropped
+    }
+
     #[cfg(test)]
     fn clear(&mut self) {
         self.map.clear();
@@ -476,19 +501,23 @@ pub enum Message {
     /// Close the detail view, returning to the grid.
     DetailClosed,
     /// A hi-res decode for the detail view finished, returning the linear
-    /// pre-sRGB mono buffer for the GPU shader.
-    DetailReady(String, Result<(Vec<f32>, u32, u32, u32), ()>),
+    /// pre-sRGB mono buffer for the GPU shader. Carries the preset the decode
+    /// ran under so the LRU is keyed consistently with the buffer contents.
+    DetailReady(String, FilmPreset, Result<(Vec<f32>, u32, u32, u32), ()>),
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
-    DetailPreloaded(PathBuf, String, Result<(Vec<f32>, u32, u32, u32), ()>),
+    DetailPreloaded(PathBuf, String, FilmPreset, Result<(Vec<f32>, u32, u32, u32), ()>),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
     RollInfoLoaded(Roll),
     /// A roll cover decode finished.
     CoverReady(PathBuf, Result<Handle, ()>),
-    /// The folder picker returned a roll directory to add.
-    RollAdded(PathBuf),
+    /// The folder picker returned a roll directory to add, along with the
+    /// film preset chosen for it in the dialog.
+    RollAdded(PathBuf, FilmPreset),
+    /// The selected roll's film preset was changed from the roll-info drawer.
+    RollPresetChanged(PathBuf, FilmPreset),
     /// The user pressed the Add roll button.
     AddRoll,
     /// A roll tile was single-clicked — select it (highlight + metadata
@@ -1442,10 +1471,10 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::DetailReady(name, result) => self.handle_detail_ready(&name, result),
+            Message::DetailReady(name, preset, result) => self.handle_detail_ready(&name, preset, result),
 
-            Message::DetailPreloaded(dir, name, result) => {
-                self.handle_detail_preloaded(&dir, &name, result)
+            Message::DetailPreloaded(dir, name, preset, result) => {
+                self.handle_detail_preloaded(&dir, &name, preset, result)
             }
 
             Message::ThumbnailActivated(name) => self.open_frame(name),
@@ -1694,12 +1723,20 @@ impl cosmic::Application for AppModel {
 
             Message::AddRoll => open_roll_picker(),
 
-            Message::RollAdded(dir) => {
+            Message::RollAdded(dir, preset) => {
                 // The library list is app-wide: persist the new roll no matter
                 // where the folder picker was invoked from.
                 if !self.rolls.iter().any(|roll| roll.dir == dir) {
                     self.config.rolls.push(dir.to_string_lossy().into_owned());
                     self.persist_config();
+                }
+                // Record the chosen preset. The manifest is the persistence
+                // layer and the in-memory roll (on a re-add) the decode source:
+                // writing first means the just-spawned scan reads it back.
+                record_roll_preset(&dir, preset);
+                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                    roll.preset = preset;
+                    roll.thumb = Thumb::Loading;
                 }
                 // Mark the new roll selected (the selection survives roll exit,
                 // so backing out lands on it). The cover scan for the card
@@ -1711,7 +1748,45 @@ impl cosmic::Application for AppModel {
                 // Drill straight into the new roll's frame grid, from wherever
                 // the app was when the roller was chosen.
                 let open = self.open_roll(dir);
-                Task::batch([card, open])
+                Task::batch([card, open, self.decode_covers()])
+            }
+
+            Message::RollPresetChanged(dir, preset) => {
+                record_roll_preset(&dir, preset);
+                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                    roll.preset = preset;
+                    roll.thumb = Thumb::Loading;
+                }
+                let mut tasks = vec![self.decode_covers()];
+                // The drawer is library-only today, so the active branch is a
+                // defensive re-bake (kept so a preset change can never render
+                // a stale inversion for an open roll).
+                if self.active.as_deref() == Some(dir.as_path()) {
+                    self.roll.set_preset(preset);
+                    for tile in &mut self.tiles {
+                        tile.thumb = Thumb::Loading;
+                    }
+                    self.thumb_inflight.clear();
+                    tasks.push(self.decode_next());
+                    // Drop every detail buffer decoded under the old profile:
+                    // the live shader, the roll's cache entries, and any
+                    // in-flight native level-up, then re-pump so the next
+                    // frames come up under the new preset. Exposure/curve/crop
+                    // edits survive (they are applied in-shader).
+                    self.detail_shader = None;
+                    self.detail_native_queued = false;
+                    self.detail_inflight = None;
+                    self.detail_preload_inflight.clear();
+                    self.detail_thumb = None;
+                    self.detail_last_frame = None;
+                    let _ = self
+                        .detail_cache
+                        .retain(|(cached_dir, _, _)| cached_dir != &dir);
+                    let current = self.selected.clone().unwrap_or_default();
+                    tasks.push(self.decode_detail_next());
+                    tasks.push(self.preload_detail_neighbors(&current));
+                }
+                Task::batch(tasks)
             }
 
             Message::RollSelected(dir) => {
@@ -2312,6 +2387,7 @@ impl AppModel {
             .collect();
         let total = frames.len();
         self.export_progress = Some((0, total));
+        let preset = self.roll.preset();
 
         // Stream from an async channel so the UI sees per-frame ticks. After
         // each frame the sender pushes an `ExportProgress` message (dropping
@@ -2323,7 +2399,7 @@ impl AppModel {
                 let _ = sender.try_send(Message::ExportProgress { done, total });
             };
             let (ok, skipped, failed) =
-                export_frames(dir, dest.clone(), frames, options, &mut tick).await;
+                export_frames(dir, dest.clone(), frames, options, preset, &mut tick).await;
             let _ = sender
                 .send(Message::ExportDone {
                     ok,
@@ -2470,6 +2546,12 @@ impl AppModel {
             pending.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
         ));
 
+        // The in-memory manifest is loaded synchronously in `RollOpened`
+        // before the tile pump runs, so it carries the preset even while the
+        // library card scan (`RollInfoLoaded`) is still in flight for a
+        // freshly-added roll — `self.rolls` can be a step behind on that path.
+        let preset = self.roll.preset();
+
         self.thumb_inflight
             .extend(pending.iter().map(|(name, ..)| name.clone()));
 
@@ -2477,7 +2559,14 @@ impl AppModel {
             pending
                 .into_iter()
                 .map(move |(name, tone, crop, rotation)| {
-                    cosmic::task::future(decode_thumbnail(dir.clone(), name, tone, crop, rotation))
+                    cosmic::task::future(decode_thumbnail(
+                        dir.clone(),
+                        name,
+                        tone,
+                        crop,
+                        rotation,
+                        preset,
+                    ))
                 }),
         )
     }
@@ -2490,12 +2579,16 @@ impl AppModel {
             return Task::none();
         }
 
-        let pending: Vec<(PathBuf, String)> = self
+        let pending: Vec<(PathBuf, String, FilmPreset)> = self
             .rolls
             .iter()
             .filter(|roll| matches!(roll.thumb, Thumb::Loading))
             .filter(|roll| !self.cover_inflight.iter().any(|dir| dir == &roll.dir))
-            .filter_map(|roll| roll.cover.clone().map(|name| (roll.dir.clone(), name)))
+            .filter_map(|roll| {
+                roll.cover
+                    .clone()
+                    .map(|name| (roll.dir.clone(), name, roll.preset))
+            })
             .take(capacity)
             .collect();
 
@@ -2504,12 +2597,12 @@ impl AppModel {
         }
 
         self.cover_inflight
-            .extend(pending.iter().map(|(dir, _)| dir.clone()));
+            .extend(pending.iter().map(|(dir, _, _)| dir.clone()));
 
         Task::batch(
             pending
                 .into_iter()
-                .map(|(dir, name)| cosmic::task::future(decode_cover(dir, name))),
+                .map(|(dir, name, preset)| cosmic::task::future(decode_cover(dir, name, preset))),
         )
     }
 
@@ -2577,6 +2670,12 @@ impl AppModel {
             return Task::none();
         }
 
+        // The active roll's in-memory manifest is the decode source of truth
+        // (loaded synchronously in `RollOpened`, kept in sync on preset
+        // changes), so this is correct even while the library card scan for a
+        // freshly added roll is still in flight.
+        let preset = self.roll.preset();
+
         // Level 1 is native unless the sensor's long edge exceeds the wgpu
         // texture ceiling; `resize_area` treats a cap ≥ the source edge as
         // identity, so ≤8K scans decode at true full resolution.
@@ -2608,7 +2707,7 @@ impl AppModel {
             && let Some(dir) = self.active.clone()
             && let Some(cached) = self
                 .detail_cache
-                .get(&(dir, name.clone()))
+                .get(&(dir, preset, name.clone()))
                 .map(|c| (c.mono.clone(), c.width, c.height, c.src_long_edge))
         {
             let (mono, width, height, src_long_edge) = cached;
@@ -2631,7 +2730,7 @@ impl AppModel {
             return Task::none();
         };
 
-        cosmic::task::future(decode_detail(dir, name, cap))
+        cosmic::task::future(decode_detail(dir, name, cap, preset))
     }
 
     /// Builds and installs the detail shader from a decoded mono buffer,
@@ -2680,6 +2779,7 @@ impl AppModel {
         &mut self,
         dir: &PathBuf,
         name: &str,
+        preset: FilmPreset,
         result: Result<(Vec<f32>, u32, u32, u32), ()>,
     ) -> Task<cosmic::Action<Message>> {
         self.detail_preload_inflight
@@ -2687,7 +2787,7 @@ impl AppModel {
 
         if let Ok((mono, width, height, src_long_edge)) = result {
             let _evicted = self.detail_cache.insert(
-                (dir.clone(), name.to_string()),
+                (dir.clone(), preset, name.to_string()),
                 DetailMono {
                     mono,
                     width,
@@ -2731,10 +2831,12 @@ impl AppModel {
             return Task::none();
         }
 
+        let preset = self.roll.preset();
+
         let pending: Vec<String> = neighbors
             .into_iter()
             .filter(|n| {
-                let key = (dir.clone(), n.clone());
+                let key = (dir.clone(), preset, n.clone());
                 !self.detail_cache.contains(&key)
                     && !self
                         .detail_preload_inflight
@@ -2751,11 +2853,9 @@ impl AppModel {
         self.detail_preload_inflight
             .extend(pending.iter().map(|n| (dir.clone(), n.clone())));
 
-        Task::batch(
-            pending
-                .into_iter()
-                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n))),
-        )
+        Task::batch(pending.into_iter().map(|n| {
+            cosmic::task::future(preload_detail(dir.clone(), n, preset))
+        }))
     }
 
     /// Reset all detail-view buffers, crossfade state, the view transform, and
@@ -3061,6 +3161,7 @@ impl AppModel {
     fn handle_detail_ready(
         &mut self,
         name: &str,
+        preset: FilmPreset,
         result: Result<(Vec<f32>, u32, u32, u32), ()>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
@@ -3091,7 +3192,7 @@ impl AppModel {
                         // freeing its memory eagerly; the value is otherwise
                         // unused.
                         let _evicted = self.detail_cache.insert(
-                            (dir.clone(), name.to_string()),
+                            (dir.clone(), preset, name.to_string()),
                             DetailMono {
                                 mono: mono.clone(),
                                 width,
@@ -3213,20 +3314,43 @@ fn rebake_trace(args: std::fmt::Arguments<'_>) {
 }
 
 /// Loads one roll's metadata: display name (directory leaf), cover file (first
-/// sorted non-dot file), and the count of frame files — with nothing decoded
-/// yet.
+/// sorted non-dot file), the count of frame files, and the film preset recorded
+/// in the roll's edit manifest (defaulting to the non-inverted `None`) — with
+/// nothing decoded yet.
 async fn load_roll(dir: PathBuf) -> Roll {
     let name = dir
         .file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
     let (cover, frame_count) = roll_cover_and_count(&dir).await;
+    let preset = edit_manifest::load_roll_manifest(&dir).preset();
     Roll {
         dir,
         name,
         cover,
         frame_count,
+        preset,
         thumb: Thumb::Loading,
+    }
+}
+
+/// Persists a roll's film preset to its edit manifest, the on-disk source of
+/// truth for decodes after a restart. Only a non-default preset is written:
+/// [`FilmPreset::Hp5Plus`] records its choice key, while the `None` default is
+/// implicit in the key's absence — so a default raw scan keeps a clean
+/// manifest, and a write failure degrades to a stderr report instead of
+/// blocking the UI.
+fn record_roll_preset(dir: &Path, preset: FilmPreset) {
+    if preset == FilmPreset::default() {
+        return;
+    }
+    let mut manifest = edit_manifest::load_roll_manifest(dir);
+    manifest.set_preset(preset);
+    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
+        eprintln!(
+            "failed to write roll manifest {}: {err}",
+            edit_manifest::manifest_path(dir).display()
+        );
     }
 }
 
@@ -3366,19 +3490,44 @@ fn library_cell_index(
     cells.iter().position(|cell| cell.selection() == *selection)
 }
 
+/// The add-roll dialog's "film preset" choice: whether the chosen folder holds
+/// already-positive scans (regular RAWs, the non-inverted default) or HP5+
+/// negatives. The response returns the selected key, which the picker resolves
+/// back into a [`FilmPreset`].
+#[must_use]
+fn roll_preset_choice() -> cosmic::dialog::file_chooser::Choice {
+    cosmic::dialog::file_chooser::Choice::new("preset", &fl!("preset-label"), "none")
+        .insert("none", &fl!("preset-none"))
+        .insert("hp5", ACTIVE_STOCK.name)
+}
+
 /// Opens the system folder picker, and on success emits [`Message::RollAdded`]
-/// for the chosen directory (a cancel or portal failure is a no-op). Shared by
-/// the double-click handler and Enter on a selected Add Roll tile.
+/// for the chosen directory (a cancel or portal failure is a no-op). The dialog
+/// carries the film-preset choice, which lands in the [`Message::RollAdded`]
+/// payload alongside the directory. Shared by the double-click handler and
+/// Enter on a selected Add Roll tile.
 fn open_roll_picker() -> Task<cosmic::Action<Message>> {
     cosmic::task::future(async {
-        match cosmic::dialog::file_chooser::open::Dialog::new()
-            .open_folder()
-            .await
-        {
-            Ok(response) => response
-                .url()
-                .to_file_path()
-                .map_or(Message::Ignore, Message::RollAdded),
+        let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
+            .choice(roll_preset_choice())
+            .open_folder();
+        match dialog.await {
+            Ok(response) => {
+                let Ok(dir) = response.url().to_file_path() else {
+                    return Message::Ignore;
+                };
+                // The response lists the selected (id, value) pairs; the
+                // "preset" choice carries the preset key. A backend that
+                // dropped the choice falls back to the default (None).
+                let preset = response
+                    .choices()
+                    .iter()
+                    .find(|(id, _)| id == "preset")
+                    .map_or(FilmPreset::default(), |(_, value)| {
+                        FilmPreset::from_key(value.as_str())
+                    });
+                Message::RollAdded(dir, preset)
+            }
             // Cancelled (or a portal failure) is a no-op.
             Err(_) => Message::Ignore,
         }
@@ -3877,7 +4026,20 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
     let remove = widget::button::destructive(fl!("remove-roll"))
         .on_press(Message::RemoveRoll(roll.dir.clone()));
 
-    widget::column::with_capacity(7)
+    // The film preset selector: non-inverted (regular RAW) by default, or the
+    // HP5+ negative profile. Index order must match `FilmPreset::index()`.
+    let roll_dir = roll.dir.clone();
+    let preset = widget::dropdown::dropdown(
+        vec![
+            fl!("preset-none"),
+            ACTIVE_STOCK.name.to_owned(),
+        ],
+        Some(roll.preset.index()),
+        move |index| Message::RollPresetChanged(roll_dir.clone(), FilmPreset::from_index(index)),
+    )
+    .width(Length::Fill);
+
+    widget::column::with_capacity(8)
         .push(widget::text::heading(&roll.name))
         .push(widget::divider::horizontal::default())
         .push(meta_row(
@@ -3892,6 +4054,9 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
             fl!("roll-cover-label"),
             roll.cover.clone().unwrap_or_else(|| fl!("roll-no-cover")),
         ))
+        .push(widget::divider::horizontal::default())
+        .push(widget::text(fl!("preset-label")))
+        .push(preset)
         .push(widget::divider::horizontal::default())
         .push(remove)
         .spacing(space_s)
@@ -4501,9 +4666,10 @@ async fn decode_thumbnail(
     tone: edit_manifest::ToneEdit,
     crop: edit_manifest::CropMargins,
     rotation: u8,
+    preset: FilmPreset,
 ) -> Message {
     let result = decode_raw(dir, name.clone(), move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation)
+        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset)
     })
     .await;
 
@@ -4515,13 +4681,13 @@ async fn decode_thumbnail(
 /// manifest so the roll tile preview parallels the edited frame (grid == detail
 /// for covers too). A roll with no manifest (or an unedited cover) falls back
 /// to identity.
-async fn decode_cover(dir: PathBuf, name: String) -> Message {
+async fn decode_cover(dir: PathBuf, name: String, preset: FilmPreset) -> Message {
     let manifest = edit_manifest::load_roll_manifest(&dir);
     let tone = manifest.tone(&name);
     let crop = manifest.crop(&name);
     let rotation = manifest.rotation(&name) & 3;
     let result = decode_raw(dir.clone(), name, move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation)
+        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset)
     })
     .await;
 
@@ -4533,17 +4699,17 @@ async fn decode_cover(dir: PathBuf, name: String) -> Message {
 /// shader uploads and applies exposure to.  `max_edge` caps the long edge in
 /// pixels; the overview level uses [`HI_RES_SIZE`], the native level-up
 /// [`MAX_TEXTURE_EDGE`].
-async fn decode_detail(dir: PathBuf, name: String, max_edge: u32) -> Message {
-    let result = decode_raw_detail(dir, name.clone(), max_edge).await;
-    Message::DetailReady(name, result)
+async fn decode_detail(dir: PathBuf, name: String, max_edge: u32, preset: FilmPreset) -> Message {
+    let result = decode_raw_detail(dir, name.clone(), max_edge, preset).await;
+    Message::DetailReady(name, preset, result)
 }
 
 /// Decodes a neighbor frame's overview for the preload cache. Unlike
 /// [`decode_detail`] this only populates the LRU — it never becomes the active
 /// detail shader — so it always decodes at the fixed overview cap.
-async fn preload_detail(dir: PathBuf, name: String) -> Message {
-    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE).await;
-    Message::DetailPreloaded(dir, name, result)
+async fn preload_detail(dir: PathBuf, name: String, preset: FilmPreset) -> Message {
+    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, preset).await;
+    Message::DetailPreloaded(dir, name, preset, result)
 }
 
 /// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
@@ -4559,6 +4725,7 @@ async fn decode_raw_detail(
     dir: PathBuf,
     name: String,
     max_edge: u32,
+    preset: FilmPreset,
 ) -> Result<(Vec<f32>, u32, u32, u32), ()> {
     let path = dir.join(name);
 
@@ -4600,10 +4767,17 @@ async fn decode_raw_detail(
             (flatten_bayer(&samples, width, height, &cfa), width, height)
         };
 
-        let base = measure_base(&mono)
-            .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
-            .unwrap_or(ACTIVE_STOCK.base);
-        invert_gray(&mut mono, &ACTIVE_STOCK, base);
+        // Invert the negative in density space when a film stock was chosen;
+        // an already-positive scan (the `None` preset) is just normalized.
+        match preset.stock() {
+            Some(stock) => {
+                let base = measure_base(&mono)
+                    .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
+                    .unwrap_or(stock.base);
+                invert_gray(&mut mono, &stock, base);
+            }
+            None => normalize_positive(&mut mono),
+        }
 
         let (mono, width, height) = resize_area(&mono, width as u32, height as u32, max_edge, 1);
 
@@ -4635,6 +4809,7 @@ async fn export_frames(
         u8,
     )>,
     options: ExportOptions,
+    preset: FilmPreset,
     mut progress: impl FnMut(usize, usize) + Send,
 ) -> (usize, usize, usize) {
     let mut ok = 0;
@@ -4648,7 +4823,7 @@ async fn export_frames(
         // is skipped before any decode.
         if !options.overwrite && target.exists() {
             skipped += 1;
-        } else if export_one(dir.clone(), name, target, tone, crop, rotation, options)
+        } else if export_one(dir.clone(), name, target, tone, crop, rotation, options, preset)
             .await
             .is_ok()
         {
@@ -4673,6 +4848,7 @@ async fn export_frames(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
+#[allow(clippy::too_many_arguments)]
 async fn export_one(
     dir: PathBuf,
     name: String,
@@ -4681,6 +4857,7 @@ async fn export_one(
     crop: edit_manifest::CropMargins,
     rotation: u8,
     options: ExportOptions,
+    preset: FilmPreset,
 ) -> Result<(), ()> {
     let max_edge = options.size.long_edge();
     // Oriented linear mono (already masked-border cropped, inverted,
@@ -4688,7 +4865,8 @@ async fn export_one(
     // edge or full native resolution. `src_long_edge` is the pre-downscale
     // long edge, so the factor pins how far below native the print is.
     let (mut mono, width, height, src_long_edge) =
-        decode_raw_detail(dir, name, if max_edge == 0 { u32::MAX } else { max_edge }).await?;
+        decode_raw_detail(dir, name, if max_edge == 0 { u32::MAX } else { max_edge }, preset)
+            .await?;
 
     // The crop margins are authored in display-upright source pixels; scale
     // them onto the (possibly downscaled) print. When the decode was already
@@ -5527,17 +5705,25 @@ fn convert_thumbnail(
     tone: edit_manifest::ToneEdit,
     crop: edit_manifest::CropMargins,
     rotation: u8,
+    preset: FilmPreset,
 ) -> Result<Handle, ()> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
     // downscale straight from the sensor samples into a small linear negative.
     let (mut mono, width, height) = downsample_thumbnail(image, max_size as u32).ok_or(())?;
 
-    // Anchor the black point on the frame's clearest film, then invert the
-    // negative in density space.
-    let base = measure_base(&mono)
-        .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
-        .unwrap_or(ACTIVE_STOCK.base);
-    invert_gray(&mut mono, &ACTIVE_STOCK, base);
+    // Invert the negative in density space when a film stock was chosen; an
+    // already-positive scan (the `None` preset) is just normalized.
+    match preset.stock() {
+        Some(stock) => {
+            // Anchor the black point on the frame's clearest film, then invert
+            // the negative in density space.
+            let base = measure_base(&mono)
+                .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
+                .unwrap_or(stock.base);
+            invert_gray(&mut mono, &stock, base);
+        }
+        None => normalize_positive(&mut mono),
+    }
 
     // Restore edge punch lost to the heavy downscale, before tone encoding so
     // overshoot stays out of the perceptually amplified display range.
@@ -5860,6 +6046,7 @@ mod tests {
             name: name.to_string(),
             cover: None,
             frame_count: 0,
+            preset: FilmPreset::default(),
             thumb: Thumb::Loading,
         }
     }
@@ -6613,6 +6800,46 @@ mod tests {
         let mut cache = LruCache::new(0);
         assert_eq!(cache.insert("a", 1), Some(1));
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn lru_cache_preset_keyed_entries_do_not_collide() {
+        // Two presets for the same roll+frame are distinct cache entries, so a
+        // preset change can never serve a stale inversion.
+        let mut cache = LruCache::new(8);
+        let dir = PathBuf::from("/rolls/a");
+        let key_alpha = (dir.clone(), FilmPreset::Hp5Plus, "frame.DNG".to_string());
+        let key_neutral = (dir, FilmPreset::None, "frame.DNG".to_string());
+        assert!(cache.insert(key_alpha.clone(), 1).is_none());
+        assert!(cache.insert(key_neutral.clone(), 2).is_none());
+        assert_eq!(cache.get(&key_alpha), Some(&1));
+        assert_eq!(cache.get(&key_neutral), Some(&2));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn lru_cache_retain_drops_only_matching_dir_and_preserves_recency() {
+        let mut cache = LruCache::new(8);
+        let roll_a = PathBuf::from("/rolls/a");
+        let roll_b = PathBuf::from("/rolls/b");
+        let key_a_none = (roll_a.clone(), FilmPreset::None, "1.DNG".to_string());
+        let key_a_hp5 = (roll_a.clone(), FilmPreset::Hp5Plus, "2.DNG".to_string());
+        let key_b = (roll_b.clone(), FilmPreset::None, "3.DNG".to_string());
+        cache.insert(key_a_none.clone(), 1);
+        cache.insert(key_a_hp5.clone(), 2);
+        cache.insert(key_b.clone(), 3);
+        // Touch the other roll so its recency stays intact through the retain.
+        assert_eq!(cache.get(&key_b), Some(&3));
+
+        // Dropping every entry for roll `a` (any preset) leaves roll `b` alone.
+        let dropped = cache.retain(|(dir, _, _)| dir != &roll_a);
+        assert_eq!(dropped.len(), 2);
+
+        assert!(!cache.contains(&key_a_none));
+        assert!(!cache.contains(&key_a_hp5));
+        assert!(cache.contains(&key_b));
+        assert_eq!(cache.get(&key_b), Some(&3));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

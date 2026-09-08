@@ -32,6 +32,75 @@ pub const ACTIVE_STOCK: MonoStock = MonoStock {
     gamma: 0.7,
 };
 
+/// The film-inversion preset a roll's frames are rendered with: which
+/// [`MonoStock`] profile inverts the negatives, or `None` for already-positive
+/// scans (regular RAWs) that must NOT be inverted.
+///
+/// The default is [`FilmPreset::None`], so a roll with no recorded preset
+/// renders as a regular (non-inverted) scan.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+pub enum FilmPreset {
+    /// No inversion: the scan is treated as an already-positive image (a
+    /// regular RAW). The pipeline normalizes it in place of inverting a
+    /// negative.
+    #[default]
+    None,
+    /// Invert with the active stock profile.
+    Hp5Plus,
+}
+
+impl FilmPreset {
+    /// The inversion profile for a chosen preset: [`None`] (no inversion)
+    /// carries no profile; the negative preset carries [`ACTIVE_STOCK`].
+    #[must_use]
+    pub const fn stock(self) -> Option<MonoStock> {
+        match self {
+            Self::None => None,
+            Self::Hp5Plus => Some(ACTIVE_STOCK),
+        }
+    }
+
+    /// The stable dialog and manifest storage key for this preset. `None` is
+    /// the zero-value default, represented by the key's absence; only a
+    /// non-default preset is ever written.
+    #[must_use]
+    pub const fn choice_key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Hp5Plus => "hp5",
+        }
+    }
+
+    /// Resolves a stored choice key into a preset; the missing/absent key and
+    /// unknown values fall back to the default [`FilmPreset::None`].
+    #[must_use]
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "hp5" => Self::Hp5Plus,
+            _ => Self::None,
+        }
+    }
+
+    /// The dropdown index ordering (None first, matching the default).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Hp5Plus => 1,
+        }
+    }
+
+    /// Resolves a dropdown index (see [`Self::index`]) back into a preset;
+    /// any out-of-range index falls back to the default [`FilmPreset::None`].
+    #[must_use]
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Hp5Plus,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Samples at or below this transmission encode maximum density.
 const MIN_TRANSMISSION: f32 = 1e-6;
 
@@ -103,6 +172,26 @@ pub fn measure_base(samples: &[f32]) -> Option<f32> {
 
     sorted.sort_by(f32::total_cmp);
     Some(sorted[sorted.len() * 95 / 100])
+}
+
+/// Normalizes a non-negative (already-positive) scan into display range,
+/// anchoring the bright end on the image's own high percentile.
+///
+/// This is the `FilmPreset::None` path: regular RAWs are not negatives, so they
+/// skip the density-space inversion and instead just get scaled from their
+/// brightest measured value down to `[0, 1]`. Shares the bright high percentile
+/// of [`measure_base`] so a consistent anchor is reused, and safely falls back
+/// (leaving samples unchanged) when there is nothing finite to anchor on.
+pub fn normalize_positive(samples: &mut [f32]) {
+    let Some(anchor) = measure_base(samples) else {
+        return;
+    };
+    if anchor <= 0.0 || !anchor.is_finite() {
+        return;
+    }
+    for slot in samples {
+        *slot = (*slot / anchor).clamp(0.0, 1.0);
+    }
 }
 
 /// Measures each RGB channel's clear-film transmission from interleaved linear
@@ -306,5 +395,73 @@ mod tests {
                 assert!((value - expected).abs() < 1e-6);
             }
         }
+    }
+
+    #[test]
+    fn film_preset_default_is_none() {
+        assert_eq!(FilmPreset::default(), FilmPreset::None);
+    }
+
+    #[test]
+    fn film_preset_stock_mapping() {
+        assert_eq!(FilmPreset::None.stock(), None);
+        assert_eq!(FilmPreset::Hp5Plus.stock(), Some(ACTIVE_STOCK));
+    }
+
+    #[test]
+    fn film_preset_choice_key_round_trip() {
+        for preset in [FilmPreset::None, FilmPreset::Hp5Plus] {
+            assert_eq!(FilmPreset::from_key(preset.choice_key()), preset);
+        }
+        // Unknown keys resolve to the default (None), like a missing entry.
+        assert_eq!(FilmPreset::from_key(""), FilmPreset::None);
+        assert_eq!(FilmPreset::from_key("delta"), FilmPreset::None);
+    }
+
+    #[test]
+    fn film_preset_index_round_trip() {
+        for preset in [FilmPreset::None, FilmPreset::Hp5Plus] {
+            assert_eq!(FilmPreset::from_index(preset.index()), preset);
+        }
+        assert_eq!(FilmPreset::from_index(99), FilmPreset::None);
+    }
+
+    #[test]
+    fn normalize_positive_anchors_on_bright_percentile() {
+        // A regular scan with a broad bright region (a bright exposure)
+        // sitting at 0.8, midtones at 0.5, and a specular outlier above.
+        let mut samples = vec![0.5_f32; 20];
+        samples.extend(vec![0.8_f32; 80]);
+        samples.push(1.5);
+
+        normalize_positive(&mut samples);
+
+        // The bright region's p95 anchor maps to ~1.0 and the midtones scale
+        // proportionally; the outlier clamps.
+        assert!((samples[100] - 1.0).abs() < 1e-5);
+        assert!((samples[0] - 0.5 / 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normalize_positive_clamps_above_anchor() {
+        let mut samples = vec![0.9, 0.7, 0.2];
+        normalize_positive(&mut samples);
+        assert!(samples.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!((samples[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normalize_positive_falls_back_on_empty_or_degenerate() {
+        let mut empty: Vec<f32> = Vec::new();
+        normalize_positive(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut nan = vec![f32::NAN, 0.5];
+        normalize_positive(&mut nan);
+        assert!(nan[1].is_finite());
+
+        let mut zero = vec![0.0, 0.0];
+        normalize_positive(&mut zero);
+        assert_eq!(zero[0], 0.0);
     }
 }

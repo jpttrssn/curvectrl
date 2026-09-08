@@ -13,6 +13,8 @@ roll-path-label = Path
 roll-frames-label = Frames
 roll-cover-label = Cover
 roll-no-cover = No cover
+preset-label = Film preset
+preset-none = None
 roll-frames = {$count ->
     [one] {$count} frame
    *[other] {$count} frames
