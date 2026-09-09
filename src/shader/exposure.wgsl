@@ -15,7 +15,7 @@ fn vertex_position(vertex_index: u32) -> vec2<f32> {
 }
 
 struct Uniforms {
-    exposure: f32,   // 2^EV gain (linear-light multiplier)
+    exposure: f32,   // linear-light sensor gain: 2^EV, or 2^-EV when inverted (film) so +EV brightens the positive
     tex_w: f32,      // texture width in pixels
     tex_h: f32,      // texture height in pixels
     sc_x: f32,       // scissor rect origin x (physical pixels)
@@ -46,12 +46,25 @@ struct Uniforms {
     // overlay reuses the same zoom/pan; anything beyond the shader region is
     // clipped by the viewport. 0.0 = base zoom-crop view only.
     show_mask: f32,
-    // Live tone curve applied to the sampled positive: `clamp(ratio * p^exp, 0, 1)`.
+    // Live tone curve applied to the rendered positive: `clamp(ratio * p^exp, 0, 1)`.
     // The CPU folds the contrast/rolloff/shadows power curves (pivoted at the
     // image's measured mid-gray, white point, and shadow anchor) into this
     // single pair; all are identity at the defaults, making the remap a no-op.
     curve_ratio: f32,
     curve_exp: f32,
+    // When non-zero, the texture is a TRUE sensor-linear NEGATIVE (a film
+    // preset) that must be density-inverted per fragment: `exposure` multiplies
+    // the sensor data FIRST, then the inversion maps transmission → positive,
+    // and only then the curve applies. When zero (an already-positive scan) the
+    // pipeline is unchanged: curve, then `exposure` gain, then sRGB.
+    inv: f32,
+    // Inversion params (valid when `inv != 0.0`), mirroring film::invert_value:
+    // `inv_base` is the clear-film transmission (positive black), `inv_d_max`
+    // the usable density range (positive white), `inv_gamma` the density-space
+    // tone exponent.
+    inv_base: f32,
+    inv_d_max: f32,
+    inv_gamma: f32,
 };
 
 @group(0) @binding(0) var t_mono: texture_2d<f32>;
@@ -235,20 +248,42 @@ fn view_uv(frag: vec2<f32>) -> ViewSample {
 /// zoom-crop layer and the full-frame dim overlay so they match exactly.
 fn shade(uv: vec2<f32>) -> f32 {
     // Sample within [0, 1] (clamped to avoid sampler wrap reads at sub-rect
-    // edges when rasterizing across the contained boundary).
+    // edges when rasterizing across the contained boundary). The texture is
+    // TRUE sensor-linear data for every preset: linear `[0,1]` relative to the
+    // sensor white point.
     let mono_linear = textureSample(t_mono, s_mono, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0))).r;
 
-    // Live tone curve re-shapes the baked positive's values: the CPU folds
-    // the contrast power (pivot at the image's measured mid-gray), the
-    // highlight-rolloff power (pivot at the measured white point), and the
-    // shadows power (pivot at the measured shadow anchor) into one
-    // `ratio * p^exp`. Identity at the defaults (byte-identical render).
-    let remapped = clamp(uniforms.curve_ratio * pow(mono_linear, uniforms.curve_exp), 0.0, 1.0);
-
-    // Linear-light exposure via the Rust-computed 2^EV gain.
-    let exposed = remapped * uniforms.exposure;
-    let clamped = clamp(exposed, 0.0, 1.0);
-    return linear_to_srgb(clamped);
+    var v: f32;
+    if uniforms.inv != 0.0 {
+        // --- Film negative: EV acts on the true sensor data FIRST ---
+        // The gain already carries the inverted sign (`2^-EV` from the CPU), so
+        // +EV lowers the transmission, raises the density, and brightens the
+        // positive — the same direction the non-inverted preset shows.
+        let transmission = mono_linear * uniforms.exposure;
+        // Density-space inversion (CPU twin: `film::invert_value`):
+        //   value = clamp(transmission, MIN_TRANSMISSION, base)
+        //   density = log10(base / value)
+        //   position = clamp(density / d_max, 0, 1)
+        //   positive = position^gamma
+        let clamped = clamp(transmission, 1e-6, uniforms.inv_base);
+        let density = -log(clamped / uniforms.inv_base) / log(10.0);
+        let position = clamp(density / uniforms.inv_d_max, 0.0, 1.0);
+        let positive = pow(position, uniforms.inv_gamma);
+        // Live tone curve re-shapes the positive (pivots measured from the
+        // EV-0 positive at decode); then clamp to [0,1].
+        v = clamp(uniforms.curve_ratio * pow(positive, uniforms.curve_exp), 0.0, 1.0);
+    } else {
+        // --- Already-positive scan (unchanged path) ---
+        // Live tone curve re-shapes the baked positive's values: the CPU folds
+        // the contrast power (pivot at the image's measured mid-gray), the
+        // highlight-rolloff power (pivot at the measured white point), and the
+        // shadows power (pivot at the measured shadow anchor) into one
+        // `ratio * p^exp`. Identity at the defaults (byte-identical render).
+        let remapped = clamp(uniforms.curve_ratio * pow(mono_linear, uniforms.curve_exp), 0.0, 1.0);
+        // Linear-light exposure via the Rust-computed 2^EV gain.
+        v = clamp(remapped * uniforms.exposure, 0.0, 1.0);
+    }
+    return linear_to_srgb(v);
 }
 
 @fragment

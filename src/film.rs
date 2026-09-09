@@ -9,8 +9,10 @@ pub struct MonoStock {
     // Unused until a stock picker exists.
     #[allow(dead_code)]
     pub name: &'static str,
-    /// Scanner-linear transmission of unexposed film base + fog; defines the
-    /// positive's black point (the clearest film areas).
+    /// Scanner-linear transmission of unexposed film base + fog; the positive's
+    /// black point (the clearest film areas). A preset fallback: a roll may
+    /// override it with a calibrated reference or per-frame measurement (see
+    /// [`resolve_base`]).
     pub base: f32,
     /// Usable density range of the film above the base; the densest useful
     /// negative area maps to the positive's white point.
@@ -58,6 +60,18 @@ impl FilmPreset {
             Self::None => None,
             Self::Hp5Plus => Some(ACTIVE_STOCK),
         }
+    }
+
+    /// Whether this preset marks the scan as a negative to be density-inverted
+    /// (`None` = already-positive scan, no inversion).
+    ///
+    /// The pipeline consumes this: an inverted preset applies the exposure gain
+    /// to the true sensor-linear data BEFORE the inversion and flips the EV
+    /// sign at that point, so the user-facing controls (+EV = brighter) stay
+    /// identical across presets.
+    #[must_use]
+    pub const fn is_inverted(self) -> bool {
+        self.stock().is_some()
     }
 
     /// The stable dialog and manifest storage key for this preset. `None` is
@@ -112,7 +126,11 @@ pub const MIN_PLAUSIBLE_BASE: f32 = 0.1;
 /// channel's clear-film transmission: optical density relative to that anchor,
 /// positioned within the stock's usable density range, then run through the
 /// contrast curve.
-fn positive(transmission: f32, base: f32, stock: &MonoStock) -> f32 {
+///
+/// `base` is the clear-film transmission ([`MonoStock::base`] or a per-frame
+/// measurement); `value == base` prints black, the densest useful area prints
+/// white.
+pub fn invert_value(transmission: f32, base: f32, stock: &MonoStock) -> f32 {
     let value = transmission.clamp(MIN_TRANSMISSION, base);
     // Density relative to the clear-film anchor.
     let density = f32::log10(base / value);
@@ -137,7 +155,7 @@ fn positive(transmission: f32, base: f32, stock: &MonoStock) -> f32 {
 pub fn invert_mono(rgb: &mut [f32], stock: &MonoStock, bases: [f32; 3]) {
     for pixel in rgb.as_chunks_mut::<3>().0 {
         for (slot, base) in pixel.iter_mut().zip(bases) {
-            *slot = positive(*slot, base, stock);
+            *slot = invert_value(*slot, base, stock);
         }
     }
 }
@@ -150,7 +168,7 @@ pub fn invert_mono(rgb: &mut [f32], stock: &MonoStock, bases: [f32; 3]) {
 /// channels outright.
 pub fn invert_gray(samples: &mut [f32], stock: &MonoStock, base: f32) {
     for slot in samples {
-        *slot = positive(*slot, base, stock);
+        *slot = invert_value(*slot, base, stock);
     }
 }
 
@@ -174,23 +192,60 @@ pub fn measure_base(samples: &[f32]) -> Option<f32> {
     Some(sorted[sorted.len() * 95 / 100])
 }
 
-/// Normalizes a non-negative (already-positive) scan into display range,
-/// anchoring the bright end on the image's own high percentile.
-///
-/// This is the `FilmPreset::None` path: regular RAWs are not negatives, so they
-/// skip the density-space inversion and instead just get scaled from their
-/// brightest measured value down to `[0, 1]`. Shares the bright high percentile
-/// of [`measure_base`] so a consistent anchor is reused, and safely falls back
-/// (leaving samples unchanged) when there is nothing finite to anchor on.
-pub fn normalize_positive(samples: &mut [f32]) {
-    let Some(anchor) = measure_base(samples) else {
-        return;
-    };
-    if anchor <= 0.0 || !anchor.is_finite() {
-        return;
+/// The roll-level base-resolution state threaded from the manifest into every
+/// decode and bake, so the detail shader, grid thumbnails, and exports cannot
+/// drift the film's black point between renderings.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BaseConfig {
+    /// An explicit per-roll calibration measured once from a blank/leader
+    /// frame held in the roll manifest. Wins over everything else.
+    pub calibrated: Option<f32>,
+    /// Opt-in per-frame auto measurement of the clear-film anchor. When off,
+    /// the frame's own `measure_base` result is never computed (sorting a full
+    /// buffer is wasted work).
+    pub auto: bool,
+}
+
+impl BaseConfig {
+    /// Resolves the tonally-effective black point for one frame of `stock`.
+    ///
+    /// `measured` is the frame's own `measure_base` result — pass it only when
+    /// [`BaseConfig::auto`] is on; the caller must not compute it otherwise.
+    #[must_use]
+    pub fn resolve(self, measured: Option<f32>, stock: &MonoStock) -> f32 {
+        resolve_base(self.calibrated, self.auto, measured, stock)
     }
-    for slot in samples {
-        *slot = (*slot / anchor).clamp(0.0, 1.0);
+}
+
+/// Resolves the tonally-effective black point for one frame from the roll's
+/// calibration state, preset-first:
+///
+/// 1. An explicit per-roll calibration wins outright (a blank/leader frame
+///    photographed once, stored in the roll manifest).
+/// 2. Otherwise, the per-frame auto measurement — an explicit opt-in — refines
+///    the stock's preset base, skipping it when it is implausible or absent.
+/// 3. Otherwise the stock's preset base is the truth.
+///
+/// `measured` is the frame's own `measure_base` result when `auto` is on;
+/// callers must not compute it otherwise (sorting a full buffer is wasted).
+///
+/// Kept pure + unit-tested so the detail decode, the thumbnail bake, and the
+/// export path cannot drift the black point between renderings.
+#[must_use]
+pub fn resolve_base(
+    calibrated: Option<f32>,
+    auto: bool,
+    measured: Option<f32>,
+    stock: &MonoStock,
+) -> f32 {
+    if let Some(base) = calibrated {
+        base
+    } else if auto {
+        measured
+            .filter(|value| *value >= MIN_PLAUSIBLE_BASE)
+            .unwrap_or(stock.base)
+    } else {
+        stock.base
     }
 }
 
@@ -291,6 +346,34 @@ mod tests {
     fn measure_base_needs_finite_samples() {
         assert_eq!(measure_base(&[]), None);
         assert_eq!(measure_base(&[f32::NAN]), None);
+    }
+
+    #[test]
+    fn resolve_base_prefers_calibration_over_auto_and_preset() {
+        // A roll calibration is the truth regardless of auto or measured.
+        assert_eq!(resolve_base(Some(0.71), false, Some(0.9), &ACTIVE_STOCK), 0.71);
+        assert_eq!(resolve_base(Some(0.71), true, Some(0.9), &ACTIVE_STOCK), 0.71);
+    }
+
+    #[test]
+    fn resolve_base_auto_uses_a_plausible_measurement() {
+        assert_eq!(resolve_base(None, true, Some(0.88), &ACTIVE_STOCK), 0.88);
+    }
+
+    #[test]
+    fn resolve_base_auto_falls_back_on_implausible_or_missing_measurement() {
+        // A frame without measurable clear film (or an absent measurement)
+        // falls back to the preset base in auto mode too.
+        assert_eq!(resolve_base(None, true, Some(0.02), &ACTIVE_STOCK), ACTIVE_STOCK.base);
+        assert_eq!(resolve_base(None, true, None, &ACTIVE_STOCK), ACTIVE_STOCK.base);
+    }
+
+    #[test]
+    fn resolve_base_defaults_to_the_preset() {
+        // Preset-first: without calibration or auto, even a frame measurement
+        // is ignored — the stock's preset base is the truth.
+        assert_eq!(resolve_base(None, false, Some(0.88), &ACTIVE_STOCK), ACTIVE_STOCK.base);
+        assert_eq!(resolve_base(None, false, None, &ACTIVE_STOCK), ACTIVE_STOCK.base);
     }
 
     #[test]
@@ -409,6 +492,12 @@ mod tests {
     }
 
     #[test]
+    fn film_preset_inverted_marking() {
+        assert!(!FilmPreset::None.is_inverted());
+        assert!(FilmPreset::Hp5Plus.is_inverted());
+    }
+
+    #[test]
     fn film_preset_choice_key_round_trip() {
         for preset in [FilmPreset::None, FilmPreset::Hp5Plus] {
             assert_eq!(FilmPreset::from_key(preset.choice_key()), preset);
@@ -424,44 +513,5 @@ mod tests {
             assert_eq!(FilmPreset::from_index(preset.index()), preset);
         }
         assert_eq!(FilmPreset::from_index(99), FilmPreset::None);
-    }
-
-    #[test]
-    fn normalize_positive_anchors_on_bright_percentile() {
-        // A regular scan with a broad bright region (a bright exposure)
-        // sitting at 0.8, midtones at 0.5, and a specular outlier above.
-        let mut samples = vec![0.5_f32; 20];
-        samples.extend(vec![0.8_f32; 80]);
-        samples.push(1.5);
-
-        normalize_positive(&mut samples);
-
-        // The bright region's p95 anchor maps to ~1.0 and the midtones scale
-        // proportionally; the outlier clamps.
-        assert!((samples[100] - 1.0).abs() < 1e-5);
-        assert!((samples[0] - 0.5 / 0.8).abs() < 1e-5);
-    }
-
-    #[test]
-    fn normalize_positive_clamps_above_anchor() {
-        let mut samples = vec![0.9, 0.7, 0.2];
-        normalize_positive(&mut samples);
-        assert!(samples.iter().all(|v| (0.0..=1.0).contains(v)));
-        assert!((samples[0] - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn normalize_positive_falls_back_on_empty_or_degenerate() {
-        let mut empty: Vec<f32> = Vec::new();
-        normalize_positive(&mut empty);
-        assert!(empty.is_empty());
-
-        let mut nan = vec![f32::NAN, 0.5];
-        normalize_positive(&mut nan);
-        assert!(nan[1].is_finite());
-
-        let mut zero = vec![0.0, 0.0];
-        normalize_positive(&mut zero);
-        assert_eq!(zero[0], 0.0);
     }
 }

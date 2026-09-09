@@ -12,7 +12,12 @@ use std::path::{Path, PathBuf};
 pub const ROLL_MANIFEST_FILE: &str = ".film-roll.toml";
 
 /// Exposure applied to an image until an edit records otherwise.
-pub const DEFAULT_EXPOSURE_EV: f32 = 0.0;
+///
+/// Matches Darktable's default +0.7 EV starting point: with the auto-expose
+/// (`normalize_positive`) removed, EV 0 is true sensor exposure and untouched
+/// frames open at this visible base rather than black. The slider spans
+/// −3..+4 so the user can drag down to honest sensor exposure.
+pub const DEFAULT_EXPOSURE_EV: f32 = 0.7;
 
 /// Contrast power applied until an edit records otherwise (identity `1.0`).
 pub const DEFAULT_CURVE_CONTRAST: f32 = 1.0;
@@ -28,8 +33,8 @@ pub const DEFAULT_CURVE_SHADOWS: f32 = 1.0;
 /// Serializable per-file edits.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EditData {
-    /// Exposure compensation in EV (−3.00 to +3.00).
-    #[serde(default)]
+    /// Exposure compensation in EV (−3.00 to +4.00).
+    #[serde(default = "default_exposure")]
     pub exposure_ev: f32,
     /// Tone-curve contrast power (pivoted at the image's measured mid-gray),
     /// `1.0` = identity. Missing in older manifests stays `1.0`.
@@ -79,6 +84,13 @@ impl Default for EditData {
 #[allow(clippy::unnecessary_wraps)]
 fn default_curve_identity() -> f32 {
     1.0
+}
+
+/// `#[serde(default)]` target so a legacy manifest entry without an exposure
+/// field loads the current base exposure rather than a raw `0.0`.
+#[allow(clippy::unnecessary_wraps)]
+fn default_exposure() -> f32 {
+    DEFAULT_EXPOSURE_EV
 }
 
 /// A per-file edit aggregated into one value the decode/thumbnail pipelines
@@ -174,15 +186,30 @@ pub struct RollManifest {
     /// the default [`FilmPreset::None`] (a non-negative/regular-RAW roll).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// Roll-level black-point calibration: the clear-film transmission
+    /// measured once from a blank/leader frame of this roll. While present,
+    /// every frame in the roll inverts against this same base (consistent
+    /// shadows across the roll instead of a per-frame content chase). Absent
+    /// falls back to the stock's preset base (preset-first) unless
+    /// [`Self::base_auto`] opts into per-frame measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<f32>,
+    /// Explicit opt-in to per-frame automatic base measurement. Preset-first:
+    /// the default (false) uses the stock's preset base until a calibration is
+    /// recorded. A safety net for uncalibrated setups, never the default.
+    #[serde(default)]
+    pub base_auto: bool,
 }
 
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 5,
+            version: 6,
             name: None,
             edits: HashMap::new(),
             preset: None,
+            base: None,
+            base_auto: false,
         }
     }
 }
@@ -350,6 +377,61 @@ impl RollManifest {
             FilmPreset::None => self.preset = None,
         }
     }
+
+    /// The roll's calibrated black point (clear-film transmission), if a
+    /// blank/leader reference frame was measured and recorded.
+    #[must_use]
+    pub const fn calibrated_base(&self) -> Option<f32> {
+        self.base
+    }
+
+    /// Whether the roll explicitly opts into per-frame automatic base
+    /// measurement (never the default: preset-first).
+    #[must_use]
+    pub const fn base_auto(&self) -> bool {
+        self.base_auto
+    }
+
+    /// Records a calibrated black point measured from this roll's blank/leader
+    /// reference frame. Every frame in the roll then inverts against this same
+    /// base, and any per-frame auto mode is superseded.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_calibrated_base(&mut self, base: f32) {
+        self.base = Some(base);
+        self.base_auto = false;
+    }
+
+    /// Switches the roll to per-frame automatic base measurement (explicit
+    /// opt-in): each frame's own clear-film plateau drives its black point,
+    /// discarding any recorded calibration.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_base_auto(&mut self) {
+        self.base = None;
+        self.base_auto = true;
+    }
+
+    /// Returns the roll to the preset-first default: the stock's preset base
+    /// is the truth until a calibration is recorded. Clears both the recorded
+    /// calibration and the auto opt-in.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn use_preset_base(&mut self) {
+        self.base = None;
+        self.base_auto = false;
+    }
+
+    /// The roll's base-resolution state as a single [`film::BaseConfig`], the
+    /// unit threaded into every decode and bake so a rendering reflects the
+    /// roll's calibration mode.
+    #[must_use]
+    pub fn base_config(&self) -> crate::film::BaseConfig {
+        crate::film::BaseConfig {
+            calibrated: self.calibrated_base(),
+            auto: self.base_auto(),
+        }
+    }
 }
 
 /// Full path to the roll manifest inside `dir`.
@@ -465,7 +547,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 5);
+        assert_eq!(loaded.version, 6);
     }
 
     #[test]
@@ -935,5 +1017,105 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+    }
+
+    #[test]
+    fn calibrated_base_round_trips_and_supersedes_auto() {
+        let dir = temp_dir("base-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_calibrated_base(0.71);
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded, manifest);
+        assert_eq!(loaded.calibrated_base(), Some(0.71));
+        assert!(!loaded.base_auto(), "calibration supersedes auto mode");
+    }
+
+    #[test]
+    fn preset_first_default_has_no_base_recording() {
+        // Preset-first: a fresh roll records neither a calibration nor auto.
+        let mut manifest = RollManifest::default();
+        assert_eq!(manifest.calibrated_base(), None);
+        assert!(!manifest.base_auto());
+
+        manifest.use_preset_base();
+        assert_eq!(manifest.calibrated_base(), None);
+        assert!(!manifest.base_auto());
+    }
+
+    #[test]
+    fn base_auto_round_trips_and_clears_calibration() {
+        let dir = temp_dir("base-auto");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_base_auto();
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(loaded.base_auto(), "auto mode persists");
+        assert_eq!(loaded.calibrated_base(), None, "auto discards a calibration");
+    }
+
+    #[test]
+    fn legacy_manifest_without_base_loads_preset_default() {
+        let dir = temp_dir("legacy-base");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A v5 manifest predating the base fields.
+        std::fs::write(
+            manifest_path(&dir),
+            "version = 5\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+        )
+        .unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.version, 5, "older schema versions load verbatim");
+        assert_eq!(loaded.calibrated_base(), None);
+        assert!(!loaded.base_auto());
+        assert_eq!(loaded.tone("a.DNG").exposure_ev, 0.75);
+    }
+
+    #[test]
+    fn base_modes_switch_and_clear_each_other() {
+        let mut manifest = RollManifest::default();
+        manifest.set_calibrated_base(0.71);
+        assert_eq!(manifest.calibrated_base(), Some(0.71));
+
+        manifest.set_base_auto();
+        assert!(manifest.base_auto());
+        assert_eq!(manifest.calibrated_base(), None);
+
+        manifest.set_calibrated_base(0.68);
+        assert_eq!(manifest.calibrated_base(), Some(0.68));
+        assert!(!manifest.base_auto(), "recording a calibration leaves auto");
+
+        manifest.use_preset_base();
+        assert_eq!(manifest.calibrated_base(), None);
+        assert!(!manifest.base_auto());
+    }
+
+    #[test]
+    fn base_calibration_coexists_with_preset_and_edits() {
+        let dir = temp_dir("base-coexist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_preset(FilmPreset::Hp5Plus);
+        manifest.set_calibrated_base(0.7);
+        manifest.set_exposure("IMG_0001.DNG", 0.42);
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(loaded.calibrated_base(), Some(0.7));
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
     }
 }

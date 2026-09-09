@@ -3,7 +3,9 @@
 use crate::config::Config;
 use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
-use crate::film::{ACTIVE_STOCK, FilmPreset, MIN_PLAUSIBLE_BASE, invert_gray, measure_base, normalize_positive};
+use crate::film::{
+    ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
+};
 use crate::fl;
 use crate::shader;
 use cosmic::Application;
@@ -383,6 +385,31 @@ struct DetailMono {
     /// The sensor's true long edge AFTER cropping but BEFORE the downscale, so
     /// a served cache entry can decide whether the overview was already native.
     src_long_edge: u32,
+    /// Film-negative inversion carried through the cache: `Some((stock, base))`
+    /// when the frame is a negative the shader density-inverts per fragment
+    /// (`base` is the per-frame clear-film transmission measured from the
+    /// sensor mono), `None` for an already-positive scan. Rebuilds an identical
+    /// shader from a cache hit without re-decoding the RAW.
+    inversion: Option<(MonoStock, f32)>,
+}
+
+/// A decoded true sensor-linear mono frame plus the data the detail and export
+/// paths need to shape it.
+///
+/// `mono` is linear `[0,1]` relative to the sensor white point for EVERY preset
+/// (an already-positive scan or a film negative) — the single source of truth;
+/// the exposure gain touches it, and per-fragment shaping (density inversion
+/// for film) happens downstream per preset.
+#[derive(Debug, Clone)]
+pub(crate) struct DetailDecode {
+    mono: Vec<f32>,
+    width: u32,
+    height: u32,
+    /// The sensor's true long edge AFTER cropping but BEFORE the downscale.
+    src_long_edge: u32,
+    /// `None` for an already-positive scan; `(stock, base)` for a film negative
+    /// the shader must density-invert (`base` is the clear-film anchor).
+    inversion: Option<(MonoStock, f32)>,
 }
 
 /// A fixed-capacity least-recently-used map keyed by (roll dir, film preset,
@@ -500,13 +527,19 @@ pub enum Thumb {
 pub enum Message {
     /// Close the detail view, returning to the grid.
     DetailClosed,
-    /// A hi-res decode for the detail view finished, returning the linear
-    /// pre-sRGB mono buffer for the GPU shader. Carries the preset the decode
-    /// ran under so the LRU is keyed consistently with the buffer contents.
-    DetailReady(String, FilmPreset, Result<(Vec<f32>, u32, u32, u32), ()>),
+    /// A hi-res decode for the detail view finished, returning the true
+    /// sensor-linear mono buffer for the GPU shader. Carries the preset the
+    /// decode ran under so the LRU is keyed consistently with the buffer
+    /// contents.
+    DetailReady(String, FilmPreset, Result<DetailDecode, ()>),
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
-    DetailPreloaded(PathBuf, String, FilmPreset, Result<(Vec<f32>, u32, u32, u32), ()>),
+    DetailPreloaded(
+        PathBuf,
+        String,
+        FilmPreset,
+        Result<DetailDecode, ()>,
+    ),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
@@ -518,6 +551,16 @@ pub enum Message {
     RollAdded(PathBuf, FilmPreset),
     /// The selected roll's film preset was changed from the roll-info drawer.
     RollPresetChanged(PathBuf, FilmPreset),
+    /// The user asked to make the currently viewed frame the roll's calibrated
+    /// black point: its clear-film plateau is measured once and recorded in the
+    /// roll manifest, overriding every frame's inversion base until cleared.
+    CalibrateBaseFromFrame,
+    /// The user switched this roll to per-frame automatic base measurement
+    /// (explicit opt-in): every frame measures its own clear-film plateau.
+    AutoBasePerFrame,
+    /// The user returned this roll to the preset-first default: the stock's
+    /// preset base is the truth (clears calibration and the auto opt-in).
+    UsePresetBase,
     /// The user pressed the Add roll button.
     AddRoll,
     /// A roll tile was single-clicked — select it (highlight + metadata
@@ -1000,12 +1043,12 @@ impl cosmic::Application for AppModel {
             curve_contrast: 1.0,
             curve_rolloff: 1.0,
             curve_shadows: 1.0,
-            exposure_ev: 0.0,
+            exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             crop: edit_manifest::CropMargins::default(),
             crop_drafts: CropDrafts::from_margins(edit_manifest::CropMargins::default()),
             rotation: 0,
             show_crop_mask: false,
-            reset_exposure_ev: 0.0,
+            reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             reset_curve_contrast: 1.0,
             reset_curve_rolloff: 1.0,
             reset_curve_shadows: 1.0,
@@ -1095,16 +1138,49 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-paste-edits"), None, MenuAction::PasteEdits)
         };
 
+        // Base calibration is roll-scoped and only meaningful while a film
+        // negative roll is open: it records (or clears) the roll's black-point
+        // override in the open roll's manifest. The handlers no-op where there
+        // is no eligible frame, so the menu only gates on the preset.
+        let negative_roll = self.active.is_some() && self.roll.preset().is_inverted();
+        let base_items = if negative_roll {
+            vec![
+                menu::Item::Divider,
+                menu::Item::Button(
+                    fl!("menu-calibrate-base"),
+                    None,
+                    MenuAction::CalibrateBase,
+                ),
+                menu::Item::Button(fl!("menu-auto-base"), None, MenuAction::AutoBase),
+                menu::Item::Button(fl!("menu-preset-base"), None, MenuAction::PresetBase),
+            ]
+        } else {
+            vec![
+                menu::Item::Divider,
+                menu::Item::ButtonDisabled(
+                    fl!("menu-calibrate-base"),
+                    None,
+                    MenuAction::CalibrateBase,
+                ),
+                menu::Item::ButtonDisabled(fl!("menu-auto-base"), None, MenuAction::AutoBase),
+                menu::Item::ButtonDisabled(fl!("menu-preset-base"), None, MenuAction::PresetBase),
+            ]
+        };
+
         let edit_menu = menu::Tree::with_children(
             menu::root(fl!("menu-edit")).apply(Element::from),
             menu::items(
                 &self.key_binds,
-                vec![
-                    menu::Item::Button(fl!("menu-select-all"), None, MenuAction::SelectAll),
-                    menu::Item::Divider,
-                    copy_edits,
-                    paste_edits,
-                ],
+                [
+                    vec![
+                        menu::Item::Button(fl!("menu-select-all"), None, MenuAction::SelectAll),
+                        menu::Item::Divider,
+                        copy_edits,
+                        paste_edits,
+                    ],
+                    base_items,
+                ]
+                .concat(),
             ),
         );
 
@@ -1789,6 +1865,16 @@ impl cosmic::Application for AppModel {
                 Task::batch(tasks)
             }
 
+            Message::CalibrateBaseFromFrame => self.calibrate_base_from_frame(),
+
+            Message::AutoBasePerFrame => {
+                self.set_base_mode(RollManifest::set_base_auto)
+            }
+
+            Message::UsePresetBase => {
+                self.set_base_mode(RollManifest::use_preset_base)
+            }
+
             Message::RollSelected(dir) => {
                 self.library_selection = Some(LibrarySelection::Roll(dir));
                 Task::none()
@@ -2388,6 +2474,7 @@ impl AppModel {
         let total = frames.len();
         self.export_progress = Some((0, total));
         let preset = self.roll.preset();
+        let base_config = self.roll.base_config();
 
         // Stream from an async channel so the UI sees per-frame ticks. After
         // each frame the sender pushes an `ExportProgress` message (dropping
@@ -2399,7 +2486,8 @@ impl AppModel {
                 let _ = sender.try_send(Message::ExportProgress { done, total });
             };
             let (ok, skipped, failed) =
-                export_frames(dir, dest.clone(), frames, options, preset, &mut tick).await;
+                export_frames(dir, dest.clone(), frames, options, preset, base_config, &mut tick)
+                    .await;
             let _ = sender
                 .send(Message::ExportDone {
                     ok,
@@ -2551,6 +2639,7 @@ impl AppModel {
         // library card scan (`RollInfoLoaded`) is still in flight for a
         // freshly-added roll — `self.rolls` can be a step behind on that path.
         let preset = self.roll.preset();
+        let base_config = self.roll.base_config();
 
         self.thumb_inflight
             .extend(pending.iter().map(|(name, ..)| name.clone()));
@@ -2566,6 +2655,7 @@ impl AppModel {
                         crop,
                         rotation,
                         preset,
+                        base_config,
                     ))
                 }),
         )
@@ -2653,6 +2743,80 @@ impl AppModel {
         self.re_bake_edit()
     }
 
+    /// Measures the currently viewed frame's clear-film plateau and records it
+    /// as the roll's calibrated black point, then re-renders everything under
+    /// the new base. The frame must yield a plausible measurement
+    /// (`>= MIN_PLAUSIBLE_BASE`); otherwise the calibration is left untouched —
+    /// a frame with no clear film (e.g. one shot against a grey card) must not
+    /// poison the roll's rendering.
+    fn calibrate_base_from_frame(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(dir) = self.active.clone() else {
+            return Task::none();
+        };
+        let Some(name) = self.selected.clone() else {
+            return Task::none();
+        };
+        let preset = self.roll.preset();
+        let Some(cached) = self.detail_cache.get(&(dir, preset, name)) else {
+            return Task::none();
+        };
+        let Some(base) = measure_base(&cached.mono).filter(|base| *base >= MIN_PLAUSIBLE_BASE)
+        else {
+            return Task::none();
+        };
+        self.roll.set_calibrated_base(base);
+        self.reflow_base()
+    }
+
+    /// Applies a roll-level base-mode change (auto opt-in or preset-first
+    /// return), then re-renders every rendering under the new black point.
+    fn set_base_mode(
+        &mut self,
+        apply: impl FnOnce(&mut RollManifest),
+    ) -> Task<cosmic::Action<Message>> {
+        if self.active.is_none() {
+            return Task::none();
+        }
+        apply(&mut self.roll);
+        self.reflow_base()
+    }
+
+    /// Rebuilds every rendering after a base-calibration change: the live
+    /// detail decode, the grid tiles, and the roll covers all carry a black
+    /// point resolved at decode time, so the cached overviews and decodes are
+    /// dropped and the roll is re-decoded under the new base mode. The on-disk
+    /// manifest is written first since the cover path reads it from disk.
+    fn reflow_base(&mut self) -> Task<cosmic::Action<Message>> {
+        self.persist_roll();
+        // A cached overview's `inversion` (or an in-flight decode) was resolved
+        // under the old base mode and must not be served: drop the live shader,
+        // the LRU, and the in-flight bookkeeping.
+        self.detail_shader = None;
+        self.detail_native_queued = false;
+        self.detail_inflight = None;
+        self.detail_preload_inflight.clear();
+        self.detail_thumb = None;
+        self.detail_last_frame = None;
+        let _ = self.detail_cache.retain(|_| false);
+        // Re-bake every grid tile and the open roll's cover under the new base.
+        for tile in &mut self.tiles {
+            tile.thumb = Thumb::Loading;
+        }
+        self.thumb_inflight.clear();
+        if let Some(active) = self.active.as_ref()
+            && let Some(roll) = self.rolls.iter_mut().find(|roll| &roll.dir == active)
+        {
+            roll.thumb = Thumb::Loading;
+        }
+        let current = self.selected.clone().unwrap_or_default();
+        Task::batch([
+            self.decode_next(),
+            self.decode_covers(),
+            self.decode_detail_next(),
+            self.preload_detail_neighbors(&current),
+        ])
+    }
+
     /// Spawns the hi-res decode behind the detail view when one is due.
     ///
     /// Two progressive levels share the single in-flight slot: the 2048
@@ -2708,13 +2872,21 @@ impl AppModel {
             && let Some(cached) = self
                 .detail_cache
                 .get(&(dir, preset, name.clone()))
-                .map(|c| (c.mono.clone(), c.width, c.height, c.src_long_edge))
+                .map(|c| {
+                    (
+                        c.mono.clone(),
+                        c.width,
+                        c.height,
+                        c.src_long_edge,
+                        c.inversion,
+                    )
+                })
         {
-            let (mono, width, height, src_long_edge) = cached;
+            let (mono, width, height, src_long_edge, inversion) = cached;
             detail_trace(format_args!(
                 "cache hit: {name} {width}x{height} (src {src_long_edge})"
             ));
-            self.install_detail_shader(mono, width, height, src_long_edge);
+            self.install_detail_shader(mono, width, height, src_long_edge, inversion);
             return Task::none();
         }
 
@@ -2730,7 +2902,9 @@ impl AppModel {
             return Task::none();
         };
 
-        cosmic::task::future(decode_detail(dir, name, cap, preset))
+        let base_config = self.roll.base_config();
+
+        cosmic::task::future(decode_detail(dir, name, cap, preset, base_config))
     }
 
     /// Builds and installs the detail shader from a decoded mono buffer,
@@ -2744,6 +2918,7 @@ impl AppModel {
         width: u32,
         height: u32,
         src_long_edge: u32,
+        inversion: Option<(MonoStock, f32)>,
     ) {
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1);
@@ -2756,6 +2931,7 @@ impl AppModel {
             self.rotation,
             image_id,
             src_long_edge,
+            inversion,
         ));
         if let Some(shader) = &mut self.detail_shader {
             shader.set_view(self.detail_zoom, self.detail_pan);
@@ -2780,12 +2956,19 @@ impl AppModel {
         dir: &PathBuf,
         name: &str,
         preset: FilmPreset,
-        result: Result<(Vec<f32>, u32, u32, u32), ()>,
+        result: Result<DetailDecode, ()>,
     ) -> Task<cosmic::Action<Message>> {
         self.detail_preload_inflight
             .retain(|(pending_dir, pending_name)| pending_dir != dir || pending_name != name);
 
-        if let Ok((mono, width, height, src_long_edge)) = result {
+        if let Ok(DetailDecode {
+            mono,
+            width,
+            height,
+            src_long_edge,
+            inversion,
+        }) = result
+        {
             let _evicted = self.detail_cache.insert(
                 (dir.clone(), preset, name.to_string()),
                 DetailMono {
@@ -2793,6 +2976,7 @@ impl AppModel {
                     width,
                     height,
                     src_long_edge,
+                    inversion,
                 },
             );
         }
@@ -2853,8 +3037,10 @@ impl AppModel {
         self.detail_preload_inflight
             .extend(pending.iter().map(|n| (dir.clone(), n.clone())));
 
+        let base_config = self.roll.base_config();
+
         Task::batch(pending.into_iter().map(|n| {
-            cosmic::task::future(preload_detail(dir.clone(), n, preset))
+            cosmic::task::future(preload_detail(dir.clone(), n, preset, base_config))
         }))
     }
 
@@ -2877,14 +3063,14 @@ impl AppModel {
         self.curve_contrast = 1.0;
         self.curve_rolloff = 1.0;
         self.curve_shadows = 1.0;
-        self.exposure_ev = 0.0;
+        self.exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
         self.crop = edit_manifest::CropMargins::default();
         self.crop_drafts = CropDrafts::from_margins(self.crop);
         self.rotation = 0;
         self.show_crop_mask = false;
         // The reset snapshot mirrors the live edit values' lifecycle: reset
         // to identity on close; the next `ThumbnailActivated` re-syncs it.
-        self.reset_exposure_ev = 0.0;
+        self.reset_exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
         self.reset_curve_contrast = 1.0;
         self.reset_curve_rolloff = 1.0;
         self.reset_curve_shadows = 1.0;
@@ -3162,7 +3348,7 @@ impl AppModel {
         &mut self,
         name: &str,
         preset: FilmPreset,
-        result: Result<(Vec<f32>, u32, u32, u32), ()>,
+        result: Result<DetailDecode, ()>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
             self.selected.as_deref(),
@@ -3175,7 +3361,13 @@ impl AppModel {
             let fresh_open = self.detail_shader.is_none();
             let mut landed = false;
             match result {
-                Ok((mono, width, height, src_long_edge)) => {
+                Ok(DetailDecode {
+                    mono,
+                    width,
+                    height,
+                    src_long_edge,
+                    inversion,
+                }) => {
                     landed = true;
                     detail_trace(format_args!(
                         "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
@@ -3198,6 +3390,7 @@ impl AppModel {
                                 width,
                                 height,
                                 src_long_edge,
+                                inversion,
                             },
                         );
                     }
@@ -3226,6 +3419,7 @@ impl AppModel {
                         self.rotation,
                         image_id,
                         src_long_edge,
+                        inversion,
                     ));
                     // Carry over any zoom/pan the user applied while the decode
                     // was in flight (the program starts at contain fit).
@@ -3880,7 +4074,7 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     }
 
     let label = widget::text(fl!("exposure-label"));
-    let slider = widget::slider(-3.0..=3.0, app.exposure_ev, Message::ExposureChanged)
+    let slider = widget::slider(-3.0..=4.0, app.exposure_ev, Message::ExposureChanged)
         .step(0.01_f32)
         // A finished drag is an edit flush point.
         .on_release(Message::EditSave);
@@ -4419,9 +4613,9 @@ fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: (f32, f32), cursor: Poin
     )
 }
 
-/// Clamps an exposure adjustment in EV to the slider's range (−3.0..=+3.0).
+/// Clamps an exposure adjustment in EV to the slider's range (−3.0..=+4.0).
 fn clamp_ev(ev: f32) -> f32 {
-    ev.clamp(-3.0, 3.0)
+    ev.clamp(-3.0, 4.0)
 }
 
 /// Clamps a tone-curve power (contrast/rolloff/shadows) to the slider's range
@@ -4667,9 +4861,18 @@ async fn decode_thumbnail(
     crop: edit_manifest::CropMargins,
     rotation: u8,
     preset: FilmPreset,
+    base_config: BaseConfig,
 ) -> Message {
     let result = decode_raw(dir, name.clone(), move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset)
+        convert_thumbnail(
+            image,
+            THUMB_SIZE,
+            tone,
+            crop,
+            rotation,
+            preset,
+            base_config,
+        )
     })
     .await;
 
@@ -4680,14 +4883,25 @@ async fn decode_thumbnail(
 /// file's stored exposure, tone curve and display rotation from the roll's
 /// manifest so the roll tile preview parallels the edited frame (grid == detail
 /// for covers too). A roll with no manifest (or an unedited cover) falls back
-/// to identity.
+/// to identity. The cover's own on-disk manifest also supplies the roll's base
+/// mode, so a library-page cover reflects a calibration recorded from the open
+/// roll without extra plumbing.
 async fn decode_cover(dir: PathBuf, name: String, preset: FilmPreset) -> Message {
     let manifest = edit_manifest::load_roll_manifest(&dir);
     let tone = manifest.tone(&name);
     let crop = manifest.crop(&name);
     let rotation = manifest.rotation(&name) & 3;
+    let base_config = manifest.base_config();
     let result = decode_raw(dir.clone(), name, move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset)
+        convert_thumbnail(
+            image,
+            THUMB_SIZE,
+            tone,
+            crop,
+            rotation,
+            preset,
+            base_config,
+        )
     })
     .await;
 
@@ -4699,34 +4913,51 @@ async fn decode_cover(dir: PathBuf, name: String, preset: FilmPreset) -> Message
 /// shader uploads and applies exposure to.  `max_edge` caps the long edge in
 /// pixels; the overview level uses [`HI_RES_SIZE`], the native level-up
 /// [`MAX_TEXTURE_EDGE`].
-async fn decode_detail(dir: PathBuf, name: String, max_edge: u32, preset: FilmPreset) -> Message {
-    let result = decode_raw_detail(dir, name.clone(), max_edge, preset).await;
+async fn decode_detail(
+    dir: PathBuf,
+    name: String,
+    max_edge: u32,
+    preset: FilmPreset,
+    base_config: BaseConfig,
+) -> Message {
+    let result = decode_raw_detail(dir, name.clone(), max_edge, preset, base_config).await;
     Message::DetailReady(name, preset, result)
 }
 
 /// Decodes a neighbor frame's overview for the preload cache. Unlike
 /// [`decode_detail`] this only populates the LRU — it never becomes the active
 /// detail shader — so it always decodes at the fixed overview cap.
-async fn preload_detail(dir: PathBuf, name: String, preset: FilmPreset) -> Message {
-    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, preset).await;
+async fn preload_detail(
+    dir: PathBuf,
+    name: String,
+    preset: FilmPreset,
+    base_config: BaseConfig,
+) -> Message {
+    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, preset, base_config).await;
     Message::DetailPreloaded(dir, name, preset, result)
 }
 
 /// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
-/// returning linear `mono` (post-downscale, post-unsharp) oriented to display
-/// upright.  The GPU shader applies exposure and sRGB encoding per frame.
-/// `max_edge` is the downscale target for the long edge before unsharp.
+/// returning TRUE sensor-linear `mono` (post-downscale, post-unsharp) oriented
+/// to display upright, for every preset — the shader applies the exposure gain
+/// and (for film) the density inversion per fragment. `max_edge` is the
+/// downscale target for the long edge before unsharp.
 ///
-/// The last tuple field is the sensor's true long edge AFTER cropping but
+/// The `src_long_edge` field is the sensor's true long edge AFTER cropping but
 /// BEFORE the downscale — i.e. the real native long edge the overview was
 /// scaled down from (< `max_edge` means the overview is already full-res).
+/// `inversion` is `Some((stock, base))` when the preset marks a film negative,
+/// threading the clear-film anchor to the shader; the roll's `base_config`
+/// resolves that anchor preset-first (calibration, then the auto opt-in, then
+/// the stock's preset base).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn decode_raw_detail(
     dir: PathBuf,
     name: String,
     max_edge: u32,
     preset: FilmPreset,
-) -> Result<(Vec<f32>, u32, u32, u32), ()> {
+    base_config: BaseConfig,
+) -> Result<DetailDecode, ()> {
     let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
@@ -4744,7 +4975,7 @@ async fn decode_raw_detail(
 
         let src_long_edge = u32::max(width as u32, height as u32);
 
-        let (mut mono, width, height) = if image.cpp >= 3 {
+        let (mono, width, height) = if image.cpp >= 3 {
             if samples.len() < width * height * 3 {
                 return Err(());
             }
@@ -4767,17 +4998,22 @@ async fn decode_raw_detail(
             (flatten_bayer(&samples, width, height, &cfa), width, height)
         };
 
-        // Invert the negative in density space when a film stock was chosen;
-        // an already-positive scan (the `None` preset) is just normalized.
-        match preset.stock() {
-            Some(stock) => {
-                let base = measure_base(&mono)
-                    .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
-                    .unwrap_or(stock.base);
-                invert_gray(&mut mono, &stock, base);
-            }
-            None => normalize_positive(&mut mono),
-        }
+        // True sensor-linear data for every preset: an already-positive scan
+        // (None) and a film negative both stay linear `[0,1]` relative to the
+        // sensor white point — the exposure gain touches the RAW values, and
+        // the density inversion for a negative happens per fragment in the
+        // shader. The only film-side work here is resolving the frame's
+        // clear-film anchor (the inversion's black point) from the roll's base
+        // mode: calibration, then the per-frame auto opt-in (measured from the
+        // sensor data), then the stock's preset base.
+        let inversion = preset.stock().map(|stock| {
+            let measured = if base_config.auto {
+                measure_base(&mono)
+            } else {
+                None
+            };
+            (stock, base_config.resolve(measured, &stock))
+        });
 
         let (mono, width, height) = resize_area(&mono, width as u32, height as u32, max_edge, 1);
 
@@ -4786,7 +5022,13 @@ async fn decode_raw_detail(
 
         let (oriented, width, height) = orient_mono(&mono, width, height, image.orientation);
 
-        Ok((oriented, width, height, src_long_edge))
+        Ok(DetailDecode {
+            mono: oriented,
+            width,
+            height,
+            src_long_edge,
+            inversion,
+        })
     })
     .await
     .unwrap_or(Err(()))
@@ -4810,6 +5052,7 @@ async fn export_frames(
     )>,
     options: ExportOptions,
     preset: FilmPreset,
+    base_config: BaseConfig,
     mut progress: impl FnMut(usize, usize) + Send,
 ) -> (usize, usize, usize) {
     let mut ok = 0;
@@ -4823,9 +5066,19 @@ async fn export_frames(
         // is skipped before any decode.
         if !options.overwrite && target.exists() {
             skipped += 1;
-        } else if export_one(dir.clone(), name, target, tone, crop, rotation, options, preset)
-            .await
-            .is_ok()
+        } else if export_one(
+            dir.clone(),
+            name,
+            target,
+            tone,
+            crop,
+            rotation,
+            options,
+            preset,
+            base_config,
+        )
+        .await
+        .is_ok()
         {
             ok += 1;
         } else {
@@ -4858,15 +5111,28 @@ async fn export_one(
     rotation: u8,
     options: ExportOptions,
     preset: FilmPreset,
+    base_config: BaseConfig,
 ) -> Result<(), ()> {
     let max_edge = options.size.long_edge();
-    // Oriented linear mono (already masked-border cropped, inverted,
+    // True sensor-linear mono (masked-border cropped, downscaled per the size,
     // unsharpened — the exact detail-view decode), at the size option's long
     // edge or full native resolution. `src_long_edge` is the pre-downscale
-    // long edge, so the factor pins how far below native the print is.
-    let (mut mono, width, height, src_long_edge) =
-        decode_raw_detail(dir, name, if max_edge == 0 { u32::MAX } else { max_edge }, preset)
-            .await?;
+    // long edge, so the factor pins how far below native the print is; the
+    // film inversion (if any) is applied in the bake below, not in the decode.
+    let DetailDecode {
+        mut mono,
+        width,
+        height,
+        src_long_edge,
+        inversion,
+    } = decode_raw_detail(
+        dir,
+        name,
+        if max_edge == 0 { u32::MAX } else { max_edge },
+        preset,
+        base_config,
+    )
+    .await?;
 
     // The crop margins are authored in display-upright source pixels; scale
     // them onto the (possibly downscaled) print. When the decode was already
@@ -4880,9 +5146,22 @@ async fn export_one(
     let source_h = (height as f32 / factor).round() as u32;
     let crop = scale_crop(crop, source_w, source_h, width, height);
 
-    // Bake the stored tone curve, then the exposure gain, then sRGB-encode —
-    // the same ordering as the detail shader and `convert_thumbnail`.
-    let (shadow, mid, white) = shader::tone_anchors(&mono);
+    // Bake the stored tone curve, exposure, then sRGB-encode — the detail
+    // shader's exact ordering per preset:
+    //  * film negative: EV gain on the TRUE sensor data first (2^-EV from the
+    //    user-space +EV, `sensor_gain`'s twin), then the density inversion,
+    //    then anchors/curve on the positive — the clear-film base is the EV0
+    //    measurement carried from the decode so the gain does not cancel
+    //    against a re-measured base.
+    //  * positive scan (None): anchors/curve, then the 2^EV gain (unchanged).
+    let inverted = preset.is_inverted();
+    let (shadow, mid, white) = if let Some((stock, base)) = inversion {
+        apply_exposure(&mut mono, -tone.exposure_ev);
+        invert_gray(&mut mono, &stock, base);
+        shader::tone_anchors(&mono)
+    } else {
+        shader::tone_anchors(&mono)
+    };
     shader::apply_curve(
         &mut mono,
         tone.curve_contrast,
@@ -4892,7 +5171,9 @@ async fn export_one(
         mid,
         white,
     );
-    apply_exposure(&mut mono, tone.exposure_ev);
+    if !inverted {
+        apply_exposure(&mut mono, tone.exposure_ev);
+    }
 
     for value in &mut mono {
         *value = srgb_encode(*value);
@@ -5706,35 +5987,47 @@ fn convert_thumbnail(
     crop: edit_manifest::CropMargins,
     rotation: u8,
     preset: FilmPreset,
+    base_config: BaseConfig,
 ) -> Result<Handle, ()> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
-    // downscale straight from the sensor samples into a small linear negative.
+    // downscale straight from the sensor samples into a small TRUE sensor-linear
+    // mono (the same domain the detail decode produces, for every preset).
     let (mut mono, width, height) = downsample_thumbnail(image, max_size as u32).ok_or(())?;
 
-    // Invert the negative in density space when a film stock was chosen; an
-    // already-positive scan (the `None` preset) is just normalized.
-    match preset.stock() {
-        Some(stock) => {
-            // Anchor the black point on the frame's clearest film, then invert
-            // the negative in density space.
-            let base = measure_base(&mono)
-                .filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
-                .unwrap_or(stock.base);
-            invert_gray(&mut mono, &stock, base);
-        }
-        None => normalize_positive(&mut mono),
-    }
-
-    // Restore edge punch lost to the heavy downscale, before tone encoding so
-    // overshoot stays out of the perceptually amplified display range.
+    // Restore edge punch lost to the heavy downscale — in true sensor space for
+    // every preset, matching the detail decode's unsharp so a film negative
+    // carries its sharpening INTO the density inversion instead of leaving it
+    // on the positive.
     unsharp_mask(&mut mono, width as usize, height as usize);
+
+    // Film negative: the EV gain multiplies the true sensor data FIRST (2^-EV
+    // from the user-space +EV — `sensor_gain`'s twin), its black point anchored
+    // on the frame's clearest film MEASURED AT EV0 (before the gain, so it
+    // does not cancel against a re-measured base), then the density inversion
+    // yields the positive. An already-positive scan (`None`) stays true sensor
+    // data for the whole bake. The resolution order is the roll's: an explicit
+    // calibration wins, then the per-frame auto opt-in, then the stock's
+    // preset base — and when auto is off the measurement is never computed.
+    let inverted = preset.is_inverted();
+    if let Some(stock) = preset.stock() {
+        let measured = if base_config.auto {
+            measure_base(&mono)
+        } else {
+            None
+        };
+        let base = base_config.resolve(measured, &stock);
+        apply_exposure(&mut mono, -tone.exposure_ev);
+        invert_gray(&mut mono, &stock, base);
+    }
 
     // Bake the stored tone curve (contrast + highlight rolloff + shadows) in
     // linear light, using the same anchor measurement + remap the detail
-    // shader uses, applied BEFORE the exposure gain to mirror the shader's
-    // ordering exactly (curve first, then `2^EV`, then clamp/sRGB). At
-    // the identity curve this is a no-op, so untouched renders stay
-    // byte-identical to pre-curve ones.
+    // shader uses, applied BEFORE the exposure gain on a positive scan to
+    // mirror the shader's ordering exactly (curve first, then `2^EV`, then
+    // clamp/sRGB). For a film negative the curve shapes the freshly inverted
+    // positive just as the shader shapes it per fragment. At the identity
+    // curve this is a no-op, so untouched renders stay byte-identical to
+    // pre-curve ones.
     let (shadow, mid, white) = shader::tone_anchors(&mono);
     shader::apply_curve(
         &mut mono,
@@ -5747,9 +6040,12 @@ fn convert_thumbnail(
     );
 
     // Bake the stored exposure in linear light, matching the detail shader's
-    // `mono_linear * 2^EV` (applied after the curve remap), so grid tile and
-    // detail view agree.
-    apply_exposure(&mut mono, tone.exposure_ev);
+    // ordering per preset: a positive scan gets `mono_linear * 2^EV` after the
+    // curve remap; a film negative already had its gain folded into the sensor
+    // data pre-inversion above.
+    if !inverted {
+        apply_exposure(&mut mono, tone.exposure_ev);
+    }
 
     for value in &mut mono {
         *value = srgb_encode(*value);
@@ -6014,6 +6310,9 @@ pub enum MenuAction {
     CopyEdits,
     PasteEdits,
     Export,
+    CalibrateBase,
+    AutoBase,
+    PresetBase,
     About,
     Details,
 }
@@ -6030,6 +6329,9 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::CopyEdits => Message::CopyEdits,
             MenuAction::PasteEdits => Message::PasteEdits,
             MenuAction::Export => Message::ExportRequested,
+            MenuAction::CalibrateBase => Message::CalibrateBaseFromFrame,
+            MenuAction::AutoBase => Message::AutoBasePerFrame,
+            MenuAction::PresetBase => Message::UsePresetBase,
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
             MenuAction::Details => Message::ToggleContext,
         }
@@ -6681,6 +6983,161 @@ mod tests {
     }
 
     #[test]
+    fn none_preset_does_not_rescale_midtones_or_clamp_highlights() {
+        // Regression: the `None` preset (already-positive RAW) previously ran
+        // `normalize_positive`, which divided the whole frame by its own 95th
+        // percentile and clamped everything above it to pure white. That baked
+        // an auto-expose into the data before the EV slider and permanently
+        // destroyed highlight detail. With the auto-expose removed, a frame
+        // whose midtones sit at 0.5 relative to the sensor white point must
+        // render those midtones as a real mid-gray — not scaled up to white —
+        // and speculars above the 95th percentile must survive at the peak.
+        //
+        // 10x10 RGB Integer RAW, white = 1000: 97 sites at 0.5 (raw 500) and
+        // 3 speculars at 1.0 (raw 1000), so the 95th percentile ≈ 0.5. Under
+        // the old `normalize_positive` that anchor scaled the 0.5 midtones to
+        // 1.0 and clamped the speculars — a uniform white frame. Today the
+        // midtones must stay a mid-gray (~sRGB(0.5) ≈ 188).
+        let mut values = Vec::with_capacity(10 * 10 * 3);
+        for y in 0..10 {
+            for x in 0..10 {
+                let site = if (x == 0 && y == 0) || (x == 9 && y == 0) || (x == 4 && y == 9) {
+                    1000
+                } else {
+                    500
+                };
+                values.extend_from_slice(&[site, site, site]);
+            }
+        }
+        let image = rawloader::RawImage {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: 10,
+            height: 10,
+            cpp: 3,
+            wb_coeffs: [1.0; 4],
+            whitelevels: [1000; 4],
+            blacklevels: [0; 4],
+            xyz_to_cam: [[0.0; 3]; 4],
+            cfa: rawloader::CFA::new("RGGB"),
+            crops: [0, 0, 0, 0],
+            blackareas: Vec::new(),
+            orientation: rawloader::Orientation::Normal,
+            data: rawloader::RawImageData::Integer(values),
+        };
+
+        // Identity curve + EV 0 so the sampled mono value is preserved exactly
+        // through sRGB with no user gain.
+        let tone = edit_manifest::ToneEdit {
+            exposure_ev: 0.0,
+            ..edit_manifest::ToneEdit::default()
+        };
+        let handle = convert_thumbnail(
+            &image,
+            10.0,
+            tone,
+            Default::default(),
+            0,
+            FilmPreset::None,
+            BaseConfig::default(),
+        )
+        .expect("decode succeeds");
+        let (width, height, pixels) = match &handle {
+            cosmic::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            } => (*width, *height, pixels.as_ref()),
+            _ => panic!("expected an RGBA handle"),
+        };
+        assert_eq!((width, height), (10, 10));
+        // A midtone site far from any specular must render as a genuine
+        // mid-gray, NOT a scaled-to-white 255 that `normalize_positive`
+        // produced. Site (5,5) sits in the 0.5 bulk.
+        let midtone = pixels[(5 * 10 + 5) * 4];
+        assert!(midtone < 200, "midtone crushed too bright: {midtone}");
+        assert!(midtone > 100, "midtone too dark: {midtone}");
+        // The specular sites stay at the sensor peak (much brighter than the
+        // bulk), proving highlight detail is preserved rather than crushed.
+        let specular = pixels[(0 * 10 + 0) * 4];
+        assert!(specular as i32 > midtone as i32 + 40, "specular crushed");
+    }
+
+    #[test]
+    fn inverted_preset_brightens_on_positive_ev() {
+        // User-facing EV means "brightness" for BOTH presets: +EV brightens a
+        // film negative's positive exactly as it brightens an already-positive
+        // scan. Since the rework moved the exposure gain onto the TRUE sensor
+        // data (multiplied by 2^-EV there) and then per-fragment density-
+        // inverts it, +EV must raise the density and therefore brighten the
+        // positive — NOT darken it.
+        //
+        // A uniform frame equal to its own measured clear-film base prints all
+        // black at EV 0 (every site sits at the measured black point). Raising
+        // EV to +1 halves the transmission (2^-1), lifting the density to
+        // log10(2), which must brighten the frame measurably.
+        let values: Vec<u16> = vec![900; 10 * 10 * 3];
+        let image = rawloader::RawImage {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: 10,
+            height: 10,
+            cpp: 3,
+            wb_coeffs: [1.0; 4],
+            whitelevels: [1000; 4],
+            blacklevels: [0; 4],
+            xyz_to_cam: [[0.0; 3]; 4],
+            cfa: rawloader::CFA::new("RGGB"),
+            crops: [0, 0, 0, 0],
+            blackareas: Vec::new(),
+            orientation: rawloader::Orientation::Normal,
+            data: rawloader::RawImageData::Integer(values),
+        };
+
+        let bake = |ev: f32| {
+            let tone = edit_manifest::ToneEdit {
+                exposure_ev: ev,
+                ..edit_manifest::ToneEdit::default()
+            };
+            let handle = convert_thumbnail(
+                &image,
+                10.0,
+                tone,
+                Default::default(),
+                0,
+                FilmPreset::Hp5Plus,
+                BaseConfig::default(),
+            )
+            .expect("decode succeeds");
+            let (width, height, pixels) = match &handle {
+                cosmic::widget::image::Handle::Rgba {
+                    width,
+                    height,
+                    pixels,
+                    ..
+                } => (*width, *height, pixels.as_ref()),
+                _ => panic!("expected an RGBA handle"),
+            };
+            assert_eq!((width, height), (10, 10));
+            let count = pixels.len() / 4;
+            let sum: u32 = pixels
+                .chunks_exact(4)
+                .map(|p| u32::from(p[0]))
+                .sum::<u32>();
+            sum as f32 / count as f32
+        };
+
+        let ev0 = bake(0.0);
+        let ev1 = bake(1.0);
+        assert!(ev1 > ev0 + 20.0, "+1EV must brighten an inverted preset: {ev0} → {ev1}");
+    }
+
+    #[test]
     fn apply_detail_zoom_clamps_at_both_ends() {
         let (zoom, _) = apply_detail_zoom(1.0, (0.0, 0.0), None, -1.0);
         assert_eq!(zoom, 1.0);
@@ -6845,7 +7302,7 @@ mod tests {
     #[test]
     fn clamp_ev_bounds_to_the_slider_range() {
         assert_eq!(clamp_ev(-99.0), -3.0);
-        assert_eq!(clamp_ev(99.0), 3.0);
+        assert_eq!(clamp_ev(99.0), 4.0);
         assert_eq!(clamp_ev(0.5), 0.5);
     }
 

@@ -12,6 +12,7 @@ use cosmic::iced::wgpu::util::DeviceExt;
 use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewport};
 
 use crate::edit_manifest::CropMargins;
+use crate::film::{MonoStock, invert_value};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -31,8 +32,10 @@ pub struct DetailProgram {
     /// (texture == source) the scale collapses to 1 and the crop is exact.
     src_w: u32,
     src_h: u32,
-    /// Raw EV value in stops; converted to `2^EV` once on the GPU side per
-    /// slider change so the WGSL shader sees a linear-light gain.
+    /// Raw user-facing EV value in stops; converted to a linear-light gain once
+    /// on the GPU side per slider change — `2^EV` for an already-positive
+    /// scan, `2^-EV` for an inverted (film) negative so +EV always brightens
+    /// the final positive (see [`sensor_gain`]).
     exposure: f32,
     /// Detail-view zoom in `log2` units: 1.0 = contain fit, each +1 doubles
     /// the rendered scale (see [`DetailPrimitive::prepare`]).
@@ -76,6 +79,36 @@ pub struct DetailProgram {
     /// uncropped frame drawn on top of the zoomed crop with everything outside
     /// the crop rectangle dimmed. View-only — never persisted or baked.
     show_mask: bool,
+    /// Whether the mono texture holds a true sensor-linear NEGATIVE that the
+    /// shader must density-invert per fragment (a film preset), instead of an
+    /// already-positive scan. When inverted, the exposure gain multiplies the
+    /// sensor data BEFORE the inversion and the EV sign flips (see
+    /// [`sensor_gain`]), keeping the user-facing slider semantics identical
+    /// across presets.
+    inverted: bool,
+    /// The inversion's clear-film transmission anchor (black point): the stock's
+    /// calibrated `base` or a per-frame measurement from the sensor mono. Only
+    /// meaningful when `inverted`; shader-uniform value.
+    inv_base: f32,
+    /// The stock's usable density range above the base (`MonoStock::d_max`),
+    /// driving the inversion's white point. Shader-uniform value.
+    inv_d_max: f32,
+    /// The stock's density-space tone exponent (`MonoStock::gamma`). Only
+    /// meaningful when `inverted`; shader-uniform value.
+    inv_gamma: f32,
+    /// The film stock profile inverting this texture, when the preset is an
+    /// inverted film negative. Drives re-deriving the tone pivots analytically
+    /// for the live EV (see [`film_pivots_at_gain`]); `None` for a positive
+    /// scan.
+    stock: Option<MonoStock>,
+    /// Raw sensor-linear transmission fractiles (ranks {0.90, 0.50, 0.02}) the
+    /// inverted preset's tone pivots are derived from at each EV. Because the
+    /// density inversion is monotone-decreasing, the rendered positive's
+    /// percentile `q` hangs off the sensor rank `1-q`; keeping the RANK in
+    /// sensor space lets every frame's pivots be exact at the CURRENT exposure
+    /// instead of frozen EV-0 values. `None` for a positive scan, whose pivots
+    /// come straight from [`tone_anchors`] (EV-independent by construction).
+    anchor_fractiles: Option<(f32, f32, f32)>,
     /// Monotonic id bumped by the app model on each new detail decode. Used
     /// to detect image changes and rebuild the GPU texture/bind group.
     image_id: u64,
@@ -84,19 +117,26 @@ pub struct DetailProgram {
 impl DetailProgram {
     /// Create a new program for the given mono image.
     ///
-    /// `mono` is linear, inverted-positive pre-sRGB data (one `f32` per pixel,
+    /// `mono` is TRUE sensor-linear data — linear `[0,1]` relative to the
+    /// sensor white point — the same for every preset (one `f32` per pixel,
     /// row-major, top-to-bottom). `width`/`height` are the **texture** dims
     /// (the downscale of the source, display-oriented). `src_long_edge` is the
     /// sensor's true long edge AFTER masked-border cropping and BEFORE the
     /// downscale — it restores the full-resolution display-oriented source dims
     /// (`source_dimensions`) that the crop margins are authored against.
-    /// `exposure` is the raw EV value; the gain sent to the GPU is `2^EV`.
+    /// `exposure` is the raw user-facing EV value; the gain sent to the GPU is
+    /// `2^EV` for a non-inverted preset and `2^-EV` for an inverted one (see
+    /// [`sensor_gain`]), so +EV always brightens the final positive.
     /// `crop` is the frame's stored source-pixel crop (all-zero for a fresh
     /// frame). `rotation` is the cumulative counter-clockwise 90° quarter-turn
     /// display rotation on top of the EXIF-upright texture (`0` = none). The
     /// view starts at contain fit (zoom 1.0, no pan) with an identity tone
-    /// curve. The shadow/mid-gray/white-point pivots are measured from `mono`
-    /// once here.
+    /// curve. `inversion` is `Some((stock, base))` when the texture is a film
+    /// negative the shader must density-invert per fragment (`base` is the
+    /// clear-film transmission anchor). An inverted preset's shadow/mid-gray/
+    /// white-point pivots derive from the raw sensor fractiles at the CURRENT
+    /// exposure (see [`film_pivots_at_gain`]); a positive scan's pivot from
+    /// [`tone_anchors`].
     #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     pub fn new(
         mono: Vec<f32>,
@@ -107,8 +147,21 @@ impl DetailProgram {
         rotation: u8,
         image_id: u64,
         src_long_edge: u32,
+        inversion: Option<(MonoStock, f32)>,
     ) -> Self {
-        let (shadow, mid, white) = tone_anchors(&mono);
+        let (shadow, mid, white, stock, anchor_fractiles) = if let Some((stock, base)) = inversion {
+            let fractiles = film_anchor_fractiles(&mono);
+            let (shadow, mid, white) =
+                film_pivots_at_gain(fractiles, base, sensor_gain(exposure, true), stock);
+            (shadow, mid, white, Some(stock), Some(fractiles))
+        } else {
+            let (shadow, mid, white) = tone_anchors(&mono);
+            (shadow, mid, white, None, None)
+        };
+        let (inverted, inv_base, inv_d_max, inv_gamma) = match inversion {
+            Some((stock, base)) => (true, base, stock.d_max, stock.gamma),
+            None => (false, 1.0, 1.0, 1.0),
+        };
         // The texture shares the display source's aspect (resize_area +
         // orientation preserve it within floor-rounding), so the two source
         // axes are recovered from the long edge: the long-edged axis equals
@@ -144,13 +197,33 @@ impl DetailProgram {
             crop,
             rotation,
             show_mask: false,
+            inverted,
+            inv_base,
+            inv_d_max,
+            inv_gamma,
+            stock,
+            anchor_fractiles,
             image_id,
         }
     }
 
     /// Update the exposure value (called on slider drag).
+    ///
+    /// An inverted (film) preset re-derives its tone pivots from the raw
+    /// sensor fractiles at the incoming EV, so the shadow/mid/white anchors
+    /// always describe the ACTUAL render instead of the EV at decode. A
+    /// positive scan's anchors are EV-independent (the gain never touches the
+    /// curve input) and stay as measured.
     pub fn set_exposure(&mut self, ev: f32) {
         self.exposure = ev;
+        if let (Some(stock), Some(fractiles)) = (self.stock, self.anchor_fractiles) {
+            (self.shadow, self.mid, self.white) = film_pivots_at_gain(
+                fractiles,
+                self.inv_base,
+                sensor_gain(ev, true),
+                stock,
+            );
+        }
     }
 
     /// Update the zoom/pan transform (called on detail-view wheel/drag).
@@ -242,6 +315,12 @@ impl Clone for DetailProgram {
             crop: self.crop,
             rotation: self.rotation,
             show_mask: self.show_mask,
+            inverted: self.inverted,
+            inv_base: self.inv_base,
+            inv_d_max: self.inv_d_max,
+            inv_gamma: self.inv_gamma,
+            stock: self.stock,
+            anchor_fractiles: self.anchor_fractiles,
             image_id: self.image_id,
         }
     }
@@ -266,6 +345,12 @@ impl std::fmt::Debug for DetailProgram {
             .field("crop", &self.crop)
             .field("rotation", &self.rotation)
             .field("show_mask", &self.show_mask)
+            .field("inverted", &self.inverted)
+            .field("inv_base", &self.inv_base)
+            .field("inv_d_max", &self.inv_d_max)
+            .field("inv_gamma", &self.inv_gamma)
+            .field("stock", &self.stock)
+            .field("anchor_fractiles", &self.anchor_fractiles)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
             .finish()
@@ -304,6 +389,10 @@ impl<M> Program<M> for DetailProgram {
             height: self.height,
             src_w: self.src_w,
             src_h: self.src_h,
+            inverted: self.inverted,
+            inv_base: self.inv_base,
+            inv_d_max: self.inv_d_max,
+            inv_gamma: self.inv_gamma,
             image_id: self.image_id,
         }
     }
@@ -347,9 +436,42 @@ fn crop_uv_geometry(
 /// than the f16 texture's ~2^-11 and more than any preview needs.
 const ANCHOR_BINS: usize = 4096;
 
+/// Subsample stride for [`film_anchor_fractiles`]: every Nth sensor sample
+/// lands in the fractile histogram. Percentile pivots are insensitive to the
+/// subsample, and the stride bounds the per-decode cost at native resolution
+/// (an 8K² buffer would otherwise histogram ~64M samples).
+const ANCHOR_INV_STRIDE: usize = 4;
+
 /// Smallest anchor accepted. Guards `pow(0, negative)` → NaN for degenerate
 /// all-black frames, where the 50th/98th percentile of noise can land at 0.
 pub(crate) const MIN_ANCHOR: f32 = 1e-3;
+
+/// The shadow pivot is floored at this share of the mid-gray pivot so the
+/// Shadows power stays usable when the frame's bottom decile is literal black
+/// (the clear-film plateau at EV ≤ 0): a pivot pinned to [`MIN_ANCHOR`] makes
+/// `s^(1-ks)` explode (`s≈0` lifts the whole positive to white), while a
+/// pivot at ~15% of the mid keeps the control acting on the darkest real
+/// detail. Tunable during visual calibration.
+const SHADOW_PIVOT_FLOOR: f32 = 0.15;
+
+/// The linear-light sensor gain for a user-facing EV value: for an
+/// already-positive preset the gain is `2^EV` (multiplies the final positive),
+/// for an INVERTED (film) preset the sign flips — `2^-EV` multiplies the true
+/// sensor-linear NEGATIVE before the density inversion, so +EV makes the film
+/// denser and the positive brighter. Identical slider semantics (+EV =
+/// brighter) across presets; the flip happens at the point EV meets the sensor
+/// data.
+///
+/// Kept pure + unit-tested so the GPU shader, the CPU thumbnail bake, and the
+/// export path cannot drift.
+#[must_use]
+pub fn sensor_gain(ev: f32, inverted: bool) -> f32 {
+    if inverted {
+        (-ev).exp2()
+    } else {
+        ev.exp2()
+    }
+}
 
 /// Measure the tone anchors a pivoted curve needs, from the uploaded positive
 /// (`p` in [0,1]): the 10th percentile (the shadow anchor, robust against a
@@ -365,21 +487,86 @@ pub(crate) const MIN_ANCHOR: f32 = 1e-3;
     clippy::cast_sign_loss
 )]
 pub(crate) fn tone_anchors(mono: &[f32]) -> (f32, f32, f32) {
+    anchors_from(mono.iter().copied(), mono.len())
+}
+
+/// The raw sensor-linear fractiles a film inversion derives its tone pivots
+/// from: the transmission values at ranks {0.90, 0.50, 0.02}. Because the
+/// density inversion is monotone-decreasing, the rendered positive's
+/// percentile `q` hangs off the sensor rank `1−q` — the 10th-percentile shadow
+/// from the 90th, the mid-gray from the median, and the 98th-percentile white
+/// point from the 2nd (the densest real data, insensitive to a few saturated
+/// or dusty samples at the high end).
+///
+/// Keeping the RANK in raw sensor space (instead of density-inverting first)
+/// lets the EV-exact pivot for any exposure be derived analytically with
+/// `invert_value(fractile · gain)` — the exact transform the WGSL applies per
+/// fragment — instead of freezing the EV-0 anchors while the frame renders at
+/// +0.7 EV. Samples every [`ANCHOR_INV_STRIDE`]-th pixel to bound the cost on
+/// a native level-up decode.
+pub(crate) fn film_anchor_fractiles(mono: &[f32]) -> (f32, f32, f32) {
+    let count = mono.len().div_ceil(ANCHOR_INV_STRIDE);
+    let (bins, total) = histogram_from(mono.iter().step_by(ANCHOR_INV_STRIDE).copied(), count);
+    if total == 0 {
+        return (MIN_ANCHOR, MIN_ANCHOR, MIN_ANCHOR);
+    }
+    let white = percentile(&bins, total, 0.02);
+    let mid = percentile(&bins, total, 0.5);
+    let shadow = percentile(&bins, total, 0.90);
+    (shadow, mid, white)
+}
+
+/// Derive the tone pivots (shadow/mid-gray/white) for a film negative rendered
+/// at linear gain `g` from its raw sensor fractiles: the sensor value at rank
+/// `r` maps through `invert_value(fractile · g)` — the exact transform the
+/// WGSL applies per fragment. Each pivot is floored at [`MIN_ANCHOR`] like
+/// [`tone_anchors`] guards its degenerate all-black frames.
+fn film_pivots_at_gain(
+    fractiles: (f32, f32, f32),
+    base: f32,
+    gain: f32,
+    stock: MonoStock,
+) -> (f32, f32, f32) {
+    let (fs, fm, fw) = fractiles;
+    (
+        invert_value(fs * gain, base, &stock).max(MIN_ANCHOR),
+        invert_value(fm * gain, base, &stock).max(MIN_ANCHOR),
+        invert_value(fw * gain, base, &stock).max(MIN_ANCHOR),
+    )
+}
+
+/// Bin values into the anchor histogram, returning `(bins, total)` where
+/// `total` is the sample count supplied by the caller (the percentile targets
+/// scale against it). The histogram-bin core shared by [`tone_anchors`] and
+/// [`film_anchor_fractiles`].
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn histogram_from(values: impl Iterator<Item = f32>, count: usize) -> (Vec<u64>, usize) {
     // Heap-allocated (4096 × u64 ≈ 32 KB would trip `large_stack_arrays`).
     let mut bins = vec![0_u64; ANCHOR_BINS];
-    for &v in mono {
+    for v in values {
         let v = v.clamp(0.0, 1.0);
         // `(v * (BINS-1))` maps 0..1 to bin 0..BINS-1; truncation is fine
         // because binning is deliberately approximate.
         let idx = (v * (ANCHOR_BINS - 1) as f32) as usize;
         bins[idx.min(ANCHOR_BINS - 1)] += 1;
     }
+    (bins, count)
+}
 
-    if mono.is_empty() {
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn anchors_from(values: impl Iterator<Item = f32>, count: usize) -> (f32, f32, f32) {
+    let (bins, total) = histogram_from(values, count);
+    if count == 0 {
         return (MIN_ANCHOR, MIN_ANCHOR, MIN_ANCHOR);
     }
-
-    let total = mono.len();
     let shadow = percentile(&bins, total, 0.10);
     let mid = percentile(&bins, total, 0.5);
     let white = percentile(&bins, total, 0.98);
@@ -439,6 +626,12 @@ pub(crate) fn curve_remap(
     mid: f32,
     white: f32,
 ) -> (f32, f32) {
+    // A shadow pivot pinned to literal black (the clear-film plateau at EV ≤ 0)
+    // would make the Shadows power explode: `s^(1-ks)` near `s ≈ 0` lifts the
+    // whole positive to white. Floor the pivot to a share of the mid so the
+    // control keeps acting on the darkest detail; at the identity defaults
+    // (`ks = 1`) every pivot power vanishes and the remap stays exactly 1.
+    let shadow = shadow.max(mid * SHADOW_PIVOT_FLOOR);
     let ratio = shadow.powf(1.0 - shadows)
         * white.powf(shadows * (1.0 - rolloff))
         * mid.powf(shadows * rolloff * (1.0 - contrast));
@@ -510,6 +703,16 @@ pub struct DetailPrimitive {
     /// Whether the "view dimmed crop area" overlay is shown (full frame on top
     /// of the zoomed crop, dimmed outside the crop rect).
     show_mask: bool,
+    /// Whether the mono is a true sensor-linear NEGATIVE to density-invert per
+    /// fragment (film preset). Inverts the exposure gain sign (see
+    /// [`sensor_gain`]) and drives the WGSL inversion branch.
+    inverted: bool,
+    /// Clear-film transmission anchor (inversion black point), shader uniform.
+    inv_base: f32,
+    /// Usable density range above the base (stock `d_max`), shader uniform.
+    inv_d_max: f32,
+    /// Density-space tone exponent (stock `gamma`), shader uniform.
+    inv_gamma: f32,
     width: u32,
     height: u32,
     /// Full-resolution display-oriented source dims the crop margins are
@@ -642,9 +845,12 @@ impl Primitive for DetailPrimitive {
             self.white,
         );
         let uniforms = Uniforms {
-            // Convert raw EV (slider value) to linear-light gain once per
-            // frame; the WGSL shader reads this as a direct multiplier.
-            exposure: self.exposure.exp2(),
+            // Convert raw EV (slider value) to the linear-light sensor gain
+            // once per frame; for an inverted (film) preset the sign flips so
+            // the gain multiplies the sensor-linear NEGATIVE before the WGSL
+            // inversion (see `sensor_gain`). The WGSL shader reads this as a
+            // direct multiplier.
+            exposure: sensor_gain(self.exposure, self.inverted),
             // Texture dimensions feed the WGSL's contained-fit math so the
             // shader mirrors `widget::image.content_fit(ContentFit::Contain)`.
             tex_w,
@@ -666,10 +872,18 @@ impl Primitive for DetailPrimitive {
             rot,
             // Whether to draw the full-frame dim overlay (see set_show_mask).
             show_mask: if self.show_mask { 1.0 } else { 0.0 },
-            // Tone curve: `clamp(ratio * p^exp, 0, 1)`, applied before the
-            // exposure multiply.
+            // Tone curve: `clamp(ratio * p^exp, 0, 1)`, applied after the
+            // inversion (the curve pivots are measured on the positive). For a
+            // non-inverted scan it multiplies BEFORE the exposure, mirrored by
+            // the CPU bake.
             curve_ratio,
             curve_exp,
+            // Film-negative inversion: on when the texture is a true
+            // sensor-linear negative the WGSL must density-invert per fragment.
+            inv: if self.inverted { 1.0 } else { 0.0 },
+            inv_base: self.inv_base,
+            inv_d_max: self.inv_d_max,
+            inv_gamma: self.inv_gamma,
         };
         queue.write_buffer(&pipeline.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -935,6 +1149,19 @@ struct Uniforms {
     curve_ratio: f32,
     /// Tone-curve exponent; `exp = contrast · rolloff · shadows`.
     curve_exp: f32,
+    /// Non-zero when the texture is a true sensor-linear NEGATIVE the shader
+    /// must density-invert per fragment (a film preset). Drives the WGSL
+    /// inversion branch in `shade()`.
+    inv: f32,
+    /// Clear-film transmission anchor (inversion black point): `film::positive`
+    /// maps `value == inv_base` to positive black.
+    inv_base: f32,
+    /// Usable density range above the base (stock `d_max`); `density == d_max`
+    /// maps to positive white.
+    inv_d_max: f32,
+    /// Density-space tone exponent (stock `gamma`) applied to normalized
+    /// density.
+    inv_gamma: f32,
 }
 
 // SAFETY: Uniforms is repr(C) with all f32 fields.
@@ -1016,6 +1243,7 @@ fn mono_to_half_bytes(mono: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::film::ACTIVE_STOCK;
 
     #[test]
     fn crop_uv_geometry_zero_crop_is_identity() {
@@ -1086,6 +1314,7 @@ mod tests {
             0,
             1,
             6000,
+            None,
         );
         assert_eq!(program.source_dimensions(), (6000, 4000));
 
@@ -1099,6 +1328,7 @@ mod tests {
             0,
             1,
             6000,
+            None,
         );
         assert_eq!(program.source_dimensions(), (4000, 6000));
 
@@ -1112,6 +1342,7 @@ mod tests {
             0,
             1,
             600,
+            None,
         );
         assert_eq!(program.source_dimensions(), (400, 600));
     }
@@ -1310,6 +1541,139 @@ mod tests {
         assert_eq!(shadow, MIN_ANCHOR);
         assert_eq!(mid, MIN_ANCHOR);
         assert_eq!(white, MIN_ANCHOR);
+    }
+
+    #[test]
+    fn sensor_gain_flips_sign_for_inverted_presets() {
+        // An already-positive preset multiplies the positive by 2^EV: +1 EV
+        // doubles it, EV 0 is the identity.
+        assert_eq!(sensor_gain(0.0, false), 1.0);
+        assert!((sensor_gain(1.0, false) - 2.0).abs() < 1e-6);
+        assert!((sensor_gain(-1.0, false) - 0.5).abs() < 1e-6);
+        // An INVERTED preset multiplies the sensor-negative by 2^-EV: +1 EV
+        // halves the transmission, densifying the film and brightening the
+        // positive — the same user-facing "brighter" direction as non-inverted.
+        assert!((sensor_gain(1.0, true) - 0.5).abs() < 1e-6);
+        assert!((sensor_gain(-1.0, true) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn film_anchor_fractiles_measure_sensor_ranks() {
+        // On a uniform transmission ramp the fractiles land at their nominal
+        // ranks: shadow from the 90th, mid from the median, white from the 2nd.
+        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
+        let (shadow, mid, white) = film_anchor_fractiles(&mono);
+        assert!((shadow - 0.90).abs() < 0.02, "shadow-rank {shadow}");
+        assert!((mid - 0.50).abs() < 0.01, "median {mid}");
+        assert!((white - 0.02).abs() < 0.02, "white-rank {white}");
+    }
+
+    #[test]
+    fn film_pivots_at_ev0_match_anchors_of_an_inverted_ramp() {
+        // At EV 0 the derived pivots must equal the regular anchors of a buffer
+        // that was density-inverted first — the CPU twin of what the WGSL
+        // renders. Fractiles in rank space + `invert_value` reproduce the
+        // old percentiles exactly (parity, so existing renders don't shift).
+        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
+        let stock = crate::film::ACTIVE_STOCK;
+        let fractiles = film_anchor_fractiles(&mono);
+        let (shadow, mid, white) = film_pivots_at_gain(fractiles, ACTIVE_STOCK.base, 1.0, stock);
+
+        let positive: Vec<f32> = mono
+            .iter()
+            .map(|&v| invert_value(v, ACTIVE_STOCK.base, &stock))
+            .collect();
+        let (shadow_direct, mid_direct, white_direct) = tone_anchors(&positive);
+
+        assert!((shadow - shadow_direct).abs() < 0.01, "{shadow} vs {shadow_direct}");
+        assert!((mid - mid_direct).abs() < 0.01, "{mid} vs {mid_direct}");
+        // The white anchor sits on the steepest part of this synthetic ramp
+        // (near-transmission samples map to near-black positive), so the
+        // `ANCHOR_INV_STRIDE` subsampling shifts the fractile separator sample
+        // slightly and the histograms quantize the steep transform — absorb
+        // that (real negatives don't sit exactly on the clear-film endpoint).
+        assert!((white - white_direct).abs() < 0.03, "{white} vs {white_direct}");
+
+        // The direction is inverted: a ramp of transmissions (clearer at the
+        // high end) maps to a descending positive, so the positive's mid-gray
+        // sits at the LOW end of the transmission ramp.
+        assert!(mid < 0.5, "inverted mid-anchor {mid} should sit below 0.5");
+    }
+
+    #[test]
+    fn film_pivots_track_the_current_ev() {
+        // The drift fix: pivots must anchor on the ACTUAL render at any EV, not
+        // the EV-0 the fractiles were captured at. Derive the pivots for +1 EV,
+        // then CPU-render the same frame at +1 EV and measure ITS percentiles —
+        // grid/detail/export must agree.
+        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
+        let stock = crate::film::ACTIVE_STOCK;
+        let base = ACTIVE_STOCK.base;
+        let gain = sensor_gain(1.0, true); // +1 EV on a film negative = × ½ sensor
+
+        let fractiles = film_anchor_fractiles(&mono);
+        let (shadow, mid, white) = film_pivots_at_gain(fractiles, base, gain, stock);
+
+        let rendered: Vec<f32> = mono
+            .iter()
+            .map(|&t| invert_value(t * gain, base, &stock))
+            .collect();
+        let (shadow_direct, mid_direct, white_direct) = tone_anchors(&rendered);
+
+        assert!((shadow - shadow_direct).abs() < 0.02, "{shadow} vs {shadow_direct}");
+        assert!((mid - mid_direct).abs() < 0.01, "{mid} vs {mid_direct}");
+        assert!((white - white_direct).abs() < 0.03, "{white} vs {white_direct}");
+
+        // And the derive drifts with EV: brightening the film lifts the white
+        // pivot above the frozen EV-0 value — the defect the fractiles fix.
+        let (_, _, white_ev0) = film_pivots_at_gain(fractiles, base, 1.0, stock);
+        assert!(white > white_ev0, "white pivot {white_ev0} must rise to {white}");
+    }
+
+    #[test]
+    fn set_exposure_rederives_inverted_pivots() {
+        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
+        let mut program = DetailProgram::new(
+            mono,
+            2001,
+            1,
+            0.0,
+            CropMargins::default(),
+            0,
+            1,
+            2001,
+            Some((ACTIVE_STOCK, ACTIVE_STOCK.base)),
+        );
+        let (white_ev0, mid_ev0) = (program.white, program.mid);
+
+        // +1 EV on the negative densifies the film → the positive brightens and
+        // its pivots must re-anchor on the new render (the drift fix).
+        program.set_exposure(1.0);
+        assert!(
+            program.white > white_ev0,
+            "white pivot {white_ev0} → {}",
+            program.white
+        );
+        assert!(
+            program.mid > mid_ev0,
+            "mid pivot {mid_ev0} → {}",
+            program.mid
+        );
+    }
+
+    #[test]
+    fn shadow_pivot_floor_keeps_the_shadows_power_usable() {
+        // A frame whose bottom decile is literal black (the clear-film plateau
+        // at EV ≤ 0) yields a shadow pivot near MIN_ANCHOR. Without the floor,
+        // `s^(1-ks)` ≈ 31× at ks=1.5 would blow the whole positive to white.
+        let (shadow, mid, white) = (MIN_ANCHOR, 0.3_f32, 0.9_f32);
+        let (ratio, exp) = curve_remap(1.0, 1.0, 1.5, shadow, mid, white);
+        let lifted_mid = ratio * mid.powf(exp);
+        assert!(lifted_mid < 1.0, "shadows power blew out the mid-gray: {lifted_mid}");
+
+        // The identity still travels through the floored pivot untouched.
+        let (ratio_id, exp_id) = curve_remap(1.0, 1.0, 1.0, shadow, mid, white);
+        assert!((ratio_id - 1.0).abs() < 1e-6 && (exp_id - 1.0).abs() < 1e-6);
     }
 
     #[test]
