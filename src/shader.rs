@@ -944,7 +944,11 @@ impl Primitive for DetailPrimitive {
         // curve slider (`set_curve`) or EV drag on an inverted preset
         // (`set_exposure` re-derives pivots) bumps `tone_version`, and this
         // re-uploads the ~4 KB LUT. The WGSL texture-samples it per fragment.
-        if pipeline.current_tone_version != Some(self.tone_version) {
+        // `tone_version` resets per program (each image install re-derives it),
+        // but the pipeline is cached across image selections — so also force a
+        // re-upload whenever a new image is installed, or the second frame on
+        // would keep sampling the previous frame's LUT until the user edits.
+        if needs_new_texture || pipeline.current_tone_version != Some(self.tone_version) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             let lut_w = TONE_LUT_ENTRIES as u32;
             queue.write_texture(
