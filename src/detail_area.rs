@@ -33,6 +33,8 @@ pub struct DetailArea<'a, Message, Theme = cosmic::Theme, Renderer = cosmic::Ren
     on_move: Option<Box<dyn Fn(Point) -> Message + 'a>>,
     /// Called on wheel scroll with the scroll delta.
     on_scroll: Option<Box<dyn Fn(mouse::ScrollDelta) -> Message + 'a>>,
+    /// Called with the widget's logical size whenever its layout bounds change.
+    on_resize: Option<Box<dyn Fn(Size) -> Message + 'a>>,
     /// [`mouse::Interaction`] to use when hovering the area.
     interaction: Option<mouse::Interaction>,
 }
@@ -42,6 +44,9 @@ pub struct DetailArea<'a, Message, Theme = cosmic::Theme, Renderer = cosmic::Ren
 struct State {
     was_over: bool,
     pressed: bool,
+    /// Last reported layout size, so `on_resize` only fires on actual changes
+    /// (publishing on every event would spin a message loop).
+    last_size: Size,
 }
 
 impl<'a, Message, Theme, Renderer> DetailArea<'a, Message, Theme, Renderer> {
@@ -53,6 +58,7 @@ impl<'a, Message, Theme, Renderer> DetailArea<'a, Message, Theme, Renderer> {
             on_release: None,
             on_move: None,
             on_scroll: None,
+            on_resize: None,
             interaction: None,
         }
     }
@@ -84,6 +90,16 @@ impl<'a, Message, Theme, Renderer> DetailArea<'a, Message, Theme, Renderer> {
     #[must_use]
     pub fn on_scroll(mut self, on_scroll: impl Fn(mouse::ScrollDelta) -> Message + 'a) -> Self {
         self.on_scroll = Some(Box::new(on_scroll));
+        self
+    }
+
+    /// The message to emit with the widget's logical size whenever its layout
+    /// bounds change (window resize, drawer open/close, …). The detail view
+    /// uses it to recompute the 1:1 ("100%") zoom cap, which depends on the
+    /// preview area's size.
+    #[must_use]
+    pub fn on_resize(mut self, on_resize: impl Fn(Size) -> Message + 'a) -> Self {
+        self.on_resize = Some(Box::new(on_resize));
         self
     }
 
@@ -173,6 +189,17 @@ where
         let state: &mut State = tree.state.downcast_mut();
         let bounds = layout.bounds();
         let over = cursor.is_over(bounds);
+
+        // Report layout size changes so the app can recompute the 1:1 zoom cap
+        // (depends on the preview area's size). Guarded on `last_size` so it
+        // fires once per actual change, not on every event.
+        let size = bounds.size();
+        if size != state.last_size {
+            state.last_size = size;
+            if let Some(on_resize) = self.on_resize.as_ref() {
+                shell.publish(on_resize(size));
+            }
+        }
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. })

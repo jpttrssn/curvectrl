@@ -313,6 +313,25 @@ impl DetailProgram {
         (self.src_w, self.src_h)
     }
 
+    /// The zoom level (in `log2` units, `1.0` = contain fit) at which the image
+    /// renders at 100% — one texture pixel per one physical screen pixel.
+    ///
+    /// Mirrors the WGSL's `contain = min(sc_w/dw, sc_h/dh)` with the live crop
+    /// and display rotation applied, so the cap tracks the ACTUAL on-screen
+    /// scale. `widget_w`/`widget_h` are the preview area's LOGICAL size and
+    /// `scale_factor` converts them to physical pixels, matching the shader's
+    /// `sc_w = bounds · scale_factor`. Floored at 1.0 (contain fit) so the cap
+    /// never drops below the minimum zoom.
+    #[must_use]
+    pub fn zoom_100(&self, widget_w: f32, widget_h: f32, scale_factor: f32) -> f32 {
+        let (_, (cw, ch)) =
+            crop_uv_geometry(self.crop, self.width, self.height, self.src_w, self.src_h);
+        let (dw, dh) = if (self.rotation & 1) != 0 { (ch, cw) } else { (cw, ch) };
+        let sc_w = (widget_w * scale_factor).max(1.0);
+        let sc_h = (widget_h * scale_factor).max(1.0);
+        1.0 + (dw / sc_w).max(dh / sc_h).log2().max(0.0)
+    }
+
     /// Wrap in a `Shader` widget sized to fill the parent.
     pub fn view<M>(&self) -> Shader<M, Self> {
         Shader::new(self.clone())
@@ -1490,6 +1509,68 @@ mod tests {
         let (origin, size) = crop_uv_geometry(crop, 256, 384, 4000, 6000);
         assert_eq!(origin, (0.0, 19.2));
         assert_eq!(size, (256.0, 384.0 - 38.4));
+    }
+
+    #[test]
+    fn zoom_100_mirrors_the_wgsl_contain_math() {
+        // 1:1 (one texture pixel per physical screen pixel) on a 2000×1000
+        // texture in a 1000×1000 logical widget at scale factor 1.0: the width
+        // axis needs 2× contain, so the cap is 1 + log2(2) = 2.0.
+        let program = DetailProgram::new(
+            vec![0.0; 2000 * 1000],
+            2000,
+            1000,
+            0.0,
+            CropMargins::default(),
+            0,
+            1,
+            2000,
+            None,
+        );
+        assert!((program.zoom_100(1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
+
+        // An odd display rotation swaps which axis contains: in a 2000×1000
+        // widget the cropped height (1000) is the limiting axis at 2× → still
+        // 2.0; without rotation the width (2000) exactly fills → cap 1.0.
+        let rotated = DetailProgram::new(
+            vec![0.0; 2000 * 1000],
+            2000,
+            1000,
+            0.0,
+            CropMargins::default(),
+            1,
+            1,
+            2000,
+            None,
+        );
+        assert!((rotated.zoom_100(2000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
+        assert!((program.zoom_100(2000.0, 1000.0, 1.0) - 1.0).abs() < 1e-5);
+
+        // Scale factor converts logical → physical: at 2× UI the same texture
+        // already fills a 1000-logical widget at 1:1, so the cap is contain.
+        assert!((program.zoom_100(1000.0, 1000.0, 2.0) - 1.0).abs() < 1e-5);
+
+        // A crop that halves the frame halves the cap (you magnify the crop).
+        let cropped = DetailProgram::new(
+            vec![0.0; 2000 * 1000],
+            2000,
+            1000,
+            0.0,
+            CropMargins {
+                top: 0,
+                right: 1000,
+                bottom: 0,
+                left: 0,
+            },
+            0,
+            1,
+            2000,
+            None,
+        );
+        assert!((cropped.zoom_100(1000.0, 1000.0, 1.0) - 1.0).abs() < 1e-5);
+
+        // A widget larger than the texture never drops the cap below contain.
+        assert!((program.zoom_100(4000.0, 4000.0, 1.0) - 1.0).abs() < 1e-5);
     }
 
     #[test]

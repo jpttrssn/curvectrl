@@ -16,7 +16,7 @@ use cosmic::iced::futures::SinkExt;
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
-use cosmic::iced::{ContentFit, Length, Point, Subscription};
+use cosmic::iced::{ContentFit, Length, Point, Size, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
 use std::collections::{HashMap, HashSet};
@@ -199,6 +199,9 @@ pub struct AppModel {
     /// Detail-view zoom in `log2` units: 1.0 = contain fit (whole frame),
     /// each +1 doubles the rendered scale.
     detail_zoom: f32,
+    /// The detail preview's laid-out logical size, reported by `DetailArea`
+    /// via `DetailAreaResized`; drives the 1:1 ("100%") zoom cap.
+    detail_area_size: Option<Size>,
     /// Pan offset of the image center from the widget center (logical points).
     detail_pan: (f32, f32),
     /// True while the user is pressing/dragging the detail preview (grab-pan).
@@ -637,6 +640,10 @@ pub enum Message {
     /// Wheel-scroll zoom in the detail view; payload is the change in zoom
     /// units (log2 of the scale ratio), positive = zoom in, negative = out.
     DetailZoom(f32),
+    /// The detail preview was (re)laid out; carries its new logical size. Used
+    /// to recompute the 1:1 ("100%") zoom cap, which depends on the preview
+    /// area's size (window resize, drawer open/close, …).
+    DetailAreaResized(Size),
     /// The user pressed the mouse on the detail preview — grab-pan begins.
     DetailPanPress,
     /// The cursor moved over the detail preview; while panning this shifts
@@ -1037,6 +1044,7 @@ impl cosmic::Application for AppModel {
             detail_last_frame: None,
             detail_thumb: None,
             detail_zoom: 1.0,
+            detail_area_size: None,
             detail_pan: (0.0, 0.0),
             detail_panning: false,
             detail_cursor: None,
@@ -1598,8 +1606,13 @@ impl cosmic::Application for AppModel {
             }
 
             Message::DetailZoom(delta) => {
-                let (new_zoom, new_pan) =
-                    apply_detail_zoom(self.detail_zoom, self.detail_pan, self.detail_cursor, delta);
+                let (new_zoom, new_pan) = apply_detail_zoom(
+                    self.detail_zoom,
+                    self.detail_pan,
+                    self.detail_cursor,
+                    delta,
+                    self.max_detail_zoom(),
+                );
                 self.detail_zoom = new_zoom;
                 self.detail_pan = new_pan;
                 if let Some(shader) = &mut self.detail_shader {
@@ -1609,6 +1622,12 @@ impl cosmic::Application for AppModel {
                 if self.detail_zoom >= NATIVE_ZOOM_THRESHOLD && !self.detail_native_queued {
                     return self.decode_detail_next();
                 }
+                Task::none()
+            }
+
+            Message::DetailAreaResized(size) => {
+                self.detail_area_size = Some(size);
+                self.reclamp_detail_zoom();
                 Task::none()
             }
 
@@ -1683,6 +1702,7 @@ impl cosmic::Application for AppModel {
                     shader.set_crop(self.reset_crop);
                     shader.set_rotation(self.reset_rotation);
                 }
+                self.reclamp_detail_zoom();
                 Task::none()
             }
 
@@ -1721,6 +1741,7 @@ impl cosmic::Application for AppModel {
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_crop(next);
                 }
+                self.reclamp_detail_zoom();
                 self.commit_edit()
             }
 
@@ -1735,6 +1756,7 @@ impl cosmic::Application for AppModel {
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_crop(self.crop);
                 }
+                self.reclamp_detail_zoom();
                 self.commit_edit()
             }
 
@@ -2939,6 +2961,9 @@ impl AppModel {
             shader.set_crop(self.crop);
             shader.set_rotation(self.rotation);
         }
+        // A new texture (first decode or the native level-up) changes the 1:1
+        // cap, so re-derive it and clamp the current zoom.
+        self.reclamp_detail_zoom();
         // A cached overview that was already at native resolution needs no
         // level-up re-decode.
         if src_long_edge <= HI_RES_SIZE {
@@ -3052,6 +3077,7 @@ impl AppModel {
         self.detail_last_frame = None;
         self.detail_thumb = None;
         self.detail_zoom = 1.0;
+        self.detail_area_size = None;
         self.detail_native_queued = false;
         self.detail_pan = (0.0, 0.0);
         self.detail_panning = false;
@@ -3076,6 +3102,38 @@ impl AppModel {
         self.reset_curve_shadows = 1.0;
         self.reset_crop = edit_manifest::CropMargins::default();
         self.reset_rotation = 0;
+    }
+
+    /// The effective maximum zoom for the current detail view: the 1:1 ("100%")
+    /// point (one image pixel per physical screen pixel) for the live shader's
+    /// texture at the preview's current size, capped by the absolute
+    /// [`MAX_DETAIL_ZOOM`] guard. Falls back to [`MAX_DETAIL_ZOOM`] until both
+    /// a shader and a reported preview size exist.
+    fn max_detail_zoom(&self) -> f32 {
+        let Some(shader) = &self.detail_shader else {
+            return MAX_DETAIL_ZOOM;
+        };
+        let Some(size) = self.detail_area_size else {
+            return MAX_DETAIL_ZOOM;
+        };
+        let sf = self.core().scale_factor();
+        shader
+            .zoom_100(size.width, size.height, sf)
+            .min(MAX_DETAIL_ZOOM)
+    }
+
+    /// Recompute the 1:1 zoom cap and pull the current zoom down to it if it
+    /// shrank (texture level-up installs a larger texture and RAISES the cap;
+    /// a crop/rotation/resize can LOWER it). Pushes the (possibly clamped) view
+    /// to the shader so the render and state agree.
+    fn reclamp_detail_zoom(&mut self) {
+        let max = self.max_detail_zoom();
+        if self.detail_zoom > max {
+            self.detail_zoom = max;
+            if let Some(shader) = &mut self.detail_shader {
+                shader.set_view(self.detail_zoom, self.detail_pan);
+            }
+        }
     }
 
     /// Writes the in-memory roll edits to the open roll's manifest file on disk.
@@ -3191,6 +3249,7 @@ impl AppModel {
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_crop(next);
                 }
+                self.reclamp_detail_zoom();
             }
             // A display rotation steps one quarter-turn counter-clockwise
             // (authoring the composite of the crop + the EXIF-upright frame;
@@ -3214,6 +3273,7 @@ impl AppModel {
         if let Some(shader) = &mut self.detail_shader {
             shader.set_rotation(self.rotation);
         }
+        self.reclamp_detail_zoom();
     }
 
     /// Copies the focused frame's full edit (exposure + tone curve) to the
@@ -3433,6 +3493,8 @@ impl AppModel {
                         shader.set_crop(self.crop);
                         shader.set_rotation(self.rotation);
                     }
+                    // The native texture widens the 1:1 cap; re-derive it.
+                    self.reclamp_detail_zoom();
                     // The level-up is one-shot: a decode that lands after the
                     // first shader IS the native one, and an overview that was
                     // decoded at its native resolution (sensor long edge ≤
@@ -4553,6 +4615,7 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                         .height(Length::Fill),
                 )
                 .on_scroll(|delta| Message::DetailZoom(detail_zoom_delta(delta)))
+                .on_resize(Message::DetailAreaResized)
                 .on_press(Message::DetailPanPress)
                 .on_move(Message::DetailPanMove)
                 .on_release(Message::DetailPanRelease),
@@ -4577,15 +4640,17 @@ fn detail_zoom_delta(delta: cosmic::iced::mouse::ScrollDelta) -> f32 {
 }
 
 /// Applies a wheel zoom `delta` (log2 units) to the detail view, clamping to
-/// `[1.0, MAX_DETAIL_ZOOM]`. Zooming all the way back out to contain fit
-/// re-centers the image. Returns the new `(zoom, pan)`.
+/// `[1.0, max_zoom]` (the 1:1 "100%" cap, see [`AppModel::max_detail_zoom`]).
+/// Zooming all the way back out to contain fit re-centers the image. Returns
+/// the new `(zoom, pan)`.
 fn apply_detail_zoom(
     zoom: f32,
     pan: (f32, f32),
     cursor: Option<Point>,
     delta: f32,
+    max_zoom: f32,
 ) -> (f32, (f32, f32)) {
-    let new_zoom = (zoom + delta).clamp(1.0, MAX_DETAIL_ZOOM);
+    let new_zoom = (zoom + delta).clamp(1.0, max_zoom);
     // At contain fit the whole frame must be centered. `zoom + delta <= 1.0`
     // is equivalent to `new_zoom == 1.0` because of the clamp above.
     let new_pan = if zoom + delta <= 1.0 {
@@ -7157,15 +7222,27 @@ mod tests {
 
     #[test]
     fn apply_detail_zoom_clamps_at_both_ends() {
-        let (zoom, _) = apply_detail_zoom(1.0, (0.0, 0.0), None, -1.0);
+        let (zoom, _) = apply_detail_zoom(1.0, (0.0, 0.0), None, -1.0, MAX_DETAIL_ZOOM);
         assert_eq!(zoom, 1.0);
-        let (zoom, _) = apply_detail_zoom(MAX_DETAIL_ZOOM, (0.0, 0.0), None, 9.0);
+        let (zoom, _) = apply_detail_zoom(MAX_DETAIL_ZOOM, (0.0, 0.0), None, 9.0, MAX_DETAIL_ZOOM);
         assert_eq!(zoom, MAX_DETAIL_ZOOM);
     }
 
     #[test]
+    fn apply_detail_zoom_clamps_at_the_hundred_percent_cap() {
+        // The 1:1 cap is the maximum: zooming past it stops there, and the cap
+        // itself is respected even when below MAX_DETAIL_ZOOM.
+        let cap = 4.25;
+        let (zoom, _) = apply_detail_zoom(4.0, (0.0, 0.0), None, 9.0, cap);
+        assert_eq!(zoom, cap);
+        // A cap below the current zoom clamps back down to it.
+        let (zoom, _) = apply_detail_zoom(6.0, (0.0, 0.0), None, 0.0, cap);
+        assert_eq!(zoom, cap);
+    }
+
+    #[test]
     fn apply_detail_zoom_returns_unchanged_pan_without_cursor() {
-        let (zoom, pan) = apply_detail_zoom(2.0, (13.0, -7.0), None, 0.5);
+        let (zoom, pan) = apply_detail_zoom(2.0, (13.0, -7.0), None, 0.5, 8.0);
         assert!((zoom - 2.5).abs() < 1e-6);
         assert_eq!(pan, (13.0, -7.0));
     }
@@ -7173,7 +7250,7 @@ mod tests {
     #[test]
     fn apply_detail_zoom_recenters_when_back_to_contain_fit() {
         // Zooming all the way out must give the centered contain view.
-        let (zoom, pan) = apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0);
+        let (zoom, pan) = apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
         assert_eq!(zoom, 1.0);
         assert_eq!(pan, (0.0, 0.0));
     }
