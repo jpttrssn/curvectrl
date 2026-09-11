@@ -232,7 +232,7 @@ where
                 shell.capture_event();
             }
 
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if over => {
                 if let Some(on_scroll) = self.on_scroll.as_ref() {
                     shell.publish(on_scroll(*delta));
                     shell.capture_event();
