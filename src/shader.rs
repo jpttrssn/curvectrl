@@ -109,6 +109,12 @@ pub struct DetailProgram {
     /// instead of frozen EV-0 values. `None` for a positive scan, whose pivots
     /// come straight from [`tone_anchors`] (EV-independent by construction).
     anchor_fractiles: Option<(f32, f32, f32)>,
+    /// The GPU tone LUT as `R16Float` bytes, rebuilt whenever the pivots or curve
+    /// powers change (see [`Self::rebuild_tone_lut`]).
+    tone_lut: Vec<u8>,
+    /// Monotonic id bumped on every tone-LUT rebuild; the pipeline re-uploads
+    /// the texture when it changes.
+    tone_version: u64,
     /// Monotonic id bumped by the app model on each new detail decode. Used
     /// to detect image changes and rebuild the GPU texture/bind group.
     image_id: u64,
@@ -203,8 +209,26 @@ impl DetailProgram {
             inv_gamma,
             stock,
             anchor_fractiles,
+            tone_lut: build_tone_lut(1.0, 1.0, 1.0, shadow, mid, white),
+            tone_version: 0,
             image_id,
         }
+    }
+
+    /// Rebuild the GPU tone LUT from the current pivots + curve powers and bump
+    /// its version, so the pipeline re-uploads the texture. Called whenever a
+    /// slider moves (`set_exposure` re-derives film pivots, `set_curve` changes
+    /// the powers). ~2048 powf ≈ µs — negligible on a drag tick.
+    fn rebuild_tone_lut(&mut self) {
+        self.tone_lut = build_tone_lut(
+            self.contrast,
+            self.rolloff,
+            self.shadows,
+            self.shadow,
+            self.mid,
+            self.white,
+        );
+        self.tone_version = self.tone_version.wrapping_add(1);
     }
 
     /// Update the exposure value (called on slider drag).
@@ -224,6 +248,7 @@ impl DetailProgram {
                 stock,
             );
         }
+        self.rebuild_tone_lut();
     }
 
     /// Update the zoom/pan transform (called on detail-view wheel/drag).
@@ -247,6 +272,7 @@ impl DetailProgram {
         self.contrast = contrast;
         self.rolloff = rolloff;
         self.shadows = shadows;
+        self.rebuild_tone_lut();
     }
 
     /// Update the live crop margins (called on each keyboard trim).
@@ -321,6 +347,8 @@ impl Clone for DetailProgram {
             inv_gamma: self.inv_gamma,
             stock: self.stock,
             anchor_fractiles: self.anchor_fractiles,
+            tone_lut: self.tone_lut.clone(),
+            tone_version: self.tone_version,
             image_id: self.image_id,
         }
     }
@@ -351,6 +379,8 @@ impl std::fmt::Debug for DetailProgram {
             .field("inv_gamma", &self.inv_gamma)
             .field("stock", &self.stock)
             .field("anchor_fractiles", &self.anchor_fractiles)
+            .field("tone_lut_len", &self.tone_lut.len())
+            .field("tone_version", &self.tone_version)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
             .finish()
@@ -376,12 +406,6 @@ impl<M> Program<M> for DetailProgram {
             exposure: self.exposure,
             zoom: self.zoom,
             pan: self.pan,
-            mid: self.mid,
-            white: self.white,
-            shadow: self.shadow,
-            contrast: self.contrast,
-            rolloff: self.rolloff,
-            shadows: self.shadows,
             crop: self.crop,
             rotation: self.rotation,
             show_mask: self.show_mask,
@@ -393,6 +417,8 @@ impl<M> Program<M> for DetailProgram {
             inv_base: self.inv_base,
             inv_d_max: self.inv_d_max,
             inv_gamma: self.inv_gamma,
+            tone_lut: self.tone_lut.clone(),
+            tone_version: self.tone_version,
             image_id: self.image_id,
         }
     }
@@ -521,7 +547,10 @@ pub(crate) fn film_anchor_fractiles(mono: &[f32]) -> (f32, f32, f32) {
 /// `r` maps through `invert_value(fractile · g)` — the exact transform the
 /// WGSL applies per fragment. Each pivot is floored at [`MIN_ANCHOR`] like
 /// [`tone_anchors`] guards its degenerate all-black frames.
-fn film_pivots_at_gain(
+///
+/// `pub(crate)` so the CPU bake tail (`app::bake_tone`) derives the same
+/// EV-exact pivots the detail shader does, keeping grid == detail == export.
+pub(crate) fn film_pivots_at_gain(
     fractiles: (f32, f32, f32),
     base: f32,
     gain: f32,
@@ -642,9 +671,10 @@ pub(crate) fn curve_remap(
 /// Apply the composed tone remap `T(p) = clamp(ratio · p^exp, 0, 1)` to a mono
 /// positive in place.
 ///
-/// This is the CPU twin of the WGSL's `clamp(curve_ratio * pow(p, curve_exp),
-/// 0, 1)` — the exact expression the grid thumbnail bake must match so a
-/// baked tile and the detail shader produce identical tones. Identity at the
+/// The CPU twin of the tone model the GPU consumes through its tone LUT (see
+/// [`tone_model`] + [`build_tone_lut`]) — the shared math the grid thumbnail
+/// and export bakes apply exactly, so a baked tile and the detail shader
+/// produce identical tones within the tested LUT tolerance. Identity at the
 /// `(1.0, 1.0, 1.0)` defaults; `shadow`/`mid`/`white` are the same anchors
 /// [`tone_anchors`] measures. A separate op from exposure (which the shader
 /// applies after), so callers must apply this *before* the `2^EV` gain to
@@ -661,8 +691,84 @@ pub(crate) fn apply_curve(
 ) {
     let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
     for value in mono.iter_mut() {
-        *value = (ratio * value.powf(exponent)).clamp(0.0, 1.0);
+        *value = tone_model(*value, ratio, exponent);
     }
+}
+
+/// The single per-pixel tone expression `clamp(ratio · p^exp, 0, 1)` — the
+/// only place the tone-remap math lives for the non-shader paths. The GPU
+/// texture-samples it from the tone LUT ([`build_tone_lut`]) instead of
+/// re-deriving the expression per fragment, so the tone model can change on
+/// the CPU without the WGSL ever changing.
+#[must_use]
+pub(crate) fn tone_model(p: f32, ratio: f32, exponent: f32) -> f32 {
+    (ratio * p.powf(exponent)).clamp(0.0, 1.0)
+}
+
+/// Number of entries in the GPU tone LUT. 2048 on a smooth monotone curve is
+/// far below a u8 level after half-float quantization, so the interpolation is
+/// visually lossless while keeping the LUT a ~4 KB texture.
+pub(crate) const TONE_LUT_ENTRIES: usize = 2048;
+
+/// The LUT's sampling domain exponent: the LUT is built over `t ∈ [0,1]` where
+/// the curve's input is `p = t^G`. Power tone curves with `exp < 1` (a shadow
+/// lift, e.g. `p^0.3`) have an infinite slope at `p = 0`, so a uniform grid in
+/// `p` badly undershoots the darkest entries. Sampling on `t = p^(1/G)` packs
+/// the grid toward black, where the curve becomes near-linear in `t` and the
+/// interpolation error collapses. Must match the WGSL's `pow(p, 1/G)`.
+pub(crate) const TONE_LUT_GAMMA: f32 = 2.2;
+
+/// Pre-scale factor applied to the LUT's stored values (the shader divides it
+/// back out after sampling). The LUT stores the PRE-exposure curve output,
+/// which for a darkening curve can sit far below the half-float normal floor
+/// (6.1e-5) and would flush to zero — while the CPU bake preserves it in f32
+/// and the later `2^EV` gain amplifies it. Scaling by 512 shifts the floor to
+/// ~1.2e-7, deep below anything the ±4 EV slider can recover. Scale commutes
+/// with linear interpolation, so the sampled value is exact after the divide.
+pub(crate) const TONE_LUT_SCALE: f32 = 512.0;
+
+/// Build the GPU tone LUT: [`TONE_LUT_ENTRIES`] samples of [`tone_model`] over
+/// `p = t^G ∈ [0,1]` (see [`TONE_LUT_GAMMA`]), scaled by [`TONE_LUT_SCALE`] and
+/// returned as `R16Float` (half) bytes ready for `write_texture`. The WGSL
+/// samples this with linear interpolation at `t = p^(1/G)` and divides out the
+/// scale; the CPU bakes call [`tone_model`] directly (exact), so the only
+/// approximation anywhere is the LUT itself — bounded and unit-tested.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub(crate) fn build_tone_lut(
+    contrast: f32,
+    rolloff: f32,
+    shadows: f32,
+    shadow: f32,
+    mid: f32,
+    white: f32,
+) -> Vec<u8> {
+    let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
+    let mut lut = Vec::with_capacity(TONE_LUT_ENTRIES * 2);
+    for i in 0..TONE_LUT_ENTRIES {
+        let t = i as f32 / (TONE_LUT_ENTRIES - 1) as f32;
+        let p = t.powf(TONE_LUT_GAMMA);
+        lut.extend_from_slice(
+            &f32_to_half(tone_model(p, ratio, exponent) * TONE_LUT_SCALE).to_le_bytes(),
+        );
+    }
+    lut
+}
+
+/// Sample a decoded tone LUT with the same linear interpolation a GPU sampler
+/// applies, mapping the curve input through the gamma domain exactly as the
+/// WGSL does (`t = p^(1/G)`) and dividing out [`TONE_LUT_SCALE`]. Used by the
+/// parity tests to simulate the GPU fragment math from the uploaded half LUT.
+#[cfg(test)]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub(crate) fn sample_tone_lut_f32(lut: &[f32], p: f32) -> f32 {
+    let t = p.clamp(0.0, 1.0).powf(1.0 / TONE_LUT_GAMMA);
+    let pos = t * (TONE_LUT_ENTRIES - 1) as f32;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(TONE_LUT_ENTRIES - 1);
+    let frac = pos - lo as f32;
+    (lut[lo] * (1.0 - frac) + lut[hi] * frac) / TONE_LUT_SCALE
 }
 
 // ---------------------------------------------------------------------------
@@ -683,18 +789,6 @@ pub struct DetailPrimitive {
     zoom: f32,
     /// Pan offset of the image center from the widget center (logical points).
     pan: (f32, f32),
-    /// Mid-gray pivot (median of the positive), measured once at decode.
-    mid: f32,
-    /// White-point pivot (98th percentile of the positive).
-    white: f32,
-    /// Shadow anchor (10th percentile of the positive).
-    shadow: f32,
-    /// Contrast power (pivots at `mid`; 1.0 = identity).
-    contrast: f32,
-    /// Highlight-rolloff power (pivots at `white`; 1.0 = identity).
-    rolloff: f32,
-    /// Shadows power (pivots at `shadow`; 1.0 = identity).
-    shadows: f32,
     /// Live source-pixel crop margins removed from each edge (uniform UV-remap).
     crop: CropMargins,
     /// User display rotation (cumulative CCW 90° quarter-turns, `0`…`3`),
@@ -719,6 +813,10 @@ pub struct DetailPrimitive {
     /// authored against (see [`crop_uv_geometry`]).
     src_w: u32,
     src_h: u32,
+    /// The GPU tone LUT (`R16Float` bytes) and its version, so `prepare`
+    /// re-uploads the texture when the curve/pivots change.
+    tone_lut: Vec<u8>,
+    tone_version: u64,
     image_id: u64,
 }
 
@@ -803,11 +901,53 @@ impl Primitive for DetailPrimitive {
                             binding: 2,
                             resource: pipeline.uniform_buf.as_entire_binding(),
                         },
+                        cosmic::iced::wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: cosmic::iced::wgpu::BindingResource::TextureView(
+                                &pipeline.tone_lut_view,
+                            ),
+                        },
+                        cosmic::iced::wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: cosmic::iced::wgpu::BindingResource::Sampler(
+                                &pipeline.sampler,
+                            ),
+                        },
                     ],
                 },
             ));
             pipeline.current_image_id = Some(self.image_id);
             pipeline.initialized = true;
+        }
+
+        // --- Upload the tone LUT when the curve/pivots changed ---
+        // A fixed 2048×1 R16Float texture created once in `Pipeline::new`; a
+        // curve slider (`set_curve`) or EV drag on an inverted preset
+        // (`set_exposure` re-derives pivots) bumps `tone_version`, and this
+        // re-uploads the ~4 KB LUT. The WGSL texture-samples it per fragment.
+        if pipeline.current_tone_version != Some(self.tone_version) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let lut_w = TONE_LUT_ENTRIES as u32;
+            queue.write_texture(
+                cosmic::iced::wgpu::TexelCopyTextureInfo {
+                    texture: &pipeline.tone_lut_tex,
+                    mip_level: 0,
+                    origin: cosmic::iced::wgpu::Origin3d::ZERO,
+                    aspect: cosmic::iced::wgpu::TextureAspect::All,
+                },
+                &self.tone_lut,
+                cosmic::iced::wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lut_w * 2),
+                    rows_per_image: Some(1),
+                },
+                cosmic::iced::wgpu::Extent3d {
+                    width: lut_w,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            pipeline.current_tone_version = Some(self.tone_version);
         }
 
         // --- Per-frame: update uniform buffer ---
@@ -831,19 +971,6 @@ impl Primitive for DetailPrimitive {
         // Display rotation as a float quarter-turn count for the WGSL remap.
         // `0.0` = identity; the WGSL keeps it in {0,1,2,3} by construction.
         let rot = f32::from(self.rotation & 3);
-        // Live tone remap: contrast pivots at the measured mid-gray, highlight
-        // rolloff at the measured white point, shadows at the measured shadow
-        // anchor. Composed on the CPU into one `ratio · p^exp`; identity at
-        // the 1.0 defaults, so untouched renders stay byte-identical to the
-        // pre-curve pass.
-        let (curve_ratio, curve_exp) = curve_remap(
-            self.contrast,
-            self.rolloff,
-            self.shadows,
-            self.shadow,
-            self.mid,
-            self.white,
-        );
         let uniforms = Uniforms {
             // Convert raw EV (slider value) to the linear-light sensor gain
             // once per frame; for an inverted (film) preset the sign flips so
@@ -872,12 +999,6 @@ impl Primitive for DetailPrimitive {
             rot,
             // Whether to draw the full-frame dim overlay (see set_show_mask).
             show_mask: if self.show_mask { 1.0 } else { 0.0 },
-            // Tone curve: `clamp(ratio * p^exp, 0, 1)`, applied after the
-            // inversion (the curve pivots are measured on the positive). For a
-            // non-inverted scan it multiplies BEFORE the exposure, mirrored by
-            // the CPU bake.
-            curve_ratio,
-            curve_exp,
             // Film-negative inversion: on when the texture is a true
             // sensor-linear negative the WGSL must density-invert per fragment.
             inv: if self.inverted { 1.0 } else { 0.0 },
@@ -951,6 +1072,13 @@ pub struct DetailPipeline {
     bind_group_layout: cosmic::iced::wgpu::BindGroupLayout,
     bind_group: Option<cosmic::iced::wgpu::BindGroup>,
     render_pipeline: Option<cosmic::iced::wgpu::RenderPipeline>,
+    /// The fixed 2048×1 `R16Float` tone LUT texture (created once here) + its
+    /// view; `prepare()` re-uploads the bytes when `tone_version` changes.
+    tone_lut_tex: cosmic::iced::wgpu::Texture,
+    tone_lut_view: cosmic::iced::wgpu::TextureView,
+    /// Version of the tone LUT currently uploaded; compared against the
+    /// primitive's `tone_version` every frame to detect curve/pivot edits.
+    current_tone_version: Option<u64>,
     initialized: bool,
     /// Identity of the image currently installed in the GPU texture. Compared
     /// against the primitive's `image_id` on every `prepare()` call to detect
@@ -992,6 +1120,29 @@ impl Pipeline for DetailPipeline {
             ..Default::default()
         });
 
+        // The tone LUT texture lives for the pipeline's lifetime: a fixed
+        // 2048×1 R16Float strip re-uploaded by `prepare()` when the curve or
+        // pivots change (the mono texture + bind group are still created
+        // lazily below on the first frame, since they need the mono data).
+        let tone_lut_tex = device.create_texture(&cosmic::iced::wgpu::TextureDescriptor {
+            label: Some("exposure tone lut"),
+            size: cosmic::iced::wgpu::Extent3d {
+                #[allow(clippy::cast_possible_truncation)]
+                width: TONE_LUT_ENTRIES as u32,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: cosmic::iced::wgpu::TextureDimension::D2,
+            format: cosmic::iced::wgpu::TextureFormat::R16Float,
+            usage: cosmic::iced::wgpu::TextureUsages::TEXTURE_BINDING
+                | cosmic::iced::wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let tone_lut_view =
+            tone_lut_tex.create_view(&cosmic::iced::wgpu::TextureViewDescriptor::default());
+
         // Bind group and texture are created lazily in `prepare()` on the
         // first frame (they require the mono data to build the texture).
 
@@ -1002,6 +1153,9 @@ impl Pipeline for DetailPipeline {
             bind_group_layout,
             bind_group: None,
             render_pipeline: Some(render_pipeline),
+            tone_lut_tex,
+            tone_lut_view,
+            current_tone_version: None,
             initialized: false,
             current_image_id: None,
         }
@@ -1055,6 +1209,25 @@ fn build_bind_group_layout(
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
+                count: None,
+            },
+            // The 2048×1 R16Float tone LUT + its (shared) linear sampler.
+            cosmic::iced::wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: cosmic::iced::wgpu::ShaderStages::FRAGMENT,
+                ty: cosmic::iced::wgpu::BindingType::Texture {
+                    sample_type: cosmic::iced::wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: cosmic::iced::wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            cosmic::iced::wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: cosmic::iced::wgpu::ShaderStages::FRAGMENT,
+                ty: cosmic::iced::wgpu::BindingType::Sampler(
+                    cosmic::iced::wgpu::SamplerBindingType::Filtering,
+                ),
                 count: None,
             },
         ],
@@ -1142,13 +1315,6 @@ struct Uniforms {
     /// draws the full uncropped frame on top of the zoomed crop and dims
     /// everything outside the crop rectangle.
     show_mask: f32,
-    /// Tone-curve ratio: contrast/rolloff/shadows power curves (pivoted at the
-    /// image's measured mid-gray, white point, and shadow anchor) composed
-    /// into a single `ratio·p^exp` pair. `(1.0, 1.0)` is the identity —
-    /// untouched renders are unchanged.
-    curve_ratio: f32,
-    /// Tone-curve exponent; `exp = contrast · rolloff · shadows`.
-    curve_exp: f32,
     /// Non-zero when the texture is a true sensor-linear NEGATIVE the shader
     /// must density-invert per fragment (a film preset). Drives the WGSL
     /// inversion branch in `shade()`.
@@ -1227,6 +1393,31 @@ fn f32_to_half(value: f32) -> u16 {
     }
 
     sign | ((half_exp as u16) << 10) | (half_mant as u16)
+}
+
+/// Decode a half-float bit pattern to f32 — the inverse of [`f32_to_half`].
+/// Used by the parity tests to simulate the GPU's half-float LUT texture.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x03ff) as u32;
+    if exp == 0 {
+        // Zero or subnormal → flush to zero (matches f32_to_half's subnormal
+        // handling: it never emits half subnormals).
+        return f32::from_bits(sign << 31);
+    }
+    if exp == 0x1f {
+        return if mant == 0 {
+            f32::from_bits((sign << 31) | 0x7f80_0000)
+        } else {
+            f32::from_bits((sign << 31) | 0x7fc0_0000)
+        };
+    }
+    // Re-bias the exponent: half bias 15 → f32 bias 127.
+    let f32_bits = (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13);
+    f32::from_bits(f32_bits)
 }
 
 /// Convert a `Vec<f32>` of linear mono values into an `R16Float`-compatible
@@ -1693,10 +1884,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_curve_matches_the_wgsl_expression() {
-        // `apply_curve` is the CPU twin of the WGSL's
-        // `clamp(curve_ratio * pow(p, curve_exp), 0, 1)` — re-derive the same
-        // expression independently and confirm they agree on a range of inputs.
+    fn apply_curve_matches_tone_model() {
+        // `apply_curve` folds the pivoted powers with `curve_remap` then applies
+        // the per-pixel `tone_model` expression — the single source of the tone
+        // math (the WGSL now texture-samples a LUT of it instead of re-deriving
+        // the expression). Re-derive the expression independently and confirm
+        // they agree across the input range.
         let (shadow, mid, white) = (0.18_f32, 0.42_f32, 0.93_f32);
         let (contrast, rolloff, shadows) = (1.25_f32, 0.7_f32, 1.3_f32);
         let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
@@ -1706,6 +1899,34 @@ mod tests {
             let mut v = [p];
             apply_curve(&mut v, contrast, rolloff, shadows, shadow, mid, white);
             assert!((v[0] - expected).abs() < 1e-6, "p {p}: {v:?} vs {expected}");
+        }
+    }
+
+    #[test]
+    fn tone_lut_reproduces_tone_model_within_tolerance() {
+        // The GPU samples a 2048×1 half-float LUT of `tone_model` with linear
+        // interpolation; the CPU bakes call `tone_model` exactly. Bound that
+        // approximation: building the LUT, decoding it back to f32 (as the
+        // R16Float sampler would), and interpolating must stay within a small
+        // tolerance of the exact expression everywhere.
+        let (shadow, mid, white) = (0.15_f32, 0.45_f32, 0.92_f32);
+        for (contrast, rolloff, shadows) in
+            [(1.0_f32, 1.0_f32, 1.0_f32), (1.25, 0.7, 1.3), (0.5, 2.0, 0.4), (1.8, 1.1, 2.5)]
+        {
+            let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
+            let bytes = build_tone_lut(contrast, rolloff, shadows, shadow, mid, white);
+            let lut: Vec<f32> = bytes
+                .chunks_exact(2)
+                .map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            for p in [0.0_f32, 0.01, 0.1, 0.5, 0.9, 0.999, 1.0] {
+                let exact = tone_model(p, ratio, exponent);
+                let sampled = sample_tone_lut_f32(&lut, p);
+                assert!(
+                    (sampled - exact).abs() <= 1e-3,
+                    "curve {contrast}/{rolloff}/{shadows} p {p}: lut {sampled} vs exact {exact}"
+                );
+            }
         }
     }
 

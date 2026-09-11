@@ -5124,7 +5124,7 @@ async fn export_one(
         width,
         height,
         src_long_edge,
-        inversion,
+        inversion: _,
     } = decode_raw_detail(
         dir,
         name,
@@ -5146,38 +5146,12 @@ async fn export_one(
     let source_h = (height as f32 / factor).round() as u32;
     let crop = scale_crop(crop, source_w, source_h, width, height);
 
-    // Bake the stored tone curve, exposure, then sRGB-encode — the detail
-    // shader's exact ordering per preset:
-    //  * film negative: EV gain on the TRUE sensor data first (2^-EV from the
-    //    user-space +EV, `sensor_gain`'s twin), then the density inversion,
-    //    then anchors/curve on the positive — the clear-film base is the EV0
-    //    measurement carried from the decode so the gain does not cancel
-    //    against a re-measured base.
-    //  * positive scan (None): anchors/curve, then the 2^EV gain (unchanged).
-    let inverted = preset.is_inverted();
-    let (shadow, mid, white) = if let Some((stock, base)) = inversion {
-        apply_exposure(&mut mono, -tone.exposure_ev);
-        invert_gray(&mut mono, &stock, base);
-        shader::tone_anchors(&mono)
-    } else {
-        shader::tone_anchors(&mono)
-    };
-    shader::apply_curve(
-        &mut mono,
-        tone.curve_contrast,
-        tone.curve_rolloff,
-        tone.curve_shadows,
-        shadow,
-        mid,
-        white,
-    );
-    if !inverted {
-        apply_exposure(&mut mono, tone.exposure_ev);
-    }
-
-    for value in &mut mono {
-        *value = srgb_encode(*value);
-    }
+    // Bake the stored tone curve, exposure, then sRGB-encode via the one
+    // shared tail (`bake_tone`) — the detail shader's exact ordering per preset:
+    // film negatives get the EV gain on the true sensor data first (2^-EV from
+    // the user-space +EV, `sensor_gain`'s twin), then the density inversion,
+    // then the EV-exact pivoted curve; positive scans get curve then gain.
+    bake_tone(&mut mono, tone, preset, base_config);
 
     match options.format {
         ExportFormat::Jpeg => export_jpeg(mono, width, height, crop, rotation, &dest, options),
@@ -5976,6 +5950,94 @@ fn crop_rgba16(
     (out, cw, rows)
 }
 
+/// Measures the tone pivots (shadow/mid-gray/white) a frame needs — WITHOUT
+/// mutating `mono` — plus, for a film negative, the resolved clear-film base and
+/// its stock (needed by the density inversion).
+///
+/// The inverted (film) path uses the shader's EV-exact mechanic: raw sensor
+/// fractiles measured on the intact pre-gain buffer, mapped through
+/// `invert_value(fractile · 2^-EV)` so the pivots describe the ACTUAL render at
+/// the current exposure. The positive path measures the regular anchors on the
+/// positive. Returning the pair separately lets the whole-frame parity test feed
+/// `render_tail` and the WGSL reference the identical inputs.
+fn pivots_for(
+    mono: &[f32],
+    tone: edit_manifest::ToneEdit,
+    preset: FilmPreset,
+    base_config: BaseConfig,
+) -> (Option<(MonoStock, f32)>, (f32, f32, f32)) {
+    if let Some(stock) = preset.stock() {
+        // Measured BEFORE any gain so the ranks stay in the shader's upload
+        // domain (the gain would shift them).
+        let fractiles = shader::film_anchor_fractiles(mono);
+        let measured = if base_config.auto {
+            measure_base(mono)
+        } else {
+            None
+        };
+        let base = base_config.resolve(measured, &stock);
+        let pivots = shader::film_pivots_at_gain(
+            fractiles,
+            base,
+            shader::sensor_gain(tone.exposure_ev, true),
+            stock,
+        );
+        (Some((stock, base)), pivots)
+    } else {
+        (None, shader::tone_anchors(mono))
+    }
+}
+
+/// Applies the detail shader's exact per-pixel tone ordering to a mono buffer in
+/// place, then sRGB-encodes: for a film negative the EV gain hits the true
+/// sensor data first (`2^-EV`), then the density inversion, then the pivoted
+/// curve; for an already-positive scan the curve comes first, then the `2^EV`
+/// gain. `stock_and_base` is `Some((stock, base))` exactly when the buffer is a
+/// negative to invert. Shared by the grid thumbnail bake, the export bake, and
+/// the WGSL-parity tests.
+fn render_tail(
+    mono: &mut [f32],
+    tone: edit_manifest::ToneEdit,
+    stock_and_base: Option<(MonoStock, f32)>,
+    pivots: (f32, f32, f32),
+) {
+    if let Some((stock, base)) = stock_and_base {
+        apply_exposure(mono, -tone.exposure_ev);
+        invert_gray(mono, &stock, base);
+    }
+    let (shadow, mid, white) = pivots;
+    shader::apply_curve(
+        mono,
+        tone.curve_contrast,
+        tone.curve_rolloff,
+        tone.curve_shadows,
+        shadow,
+        mid,
+        white,
+    );
+    if stock_and_base.is_none() {
+        apply_exposure(mono, tone.exposure_ev);
+    }
+    for value in mono {
+        *value = srgb_encode(*value);
+    }
+}
+
+/// The one shared tone tail for every CPU bake (grid thumbnails and exports):
+/// measure the pivots from `mono`, then apply the shader's exact ordering and
+/// sRGB-encode. Grid == detail == export hold structurally because this single
+/// body (plus its WGSL-parity tests) is the only place the tone math lives for
+/// the non-shader paths.
+fn bake_tone(
+    mono: &mut [f32],
+    tone: edit_manifest::ToneEdit,
+    preset: FilmPreset,
+    base_config: BaseConfig,
+) {
+    let (stock_and_base, pivots) = pivots_for(mono, tone, preset, base_config);
+    render_tail(mono, tone, stock_and_base, pivots);
+}
+
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
 /// dimension exceeds `max_size`, baking the tone edit (`ToneEdit`: exposure,
 /// curve powers) and the display rotation into the pixels.
@@ -6000,56 +6062,12 @@ fn convert_thumbnail(
     // on the positive.
     unsharp_mask(&mut mono, width as usize, height as usize);
 
-    // Film negative: the EV gain multiplies the true sensor data FIRST (2^-EV
-    // from the user-space +EV — `sensor_gain`'s twin), its black point anchored
-    // on the frame's clearest film MEASURED AT EV0 (before the gain, so it
-    // does not cancel against a re-measured base), then the density inversion
-    // yields the positive. An already-positive scan (`None`) stays true sensor
-    // data for the whole bake. The resolution order is the roll's: an explicit
-    // calibration wins, then the per-frame auto opt-in, then the stock's
-    // preset base — and when auto is off the measurement is never computed.
-    let inverted = preset.is_inverted();
-    if let Some(stock) = preset.stock() {
-        let measured = if base_config.auto {
-            measure_base(&mono)
-        } else {
-            None
-        };
-        let base = base_config.resolve(measured, &stock);
-        apply_exposure(&mut mono, -tone.exposure_ev);
-        invert_gray(&mut mono, &stock, base);
-    }
-
-    // Bake the stored tone curve (contrast + highlight rolloff + shadows) in
-    // linear light, using the same anchor measurement + remap the detail
-    // shader uses, applied BEFORE the exposure gain on a positive scan to
-    // mirror the shader's ordering exactly (curve first, then `2^EV`, then
-    // clamp/sRGB). For a film negative the curve shapes the freshly inverted
-    // positive just as the shader shapes it per fragment. At the identity
-    // curve this is a no-op, so untouched renders stay byte-identical to
-    // pre-curve ones.
-    let (shadow, mid, white) = shader::tone_anchors(&mono);
-    shader::apply_curve(
-        &mut mono,
-        tone.curve_contrast,
-        tone.curve_rolloff,
-        tone.curve_shadows,
-        shadow,
-        mid,
-        white,
-    );
-
-    // Bake the stored exposure in linear light, matching the detail shader's
-    // ordering per preset: a positive scan gets `mono_linear * 2^EV` after the
-    // curve remap; a film negative already had its gain folded into the sensor
-    // data pre-inversion above.
-    if !inverted {
-        apply_exposure(&mut mono, tone.exposure_ev);
-    }
-
-    for value in &mut mono {
-        *value = srgb_encode(*value);
-    }
+// The one shared tone tail: measure the EV-exact (film) or histogram
+    // (positive) pivots, apply the shader's exact ordering per preset (gain
+    // before the density inversion for a negative, curve then gain for a
+    // positive scan), then sRGB-encode — the same `bake_tone` every CPU bake
+    // uses, so grid == detail == export hold structurally.
+    bake_tone(&mut mono, tone, preset, base_config);
 
     let mut rgba = Vec::with_capacity(mono.len() * 4);
     for &value in &mono {
@@ -8163,5 +8181,139 @@ mod tests {
         // A JPEG stream always starts with the SOI marker FF D8 FF.
         assert!(bytes.len() > 4, "encoded stream has payload");
         assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    /// The GPU side of the bake-parity tests: a Rust simulation of `exposure.wgsl`
+    /// `shade()` where the tone remap comes from the same 2048×1 R16Float tone
+    /// LUT the shader texture-samples (decoded to f32 + linear interpolation,
+    /// via [`shader::sample_tone_lut_f32`]). The CPU bakes call [`tone_model`]
+    /// exactly; the only approximation anywhere is the LUT itself, so this
+    /// diffing bounds that approximation rather than a duplicated expression.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_fragment(
+        mono: f32,
+        exposure: f32,
+        inv: bool,
+        inv_base: f32,
+        inv_d_max: f32,
+        inv_gamma: f32,
+        tone_lut: &[f32],
+    ) -> f32 {
+        let mono_linear = mono;
+        let v = if inv {
+            let transmission = mono_linear * exposure;
+            let clamped = transmission.clamp(1e-6, inv_base);
+            let density = -(clamped / inv_base).ln() / 10.0_f32.ln();
+            let position = (density / inv_d_max).clamp(0.0, 1.0);
+            let positive = position.powf(inv_gamma);
+            shader::sample_tone_lut_f32(tone_lut, positive)
+        } else {
+            let remapped = shader::sample_tone_lut_f32(tone_lut, mono_linear);
+            (remapped * exposure).clamp(0.0, 1.0)
+        };
+        srgb_encode(v)
+    }
+
+    /// Decode a `build_tone_lut` half-float byte buffer back to f32, matching
+    /// what the GPU's R16Float sampler would hand back (modulo the sampler's
+    /// own linear interpolation).
+    fn half_lut_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(2)
+            .map(|c| shader::half_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
+    }
+
+    /// Deterministic LCG so the differential tests are reproducible run-to-run.
+    #[allow(clippy::cast_possible_truncation)]
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Top 23 mantissa bits of [1.0, 2.0), mapped to [0.0, 1.0).
+            let bits = ((self.0 >> 40) as u32 & 0x007F_FFFF) | 0x3F80_0000;
+            f32::from_bits(bits) - 1.0
+        }
+    }
+
+    #[test]
+    fn cpu_bake_matches_gpu_lut_simulation_on_random_frames() {
+        // Randomize every input (frame values, EV, curve powers, preset, base
+        // mode) and assert `bake_tone` (grid/export, exact `tone_model`) == the
+        // GPU detail path (the same tone model delivered through a half-float
+        // LUT + linear interpolation, simulated via `gpu_fragment`) — the
+        // structural guarantee that the three render paths cannot drift beyond
+        // the accepted LUT approximation. `pivots_for` is called on the
+        // untouched frame on both sides, so they share identical pivots.
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+        for case in 0..64 {
+            let ev = rng.next() * 7.0 - 3.0;
+            let tone = edit_manifest::ToneEdit {
+                exposure_ev: ev,
+                curve_contrast: rng.next() * 1.5 + 0.5,
+                curve_rolloff: rng.next() * 1.5 + 0.5,
+                curve_shadows: rng.next() * 1.5 + 0.5,
+            };
+            let preset = if rng.next() < 0.5 {
+                FilmPreset::None
+            } else {
+                FilmPreset::Hp5Plus
+            };
+            let base_config = BaseConfig {
+                calibrated: (rng.next() < 0.4).then(|| rng.next() * 0.5 + 0.3),
+                auto: rng.next() < 0.3,
+            };
+            let mut mono: Vec<f32> = (0..256).map(|_| rng.next()).collect();
+            // Stress the clamps with hard extremes.
+            mono[0] = 0.0;
+            mono[1] = 1.0;
+            mono[64] = 1e-6;
+
+            let mut baked = mono.clone();
+            bake_tone(&mut baked, tone, preset, base_config);
+
+            let (stock_and_base, pivots) = pivots_for(&mono, tone, preset, base_config);
+            let (shadow, mid, white) = pivots;
+            // The GPU side delivers the same tone model through the LUT.
+            let lut = half_lut_bytes_to_f32(&shader::build_tone_lut(
+                tone.curve_contrast,
+                tone.curve_rolloff,
+                tone.curve_shadows,
+                shadow,
+                mid,
+                white,
+            ));
+            let (exposure, inv, inv_base, inv_d_max, inv_gamma) = match stock_and_base {
+                Some((stock, base)) => (
+                    shader::sensor_gain(tone.exposure_ev, true),
+                    true,
+                    base,
+                    stock.d_max,
+                    stock.gamma,
+                ),
+                None => (shader::sensor_gain(tone.exposure_ev, false), false, 1.0, 1.0, 1.0),
+            };
+
+            for (i, &sample) in mono.iter().enumerate() {
+                let reference = gpu_fragment(
+                    sample,
+                    exposure,
+                    inv,
+                    inv_base,
+                    inv_d_max,
+                    inv_gamma,
+                    &lut,
+                );
+                let baked_value = baked[i];
+                assert!(
+                    (baked_value - reference).abs() <= 5e-4,
+                    "case {case} pixel {i} ({sample}): bake {baked_value} vs gpu {reference}"
+                );
+            }
+        }
     }
 }
