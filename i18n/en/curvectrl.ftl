@@ -20,7 +20,6 @@ roll-frames = {$count ->
    *[other] {$count} frames
 }
 git-description = Git commit {$hash} on {$date}
-editing-title = Editing
 exposure-label = Exposure
 contrast-label = Contrast
 rolloff-label = Highlights

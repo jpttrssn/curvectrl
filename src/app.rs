@@ -537,12 +537,7 @@ pub enum Message {
     DetailReady(String, FilmPreset, Result<DetailDecode, ()>),
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
-    DetailPreloaded(
-        PathBuf,
-        String,
-        FilmPreset,
-        Result<DetailDecode, ()>,
-    ),
+    DetailPreloaded(PathBuf, String, FilmPreset, Result<DetailDecode, ()>),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
@@ -1154,11 +1149,7 @@ impl cosmic::Application for AppModel {
         let base_items = if negative_roll {
             vec![
                 menu::Item::Divider,
-                menu::Item::Button(
-                    fl!("menu-calibrate-base"),
-                    None,
-                    MenuAction::CalibrateBase,
-                ),
+                menu::Item::Button(fl!("menu-calibrate-base"), None, MenuAction::CalibrateBase),
                 menu::Item::Button(fl!("menu-auto-base"), None, MenuAction::AutoBase),
                 menu::Item::Button(fl!("menu-preset-base"), None, MenuAction::PresetBase),
             ]
@@ -1198,7 +1189,8 @@ impl cosmic::Application for AppModel {
         // view, or a roll selected on the library page (the RollInfo guards
         // make it a no-op everywhere else).
         let details_enabled = self.selected.is_some()
-            || (self.active.is_none() && matches!(&self.library_selection, Some(LibrarySelection::Roll(_))));
+            || (self.active.is_none()
+                && matches!(&self.library_selection, Some(LibrarySelection::Roll(_))));
         let details = if details_enabled {
             menu::Item::Button(fl!("menu-details"), None, MenuAction::Details)
         } else {
@@ -1287,14 +1279,14 @@ impl cosmic::Application for AppModel {
             )),
             ContextPage::Editing => {
                 // Without a selection there is nothing to edit.
-                self.selected.as_ref()?;
+                let name = self.selected.as_ref()?;
 
                 Some(
                     context_drawer::context_drawer(
                         editing_panel(self),
                         Message::ToggleContextPage(ContextPage::Editing),
                     )
-                    .title(fl!("editing-title")),
+                    .title(name),
                 )
             }
             ContextPage::RollInfo => {
@@ -1555,7 +1547,9 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::DetailReady(name, preset, result) => self.handle_detail_ready(&name, preset, result),
+            Message::DetailReady(name, preset, result) => {
+                self.handle_detail_ready(&name, preset, result)
+            }
 
             Message::DetailPreloaded(dir, name, preset, result) => {
                 self.handle_detail_preloaded(&dir, &name, preset, result)
@@ -1841,8 +1835,9 @@ impl cosmic::Application for AppModel {
                 // continues in parallel.
                 self.library_selection = Some(LibrarySelection::Roll(dir.clone()));
                 let scan_dir = dir.clone();
-                let card =
-                    cosmic::task::future(async move { Message::RollInfoLoaded(load_roll(scan_dir).await) });
+                let card = cosmic::task::future(async move {
+                    Message::RollInfoLoaded(load_roll(scan_dir).await)
+                });
                 // Drill straight into the new roll's frame grid, from wherever
                 // the app was when the roller was chosen.
                 let open = self.open_roll(dir);
@@ -1889,13 +1884,9 @@ impl cosmic::Application for AppModel {
 
             Message::CalibrateBaseFromFrame => self.calibrate_base_from_frame(),
 
-            Message::AutoBasePerFrame => {
-                self.set_base_mode(RollManifest::set_base_auto)
-            }
+            Message::AutoBasePerFrame => self.set_base_mode(RollManifest::set_base_auto),
 
-            Message::UsePresetBase => {
-                self.set_base_mode(RollManifest::use_preset_base)
-            }
+            Message::UsePresetBase => self.set_base_mode(RollManifest::use_preset_base),
 
             Message::RollSelected(dir) => {
                 self.library_selection = Some(LibrarySelection::Roll(dir));
@@ -2507,9 +2498,16 @@ impl AppModel {
             let mut tick = |done: usize, _total: usize| {
                 let _ = sender.try_send(Message::ExportProgress { done, total });
             };
-            let (ok, skipped, failed) =
-                export_frames(dir, dest.clone(), frames, options, preset, base_config, &mut tick)
-                    .await;
+            let (ok, skipped, failed) = export_frames(
+                dir,
+                dest.clone(),
+                frames,
+                options,
+                preset,
+                base_config,
+                &mut tick,
+            )
+            .await;
             let _ = sender
                 .send(Message::ExportDone {
                     ok,
@@ -3064,9 +3062,11 @@ impl AppModel {
 
         let base_config = self.roll.base_config();
 
-        Task::batch(pending.into_iter().map(|n| {
-            cosmic::task::future(preload_detail(dir.clone(), n, preset, base_config))
-        }))
+        Task::batch(
+            pending
+                .into_iter()
+                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n, preset, base_config))),
+        )
     }
 
     /// Reset all detail-view buffers, crossfade state, the view transform, and
@@ -4125,11 +4125,9 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
 fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let title = widget::text::heading(fl!("editing-title"));
-
     if app.detail_shader.is_none() {
         return widget::column::with_capacity(1)
-            .push(title)
+            .push("Loading...")
             .spacing(space_s)
             .width(Length::Fill)
             .into();
@@ -4221,7 +4219,6 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
     widget::column::with_capacity(20)
-        .push(title)
         .push(label)
         .push(slider)
         .push(contrast_label)
@@ -4286,10 +4283,7 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
     // HP5+ negative profile. Index order must match `FilmPreset::index()`.
     let roll_dir = roll.dir.clone();
     let preset = widget::dropdown::dropdown(
-        vec![
-            fl!("preset-none"),
-            ACTIVE_STOCK.name.to_owned(),
-        ],
+        vec![fl!("preset-none"), ACTIVE_STOCK.name.to_owned()],
         Some(roll.preset.index()),
         move |index| Message::RollPresetChanged(roll_dir.clone(), FilmPreset::from_index(index)),
     )
@@ -4620,7 +4614,6 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                 .on_move(Message::DetailPanMove)
                 .on_release(Message::DetailPanRelease),
             )
-            .push(widget::text(name))
             .spacing(space_s)
             .align_x(Horizontal::Center)
             .into(),
@@ -4929,15 +4922,7 @@ async fn decode_thumbnail(
     base_config: BaseConfig,
 ) -> Message {
     let result = decode_raw(dir, name.clone(), move |image| {
-        convert_thumbnail(
-            image,
-            THUMB_SIZE,
-            tone,
-            crop,
-            rotation,
-            preset,
-            base_config,
-        )
+        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset, base_config)
     })
     .await;
 
@@ -4958,15 +4943,7 @@ async fn decode_cover(dir: PathBuf, name: String, preset: FilmPreset) -> Message
     let rotation = manifest.rotation(&name) & 3;
     let base_config = manifest.base_config();
     let result = decode_raw(dir.clone(), name, move |image| {
-        convert_thumbnail(
-            image,
-            THUMB_SIZE,
-            tone,
-            crop,
-            rotation,
-            preset,
-            base_config,
-        )
+        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset, base_config)
     })
     .await;
 
@@ -4998,7 +4975,8 @@ async fn preload_detail(
     preset: FilmPreset,
     base_config: BaseConfig,
 ) -> Message {
-    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, preset, base_config).await;
+    let result =
+        decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, preset, base_config).await;
     Message::DetailPreloaded(dir, name, preset, result)
 }
 
@@ -6127,7 +6105,7 @@ fn convert_thumbnail(
     // on the positive.
     unsharp_mask(&mut mono, width as usize, height as usize);
 
-// The one shared tone tail: measure the EV-exact (film) or histogram
+    // The one shared tone tail: measure the EV-exact (film) or histogram
     // (positive) pivots, apply the shader's exact ordering per preset (gain
     // before the density inversion for a negative, curve then gain for a
     // positive scan), then sRGB-encode — the same `bake_tone` every CPU bake
@@ -7208,16 +7186,16 @@ mod tests {
             };
             assert_eq!((width, height), (10, 10));
             let count = pixels.len() / 4;
-            let sum: u32 = pixels
-                .chunks_exact(4)
-                .map(|p| u32::from(p[0]))
-                .sum::<u32>();
+            let sum: u32 = pixels.chunks_exact(4).map(|p| u32::from(p[0])).sum::<u32>();
             sum as f32 / count as f32
         };
 
         let ev0 = bake(0.0);
         let ev1 = bake(1.0);
-        assert!(ev1 > ev0 + 20.0, "+1EV must brighten an inverted preset: {ev0} → {ev1}");
+        assert!(
+            ev1 > ev0 + 20.0,
+            "+1EV must brighten an inverted preset: {ev0} → {ev1}"
+        );
     }
 
     #[test]
@@ -7250,7 +7228,8 @@ mod tests {
     #[test]
     fn apply_detail_zoom_recenters_when_back_to_contain_fit() {
         // Zooming all the way out must give the centered contain view.
-        let (zoom, pan) = apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
+        let (zoom, pan) =
+            apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
         assert_eq!(zoom, 1.0);
         assert_eq!(pan, (0.0, 0.0));
     }
@@ -8372,19 +8351,18 @@ mod tests {
                     stock.d_max,
                     stock.gamma,
                 ),
-                None => (shader::sensor_gain(tone.exposure_ev, false), false, 1.0, 1.0, 1.0),
+                None => (
+                    shader::sensor_gain(tone.exposure_ev, false),
+                    false,
+                    1.0,
+                    1.0,
+                    1.0,
+                ),
             };
 
             for (i, &sample) in mono.iter().enumerate() {
-                let reference = gpu_fragment(
-                    sample,
-                    exposure,
-                    inv,
-                    inv_base,
-                    inv_d_max,
-                    inv_gamma,
-                    &lut,
-                );
+                let reference =
+                    gpu_fragment(sample, exposure, inv, inv_base, inv_d_max, inv_gamma, &lut);
                 let baked_value = baked[i];
                 assert!(
                     (baked_value - reference).abs() <= 5e-4,
