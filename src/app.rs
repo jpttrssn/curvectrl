@@ -100,6 +100,8 @@ pub struct AppModel {
     core: cosmic::Core,
     /// Display a context drawer with the designated page if defined.
     context_page: ContextPage,
+    /// Per-view context-drawer open/closed memory (see [`DrawerMemory`]).
+    drawer_memory: DrawerMemory,
     /// The about page for this app.
     about: About,
     /// Key bindings for the application's menu bar, consumed by
@@ -177,6 +179,9 @@ pub struct AppModel {
     /// Names handed to the bounded in-flight thumbnail decodes, so re-baked
     /// tiles never double-spawn against the startup chain (memory bound).
     thumb_inflight: Vec<String>,
+    /// The frame whose EXIF parse is currently in flight for the frame-info
+    /// drawer, so a highlight change to the same frame does not double-spawn.
+    frame_meta_inflight: Option<String>,
     /// Persisted per-file edits for the film roll, loaded at startup and
     /// reconciled against the files on disk on each scan. Writes to the
     /// manifest happen only on explicit flush messages, never per frame.
@@ -367,12 +372,35 @@ pub struct Roll {
     pub thumb: Thumb,
 }
 
+/// Basic EXIF readout for the frame-info drawer, parsed lazily from the RAW
+/// file on demand and cached on its [`Tile`]. Every field is an already
+/// formatted display string (`None` = absent in the file).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FrameMeta {
+    width: Option<String>,
+    height: Option<String>,
+    make: Option<String>,
+    model: Option<String>,
+    iso: Option<String>,
+    exposure: Option<String>,
+    aperture: Option<String>,
+    focal: Option<String>,
+    lens: Option<String>,
+    date: Option<String>,
+}
+
 /// A file entry displayed as a tile on the open roll's frame grid.
 struct Tile {
     /// File name.
     name: String,
     /// Decoded thumbnail state.
     thumb: Thumb,
+    /// Lazy EXIF/dimension readout for the frame-info drawer (parsed once per
+    /// session); `None` until the first drawer request.
+    meta: Option<FrameMeta>,
+    /// Set when the file's metadata could not be parsed, so a failed read is
+    /// not re-attempted on every drawer open.
+    meta_failed: bool,
 }
 
 /// A decoded detail-view overview: the linear pre-sRGB mono buffer plus its
@@ -605,6 +633,9 @@ pub enum Message {
     GridViewport(Viewport),
     /// The frame scan for an opened roll finished.
     RollOpened(PathBuf, Vec<String>),
+    /// The frame-info drawer's lazy EXIF parse for a frame finished; carries
+    /// the parsed metadata (or a failure, which is cached so it is not retried).
+    FrameInfoReady(String, Result<FrameMeta, ()>),
     /// Activate the search field: reveal the header input (and focus it),
     /// mirroring cosmic-files' search icon toggle. No-op if already active.
     SearchActivate,
@@ -956,6 +987,7 @@ impl cosmic::Application for AppModel {
         let mut app = AppModel {
             core,
             context_page: ContextPage::default(),
+            drawer_memory: DrawerMemory::default(),
             about,
             key_binds: HashMap::from([
                 (
@@ -1031,6 +1063,7 @@ impl cosmic::Application for AppModel {
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
+            frame_meta_inflight: None,
             roll: RollManifest::default(),
             detail_shader: None,
             detail_inflight: None,
@@ -1184,11 +1217,13 @@ impl cosmic::Application for AppModel {
         );
 
         // The generic Details item opens the context drawer: the editing panel
-        // while a detail view is open, or the roll-info drawer on the library
+        // while a detail view is open, the frame-info drawer on the frames grid
+        // with a highlighted frame, or the roll-info drawer on the library
         // page. It stays enabled exactly where the drawer can open — a detail
-        // view, or a roll selected on the library page (the RollInfo guards
-        // make it a no-op everywhere else).
+        // view, a highlighted frame inside a roll, or a roll selected on the
+        // library page (the page guards make it a no-op everywhere else).
         let details_enabled = self.selected.is_some()
+            || (self.active.is_some() && self.frame_selected.is_some())
             || (self.active.is_none()
                 && matches!(&self.library_selection, Some(LibrarySelection::Roll(_))));
         let details = if details_enabled {
@@ -1308,6 +1343,26 @@ impl cosmic::Application for AppModel {
                         Message::ToggleContextPage(ContextPage::RollInfo),
                     )
                     .title(fl!("roll-info-title")),
+                )
+            }
+            ContextPage::FrameInfo => {
+                // Only meaningful on the frames grid with a highlighted frame:
+                // the drawer shows that frame's name/dimensions/EXIF, so an
+                // open detail view, an inactive roll, or no highlight closes it.
+                if self.selected.is_some() || self.active.is_none() {
+                    return None;
+                }
+                let name = self.frame_selected.as_ref()?;
+                if !self.tiles.iter().any(|tile| &tile.name == name) {
+                    return None;
+                }
+
+                Some(
+                    context_drawer::context_drawer(
+                        frame_info_panel(self, name),
+                        Message::ToggleContextPage(ContextPage::FrameInfo),
+                    )
+                    .title(name),
                 )
             }
         }
@@ -1496,54 +1551,44 @@ impl cosmic::Application for AppModel {
                     self.search = None;
                     return Task::none();
                 }
-                // On the library page, Escape first closes an open context
-                // drawer (roll info / about); only falls through when there is
-                // nothing open to close.
+                // Escape never closes a context drawer (only Space toggles it).
+                // On the library page it is a no-op beyond the search handling
+                // above.
                 if self.active.is_none() {
-                    if self.selected.is_none() && self.core.window.show_context {
-                        self.core_mut().set_show_context(false);
-                    }
                     return Task::none();
                 }
                 if self.selected.is_some() {
-                    // Escape closes an open context drawer (the editing panel)
-                    // first; the detail view itself survives until the next
-                    // Escape.
-                    if self.core.window.show_context {
-                        self.core_mut().set_show_context(false);
-                        return Task::none();
-                    }
-                    // Close the detail view; the frame highlight survives so
-                    // the grid still shows where you were.
+                    // Close the detail view immediately — the frame highlight
+                    // survives so the grid still shows where you were. The
+                    // editing drawer is not closed; the grid's own remembered
+                    // drawer state takes over.
                     self.selected = None;
                     self.clear_detail();
-                    // Without a selection the editing drawer has nothing to
-                    // show; close it so it does not linger empty.
-                    self.close_editing();
-                } else {
-                    // On the bare grid there is no intermediate de-select step:
-                    // Escape backs out of the roll entirely, resetting every
-                    // detail- and roll-page field so nothing from the closed
-                    // roll leaks into the library (the frame highlight is
-                    // dropped as part of the reset; edits were already flushed
-                    // by `persist_roll` at the top of this arm).
-                    self.active = None;
-                    self.selected = None;
-                    self.frame_selected = None;
-                    self.selected_frames.clear();
-                    self.selection_anchor = None;
-                    self.grid_viewport = None;
-                    self.tiles = Vec::new();
-                    self.thumb_inflight.clear();
-                    self.detail_inflight = None;
-                    self.detail_preload_inflight.clear();
-                    // The RAM manifest is dropped with the roll; re-opened
-                    // rolls re-load it (see `RollOpened`). The overview LRU is
-                    // deliberately kept: it survives roll switches by design.
-                    self.roll = edit_manifest::RollManifest::default();
-                    self.clear_detail();
-                    self.close_editing();
+                    self.restore_drawer_for(DrawerView::Grid);
+                    return self.ensure_frame_info_loaded().unwrap_or_else(Task::none);
                 }
+                // On the bare grid Escape backs out of the roll entirely,
+                // resetting every detail- and roll-page field so nothing from
+                // the closed roll leaks into the library (the frame highlight
+                // is dropped as part of the reset; edits were already flushed
+                // by `persist_roll` at the top of this arm).
+                self.active = None;
+                self.selected = None;
+                self.frame_selected = None;
+                self.selected_frames.clear();
+                self.selection_anchor = None;
+                self.grid_viewport = None;
+                self.tiles = Vec::new();
+                self.frame_meta_inflight = None;
+                self.thumb_inflight.clear();
+                self.detail_inflight = None;
+                self.detail_preload_inflight.clear();
+                // The RAM manifest is dropped with the roll; re-opened rolls
+                // re-load it (see `RollOpened`). The overview LRU is
+                // deliberately kept: it survives roll switches by design.
+                self.roll = edit_manifest::RollManifest::default();
+                self.clear_detail();
+                self.restore_drawer_for(DrawerView::Library);
                 Task::none()
             }
 
@@ -1785,6 +1830,7 @@ impl cosmic::Application for AppModel {
                     self.library_selection = None;
                     if self.context_page == ContextPage::RollInfo {
                         self.core_mut().set_show_context(false);
+                        self.drawer_memory.set(DrawerView::Library, false);
                     }
                 }
                 self.select_first_visible_roll();
@@ -1965,7 +2011,10 @@ impl cosmic::Application for AppModel {
                             self.selected_frames.insert(name.clone());
                         }
                         self.selection_anchor = Some(name.clone());
-                        return self.scroll_selection_into_view("frames-grid", target, len, cols);
+                        return Task::batch([
+                            self.scroll_selection_into_view("frames-grid", target, len, cols),
+                            self.ensure_frame_info_loaded().unwrap_or_else(Task::none),
+                        ]);
                     }
                     return Task::none();
                 }
@@ -2001,7 +2050,7 @@ impl cosmic::Application for AppModel {
                 );
                 self.selected_frames = updated;
                 self.selection_anchor = anchor;
-                Task::none()
+                self.ensure_frame_info_loaded().unwrap_or_else(Task::none)
             }
 
             Message::SelectAllFrames => {
@@ -2059,6 +2108,8 @@ impl cosmic::Application for AppModel {
                     .map(|name| Tile {
                         name,
                         thumb: Thumb::Loading,
+                        meta: None,
+                        meta_failed: false,
                     })
                     .collect();
 
@@ -2075,7 +2126,17 @@ impl cosmic::Application for AppModel {
                     self.selection_anchor = Some(first.name.clone());
                 }
 
-                self.decode_next()
+                // The grid's remembered drawer state can only be applied once a
+                // frame is highlighted (the pre-select above), so re-apply it
+                // here — navigation never closes the drawer.
+                self.restore_drawer_for(DrawerView::Grid);
+                // With the grid's drawer open, parse the freshly pre-selected
+                // frame's EXIF so the panel never shows a stuck "Loading…"
+                // after re-entering a roll.
+                Task::batch([
+                    self.decode_next(),
+                    self.ensure_frame_info_loaded().unwrap_or_else(Task::none),
+                ])
             }
 
             Message::SearchActivate => {
@@ -2114,40 +2175,62 @@ impl cosmic::Application for AppModel {
                 self.decode_next()
             }
 
-            Message::ToggleContextPage(context_page) => {
-                // The metadata drawer needs a library *roll* selection; without
-                // one (no selection, or the Add Roll tile) the toggle is a no-op
-                // so it never opens an empty drawer (the menu item stays enabled,
-                // like the editing toggle).
-                if context_page == ContextPage::RollInfo
-                    && (self.active.is_some()
-                        || !matches!(self.library_selection, Some(LibrarySelection::Roll(_))))
-                {
-                    return Task::none();
+            Message::FrameInfoReady(name, result) => {
+                if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
+                    match result {
+                        Ok(meta) => tile.meta = Some(meta),
+                        Err(()) => tile.meta_failed = true,
+                    }
                 }
-                if self.context_page == context_page {
-                    // Close the context drawer if the toggled context page is the same.
-                    self.core.window.show_context = !self.core.window.show_context;
-                } else {
-                    // Open the context drawer to display the requested context page.
-                    self.context_page = context_page;
-                    self.core.window.show_context = true;
+                if self.frame_meta_inflight.as_deref() == Some(name.as_str()) {
+                    self.frame_meta_inflight = None;
+                }
+                Task::none()
+            }
+
+            Message::ToggleContextPage(context_page) => {
+                // The drawer's close button (X) routes here with its own page;
+                // the View → About menu routes here with `About`. About is a
+                // transient panel: the menu opens it, its X (or Space) dismisses
+                // it by restoring the current view's remembered drawer state,
+                // and the view drawers' X closes them, clearing that view's
+                // remembered state.
+                if context_page == ContextPage::About && self.context_page != ContextPage::About {
+                    self.context_page = ContextPage::About;
+                    self.core_mut().set_show_context(true);
+                } else if self.context_page == ContextPage::About {
+                    self.restore_drawer_for(self.current_view());
+                } else if context_page == self.current_view().page() {
+                    self.core_mut().set_show_context(false);
+                    self.drawer_memory.set(self.current_view(), false);
                 }
                 Task::none()
             }
 
             Message::ToggleContext => {
-                // The default context-drawer toggle (bare Space) opens the
-                // editing panel while a detail view is open, or the roll-info
-                // drawer on the library page. Delegate to the page-specific
-                // toggles so their guards (e.g. a roll selection for roll info)
-                // still apply.
-                let page = if self.selected.is_some() {
-                    ContextPage::Editing
-                } else {
-                    ContextPage::RollInfo
-                };
-                self.update(Message::ToggleContextPage(page))
+                // Bare Space (and View → Details): toggle only the current
+                // view's context drawer. About, if showing, is dismissed and
+                // the view's own remembered state is restored.
+                let view = self.current_view();
+                if self.context_page == ContextPage::About {
+                    self.restore_drawer_for(view);
+                    return Task::none();
+                }
+                if self.core.window.show_context {
+                    self.drawer_memory.set(view, false);
+                    self.core_mut().set_show_context(false);
+                    return Task::none();
+                }
+                if !self.view_drawer_valid(view) {
+                    return Task::none();
+                }
+                self.drawer_memory.set(view, true);
+                self.context_page = view.page();
+                self.core_mut().set_show_context(true);
+                if view == DrawerView::Grid {
+                    return self.ensure_frame_info_loaded().unwrap_or_else(Task::none);
+                }
+                Task::none()
             }
 
             Message::UpdateConfig(config) => {
@@ -2352,11 +2435,11 @@ impl AppModel {
         self.selected_frames.clear();
         self.selection_anchor = None;
         self.grid_viewport = None;
+        self.frame_meta_inflight = None;
         self.clear_detail();
-        self.close_editing();
-        if self.context_page == ContextPage::RollInfo {
-            self.core_mut().set_show_context(false);
-        }
+        // Entering the grid: the drawer (if the grid's memory says open) shows
+        // the frame-info panel; navigation never closes it.
+        self.restore_drawer_for(DrawerView::Grid);
         cosmic::task::future(async move {
             let files = load_files_in(dir.clone()).await;
             Message::RollOpened(dir, files)
@@ -2396,6 +2479,9 @@ impl AppModel {
             self.crop = self.roll.crop(name.as_str());
             self.crop_drafts = CropDrafts::from_margins(self.crop);
             self.rotation = self.roll.rotation(name.as_str()) & 3;
+            // Entering the detail view: the drawer (if the detail's memory says
+            // open) shows the editing panel; navigation never closes it.
+            self.restore_drawer_for(DrawerView::Detail);
             // Anchor the reset snapshot to the opened state (the stored
             // manifest values), so Reset reverts here rather than to identity.
             self.reset_exposure_ev = stored_tone.exposure_ev;
@@ -3136,6 +3222,68 @@ impl AppModel {
         }
     }
 
+    /// The navigational view currently shown (which owns a context drawer).
+    fn current_view(&self) -> DrawerView {
+        if self.selected.is_some() {
+            DrawerView::Detail
+        } else if self.active.is_some() {
+            DrawerView::Grid
+        } else {
+            DrawerView::Library
+        }
+    }
+
+    /// Whether `view`'s drawer has a valid panel (so a toggle or restore never
+    /// opens an empty drawer).
+    fn view_drawer_valid(&self, view: DrawerView) -> bool {
+        match view {
+            DrawerView::Library => {
+                self.active.is_none()
+                    && matches!(&self.library_selection, Some(LibrarySelection::Roll(_)))
+            }
+            DrawerView::Grid => self.active.is_some() && self.frame_selected.is_some(),
+            DrawerView::Detail => self.selected.is_some(),
+        }
+    }
+
+    /// Point the context drawer at `view`'s panel with that view's remembered
+    /// open/closed state, clamped to validity. Called on every view transition
+    /// so the drawer follows the current view without ever closing on
+    /// navigation.
+    fn restore_drawer_for(&mut self, view: DrawerView) {
+        self.context_page = view.page();
+        let open = self.drawer_memory.get(view) && self.view_drawer_valid(view);
+        self.core_mut().set_show_context(open);
+    }
+
+    /// Kicks off the lazy EXIF parse for the highlighted frame if the frame-info
+    /// drawer needs it and it hasn't been parsed (or failed) already. Called on
+    /// opening the drawer and whenever the highlight changes while it is open;
+    /// returns the spawned task for the caller to run.
+    fn ensure_frame_info_loaded(&mut self) -> Option<Task<cosmic::Action<Message>>> {
+        if self.context_page != ContextPage::FrameInfo || !self.core.window.show_context {
+            return None;
+        }
+        let name = self.frame_selected.clone()?;
+        let dir = self.active.clone()?;
+        let needs_parse = self
+            .tiles
+            .iter()
+            .find(|tile| tile.name == name)
+            .is_some_and(|tile| tile.meta.is_none() && !tile.meta_failed);
+        if !needs_parse || self.frame_meta_inflight.as_deref() == Some(name.as_str()) {
+            return None;
+        }
+        self.frame_meta_inflight = Some(name.clone());
+
+        Some(cosmic::task::future(async move {
+            let parse_name = name.clone();
+            let result =
+                tokio::task::spawn_blocking(move || load_frame_meta(&dir, &parse_name)).await;
+            Message::FrameInfoReady(name, result.unwrap_or(Err(())))
+        }))
+    }
+
     /// Writes the in-memory roll edits to the open roll's manifest file on disk.
     fn persist_roll(&self) {
         let Some(dir) = &self.active else {
@@ -3155,13 +3303,6 @@ impl AppModel {
         };
         if let Err(err) = self.config.write_entry(&context) {
             eprintln!("failed to save config: {err}");
-        }
-    }
-
-    /// Closes the editing context drawer when it has nothing left to show.
-    fn close_editing(&mut self) {
-        if self.context_page == ContextPage::Editing && self.core.window.show_context {
-            self.core_mut().set_show_context(false);
         }
     }
 
@@ -3394,6 +3535,7 @@ impl AppModel {
             self.library_selection = None;
             if self.context_page == ContextPage::RollInfo {
                 self.core_mut().set_show_context(false);
+                self.drawer_memory.set(DrawerView::Library, false);
             }
         }
         // Keep a selection alive: fall back to the first remaining roll when
@@ -4251,6 +4393,93 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .into()
 }
 
+/// Parses the basic EXIF readout (dimensions, camera, ISO, shutter, aperture,
+/// focal length, lens, capture date) from a RAW file. Runs on the blocking
+/// pool when the frame-info drawer opens and is cached on the tile; `Err` for
+/// files the EXIF reader cannot parse (non-TIFF-based formats, corrupt files).
+///
+/// `display_value()` already formats the fields nicely (`1/250`, `2.8`,
+/// `50.0`, `2024-05-01 …`), so the panel renders them as strings directly.
+fn load_frame_meta(dir: &Path, name: &str) -> Result<FrameMeta, ()> {
+    let file = std::fs::File::open(dir.join(name)).map_err(|_| ())?;
+    let exif = exif::Reader::new()
+        .read_from_container(&mut std::io::BufReader::new(file))
+        .map_err(|_| ())?;
+
+    let field = |tag: exif::Tag| -> Option<String> {
+        exif.get_field(tag, exif::In::PRIMARY)
+            .map(|value| value.display_value().to_string())
+    };
+    // CR2/DNG may carry the recorded dimensions on the pixel tags rather than
+    // the plain IFD width/height, so prefer ImageWidth/ImageLength and fall
+    // back to PixelXDimension/PixelYDimension.
+    let dimension = |primary: exif::Tag, pixel: exif::Tag| field(primary).or_else(|| field(pixel));
+
+    Ok(FrameMeta {
+        width: dimension(exif::Tag::ImageWidth, exif::Tag::PixelXDimension),
+        height: dimension(exif::Tag::ImageLength, exif::Tag::PixelYDimension),
+        make: field(exif::Tag::Make),
+        model: field(exif::Tag::Model),
+        iso: field(exif::Tag::PhotographicSensitivity),
+        exposure: field(exif::Tag::ExposureTime),
+        aperture: field(exif::Tag::FNumber),
+        focal: field(exif::Tag::FocalLength),
+        lens: field(exif::Tag::LensModel),
+        date: field(exif::Tag::DateTimeOriginal),
+    })
+}
+
+/// The frame-info drawer body for the highlighted frame: its dimensions and
+/// basic EXIF readout (the file name is the drawer title, set by the caller).
+/// Shows a loading placeholder while the lazy parse is in flight and only rows
+/// for fields the file actually carries; a failed parse renders a quiet hint.
+fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let tile = app.tiles.iter().find(|tile| tile.name == name);
+    let rows: Vec<Element<'_, Message>> = if let Some(meta) = tile.and_then(|t| t.meta.as_ref()) {
+        let mut rows = Vec::with_capacity(8);
+        if let (Some(width), Some(height)) = (&meta.width, &meta.height) {
+            rows.push(meta_row(
+                fl!("frame-dimensions-label"),
+                format!("{width} × {height}"),
+            ));
+        }
+        let camera = match (&meta.make, &meta.model) {
+            (Some(make), Some(model)) => format!("{make} {model}"),
+            (Some(make), None) => make.clone(),
+            (None, Some(model)) => model.clone(),
+            _ => String::new(),
+        };
+        if !camera.is_empty() {
+            rows.push(meta_row(fl!("frame-camera-label"), camera));
+        }
+        for (label, value) in [
+            (fl!("frame-iso-label"), &meta.iso),
+            (fl!("frame-exposure-label"), &meta.exposure),
+            (fl!("frame-aperture-label"), &meta.aperture),
+            (fl!("frame-focal-label"), &meta.focal),
+            (fl!("frame-lens-label"), &meta.lens),
+            (fl!("frame-date-label"), &meta.date),
+        ] {
+            if let Some(value) = value {
+                rows.push(meta_row(label, value.clone()));
+            }
+        }
+        rows
+    } else if tile.is_some_and(|t| t.meta_failed) {
+        vec![widget::text(fl!("frame-info-unavailable")).into()]
+    } else {
+        vec![widget::text(fl!("frame-info-loading")).into()]
+    };
+
+    widget::column::with_capacity(rows.len())
+        .extend(rows)
+        .spacing(space_s)
+        .width(Length::Fill)
+        .into()
+}
+
 /// A labeled text field for one crop edge margin (source pixels), committed on
 /// Enter via [`Message::CropDraftSubmit`]. Seeded from the live draft so an
 /// in-progress edit survives view re-renders.
@@ -4481,10 +4710,10 @@ fn selection_ring() -> Element<'static, Message> {
 /// the library cards, the tile is a surface + Stack with the ring overlay; the
 /// image itself stays `Contain` so a film frame's full framing is never cropped.
 fn tile_view(tile: &Tile, selected: bool) -> Element<'_, Message> {
-    let space_s = cosmic::theme::spacing().space_s;
-
-    // The image keeps its square cell with ContentFit::Contain (no cropping);
-    // placeholders stay centered in the same sheet.
+    // The tile is the image alone in its square cell with ContentFit::Contain
+    // (no cropping); placeholders stay centered in the same sheet. The frame
+    // name now lives in the frame-info context drawer (its title), not on the
+    // tile.
     let content: Element<'_, Message> = match &tile.thumb {
         Thumb::Ready(handle) => widget::image(handle.clone())
             .width(Length::Fill)
@@ -4505,19 +4734,7 @@ fn tile_view(tile: &Tile, selected: bool) -> Element<'_, Message> {
             .into(),
     };
 
-    // The frame name sits below the image; its horizontal padding also keeps
-    // the text clear of the selection ring.
-    let info: Element<'_, Message> = widget::container(widget::text(&tile.name))
-        .width(Length::Fill)
-        .padding(space_s)
-        .into();
-
-    let card = widget::column::with_capacity(2)
-        .push(content)
-        .push(info)
-        .spacing(0);
-
-    let card: Element<'_, Message> = MouseArea::new(card)
+    let card: Element<'_, Message> = MouseArea::new(content)
         .on_press(Message::FrameSelected(tile.name.clone()))
         .on_double_click(Message::ThumbnailActivated(tile.name.clone()))
         .into();
@@ -6360,6 +6577,62 @@ pub enum ContextPage {
     Editing,
     /// The metadata drawer for the library roll selection (`library_selection`).
     RollInfo,
+    /// The frame-info drawer on the frames grid: name, dimensions, and basic
+    /// EXIF for the highlighted frame (`frame_selected`).
+    FrameInfo,
+}
+
+/// The three navigational views that own a context drawer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DrawerView {
+    /// The library page → [`ContextPage::RollInfo`].
+    Library,
+    /// The open roll's frame grid → [`ContextPage::FrameInfo`].
+    Grid,
+    /// The open frame's detail view → [`ContextPage::Editing`].
+    Detail,
+}
+
+impl DrawerView {
+    /// The drawer page this view shows.
+    #[must_use]
+    const fn page(self) -> ContextPage {
+        match self {
+            Self::Library => ContextPage::RollInfo,
+            Self::Grid => ContextPage::FrameInfo,
+            Self::Detail => ContextPage::Editing,
+        }
+    }
+}
+
+/// Per-view context-drawer state: whether each view's drawer is open, remembered
+/// across navigation. Space toggles only the current view's slot; moving
+/// between views restores the incoming view's own remembered state (Esc and
+/// navigation never close a drawer).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct DrawerMemory {
+    library: bool,
+    grid: bool,
+    detail: bool,
+}
+
+impl DrawerMemory {
+    #[must_use]
+    const fn get(self, view: DrawerView) -> bool {
+        match view {
+            DrawerView::Library => self.library,
+            DrawerView::Grid => self.grid,
+            DrawerView::Detail => self.detail,
+        }
+    }
+
+    fn set(&mut self, view: DrawerView, open: bool) {
+        match view {
+            DrawerView::Library => self.library = open,
+            DrawerView::Grid => self.grid = open,
+            DrawerView::Detail => self.detail = open,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6418,6 +6691,8 @@ mod tests {
         Tile {
             name: name.to_string(),
             thumb: Thumb::Loading,
+            meta: None,
+            meta_failed: false,
         }
     }
 

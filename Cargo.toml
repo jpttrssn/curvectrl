@@ -13,6 +13,10 @@ i18n-embed = { version = "0.16", features = [
     "desktop-requester",
 ] }
 i18n-embed-fl = "0.10"
+# Basic EXIF readout for the frame-info drawer (camera, ISO, shutter, aperture,
+# focal length, lens, date, dimensions). Already in the lock via rawloader's
+# tree, so `--locked` compiles nothing new.
+kamadak-exif = "0.6.1"
 # PNG encoding for lossless export (`png` feature only — the same image 0.25.10
 # the tree already pulls for decode, so no new crates enter the lock).
 image = { version = "0.25", default-features = false, features = ["png"] }

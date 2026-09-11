@@ -1110,6 +1110,7 @@ dependencies = [
  "i18n-embed-fl",
  "image",
  "jpeg-encoder",
+ "kamadak-exif",
  "libcosmic",
  "naga",
  "open",
