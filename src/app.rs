@@ -4440,10 +4440,13 @@ fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
     let rows: Vec<Element<'_, Message>> = if let Some(meta) = tile.and_then(|t| t.meta.as_ref()) {
         let mut rows = Vec::with_capacity(8);
         if let (Some(width), Some(height)) = (&meta.width, &meta.height) {
-            rows.push(meta_row(
-                fl!("frame-dimensions-label"),
-                format!("{width} × {height}"),
-            ));
+            rows.push(
+                widget::text::body(fl!(
+                    "frame-dimensions",
+                    dimensions = format!("{width} × {height}")
+                ))
+                .into(),
+            );
         }
         let camera = match (&meta.make, &meta.model) {
             (Some(make), Some(model)) => format!("{make} {model}"),
@@ -4452,19 +4455,25 @@ fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
             _ => String::new(),
         };
         if !camera.is_empty() {
-            rows.push(meta_row(fl!("frame-camera-label"), camera));
+            rows.push(widget::text::body(fl!("frame-camera", camera = camera)).into());
         }
-        for (label, value) in [
-            (fl!("frame-iso-label"), &meta.iso),
-            (fl!("frame-exposure-label"), &meta.exposure),
-            (fl!("frame-aperture-label"), &meta.aperture),
-            (fl!("frame-focal-label"), &meta.focal),
-            (fl!("frame-lens-label"), &meta.lens),
-            (fl!("frame-date-label"), &meta.date),
-        ] {
-            if let Some(value) = value {
-                rows.push(meta_row(label, value.clone()));
-            }
+        if let Some(value) = meta.iso.clone() {
+            rows.push(widget::text::body(fl!("frame-iso", iso = value)).into());
+        }
+        if let Some(value) = meta.exposure.clone() {
+            rows.push(widget::text::body(fl!("frame-exposure", exposure = value)).into());
+        }
+        if let Some(value) = meta.aperture.clone() {
+            rows.push(widget::text::body(fl!("frame-aperture", aperture = value)).into());
+        }
+        if let Some(value) = meta.focal.clone() {
+            rows.push(widget::text::body(fl!("frame-focal", focal = value)).into());
+        }
+        if let Some(value) = meta.lens.clone() {
+            rows.push(widget::text::body(fl!("frame-lens", lens = value)).into());
+        }
+        if let Some(value) = meta.date.clone() {
+            rows.push(widget::text::body(fl!("frame-date", date = value)).into());
         }
         rows
     } else if tile.is_some_and(|t| t.meta_failed) {
@@ -4503,7 +4512,7 @@ fn crop_margin_field(
 /// Renders the roll metadata drawer: the roll name as heading, its full path,
 /// frame count, and cover file. The drawer pane supplies the width/padding.
 fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
-    let space_s = cosmic::theme::spacing().space_s;
+    let space_xs = cosmic::theme::spacing().space_xs;
 
     let remove = widget::button::destructive(fl!("remove-roll"))
         .on_press(Message::RemoveRoll(roll.dir.clone()));
@@ -4521,34 +4530,25 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
     widget::column::with_capacity(8)
         .push(widget::text::heading(&roll.name))
         .push(widget::divider::horizontal::default())
-        .push(meta_row(
-            fl!("roll-path-label"),
-            roll.dir.display().to_string(),
-        ))
-        .push(meta_row(
-            fl!("roll-frames-label"),
-            roll.frame_count.to_string(),
-        ))
-        .push(meta_row(
-            fl!("roll-cover-label"),
-            roll.cover.clone().unwrap_or_else(|| fl!("roll-no-cover")),
-        ))
+        .push(widget::text::body(fl!(
+            "roll-path",
+            path = roll.dir.display().to_string()
+        )))
+        .push(widget::text::body(fl!(
+            "roll-frames-line",
+            frames = roll.frame_count.to_string()
+        )))
+        .push(widget::text::body(fl!(
+            "roll-cover",
+            cover = roll.cover.clone().unwrap_or_else(|| fl!("roll-no-cover"))
+        )))
         .push(widget::divider::horizontal::default())
         .push(widget::text(fl!("preset-label")))
         .push(preset)
         .push(widget::divider::horizontal::default())
         .push(remove)
-        .spacing(space_s)
+        .spacing(space_xs)
         .width(Length::Fill)
-        .into()
-}
-
-/// A label-over-value row for the roll metadata drawer.
-fn meta_row(label: String, value: String) -> Element<'static, Message> {
-    widget::column::with_capacity(2)
-        .push(widget::text(label))
-        .push(widget::text(value))
-        .spacing(cosmic::theme::spacing().space_xs)
         .into()
 }
 
