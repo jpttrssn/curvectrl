@@ -4656,13 +4656,34 @@ fn load_frame_meta(dir: &Path, name: &str) -> Result<FrameMeta, ()> {
 
 /// The frame-info drawer body for the highlighted frame: its dimensions and
 /// basic EXIF readout (the file name is the drawer title, set by the caller).
-/// Shows a loading placeholder while the lazy parse is in flight and only rows
-/// for fields the file actually carries; a failed parse renders a quiet hint.
+/// When the roll has a start date, a roll-derived "Original date" row leads the
+/// panel with the frame's exact exported `DateTimeOriginal` (the roll's start
+/// date plus the frame's full-roll offset in seconds, the same value the export
+/// stamps). That row depends only on the roll, so it shows even while the lazy
+/// EXIF parse is in flight or failed. Shows a loading placeholder while the
+/// lazy parse is in flight and only rows for fields the file actually carries;
+/// a failed parse renders a quiet hint.
 fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
+    // The synthetic capture timestamp this frame will be stamped with on
+    // export — the roll's start date plus the frame's full-roll position in
+    // seconds (the tile order is the grid order, which is also the export
+    // order). Only present when the roll carries a start date; independent of
+    // the file's own EXIF.
+    let dated = app
+        .roll
+        .start_date()
+        .and_then(|start| {
+            app.tiles
+                .iter()
+                .position(|tile| tile.name == name)
+                .and_then(|index| exif_writer::shifted_datetime(start, index))
+        });
+
     let tile = app.tiles.iter().find(|tile| tile.name == name);
-    let rows: Vec<Element<'_, Message>> = if let Some(meta) = tile.and_then(|t| t.meta.as_ref()) {
+    let meta_rows: Vec<Element<'_, Message>> = if let Some(meta) = tile.and_then(|t| t.meta.as_ref())
+    {
         let mut rows = Vec::with_capacity(8);
         if let (Some(width), Some(height)) = (&meta.width, &meta.height) {
             rows.push(
@@ -4706,6 +4727,15 @@ fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
     } else {
         vec![widget::text(fl!("frame-info-loading")).into()]
     };
+
+    // The roll-derived stamp leads the panel, above whatever the file itself
+    // carries, so a frame with no (or unreadable) EXIF still shows the date it
+    // would be exported with.
+    let mut rows = Vec::with_capacity(meta_rows.len() + usize::from(dated.is_some()));
+    if let Some(date) = dated {
+        rows.push(widget::text::body(fl!("frame-original-date", date = date)).into());
+    }
+    rows.extend(meta_rows);
 
     widget::column::with_capacity(rows.len())
         .extend(rows)

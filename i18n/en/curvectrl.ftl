@@ -78,3 +78,4 @@ frame-aperture = Aperture: {$aperture}
 frame-focal = Focal length: {$focal}
 frame-lens = Lens: {$lens}
 frame-date = Date: {$date}
+frame-original-date = Original date: {$date}
