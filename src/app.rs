@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
+use crate::exif_writer;
 use crate::film::{
     ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
 };
@@ -2687,19 +2688,29 @@ impl AppModel {
         // one batch internally consistent). This reads the same in-memory
         // manifest the grid and detail view render from, so an export always
         // matches what is on screen — even for an edit that has been applied
-        // but not yet flushed to the on-disk manifest.
+        // but not yet flushed to the on-disk manifest. Each frame carries its
+        // full-roll position (the sorted order the grid shows), the offset used
+        // for a stable synthetic capture timestamp, and the roll's start date
+        // (when set) travels along to stamp DateTimeOriginal on the output.
+        let start_date = self.roll.start_date().map(str::to_owned);
         let frames: Vec<(
             String,
             edit_manifest::ToneEdit,
             edit_manifest::CropMargins,
             u8,
+            usize,
         )> = names
             .into_iter()
             .map(|name| {
                 let tone = self.roll.tone(&name);
                 let crop = self.roll.crop(&name);
                 let rotation = self.roll.rotation(&name) & 3;
-                (name, tone, crop, rotation)
+                let index = self
+                    .tiles
+                    .iter()
+                    .position(|tile| tile.name == name)
+                    .unwrap_or(0);
+                (name, tone, crop, rotation, index)
             })
             .collect();
         let total = frames.len();
@@ -2723,6 +2734,7 @@ impl AppModel {
                 options,
                 preset,
                 base_config,
+                start_date,
                 &mut tick,
             )
             .await;
@@ -5574,6 +5586,7 @@ async fn decode_raw_detail(
 /// live progress to the UI. Returns how many frames succeeded, how many were
 /// skipped (their output already existed and overwrite was off), and how many
 /// failed.
+#[allow(clippy::too_many_arguments)]
 async fn export_frames(
     dir: PathBuf,
     dest: PathBuf,
@@ -5582,10 +5595,12 @@ async fn export_frames(
         edit_manifest::ToneEdit,
         edit_manifest::CropMargins,
         u8,
+        usize,
     )>,
     options: ExportOptions,
     preset: FilmPreset,
     base_config: BaseConfig,
+    start_date: Option<String>,
     mut progress: impl FnMut(usize, usize) + Send,
 ) -> (usize, usize, usize) {
     let mut ok = 0;
@@ -5593,7 +5608,7 @@ async fn export_frames(
     let mut failed = 0;
     let total = frames.len();
     let mut done = 0;
-    for (name, tone, crop, rotation) in frames {
+    for (name, tone, crop, rotation, index) in frames {
         let target = dest.join(export_name(&name, options.format));
         // With overwrite off, an already-present file is kept as-is: the frame
         // is skipped before any decode.
@@ -5602,6 +5617,7 @@ async fn export_frames(
         } else if export_one(
             dir.clone(),
             name,
+            index,
             target,
             tone,
             crop,
@@ -5609,6 +5625,7 @@ async fn export_frames(
             options,
             preset,
             base_config,
+            start_date.clone(),
         )
         .await
         .is_ok()
@@ -5638,6 +5655,7 @@ async fn export_frames(
 async fn export_one(
     dir: PathBuf,
     name: String,
+    index: usize,
     dest: PathBuf,
     tone: edit_manifest::ToneEdit,
     crop: edit_manifest::CropMargins,
@@ -5645,6 +5663,7 @@ async fn export_one(
     options: ExportOptions,
     preset: FilmPreset,
     base_config: BaseConfig,
+    start_date: Option<String>,
 ) -> Result<(), ()> {
     let max_edge = options.size.long_edge();
     // True sensor-linear mono (masked-border cropped, downscaled per the size,
@@ -5659,8 +5678,8 @@ async fn export_one(
         src_long_edge,
         inversion: _,
     } = decode_raw_detail(
-        dir,
-        name,
+        dir.clone(),
+        name.clone(),
         if max_edge == 0 { u32::MAX } else { max_edge },
         preset,
         base_config,
@@ -5686,16 +5705,37 @@ async fn export_one(
     // then the EV-exact pivoted curve; positive scans get curve then gain.
     bake_tone(&mut mono, tone, preset, base_config);
 
+    // When the roll carries a start date, stamp each output's DateTimeOriginal
+    // with `start date @ 00:00:00 + frame's full-roll offset in seconds` — the
+    // synthetic film-capture time that keeps exports in chronological order in
+    // photo/cloud apps. DateTimeDigitized mirrors the RAW's own scan time
+    // (read as its raw `YYYY:MM:DD HH:MM:SS` EXIF text) when it has one. Rolls
+    // without a start date export un-stamped. The extra EXIF parse runs once
+    // per frame beside the (far heavier) full decode.
+    let tiff = start_date.as_deref().and_then(|start| {
+        let original = exif_writer::shifted_datetime(start, index)?;
+        let digitized = exif_writer::raw_datetime_original(&dir, &name);
+        exif_writer::build_tiff(&original, digitized.as_deref())
+    });
+
     match options.format {
-        ExportFormat::Jpeg => export_jpeg(mono, width, height, crop, rotation, &dest, options),
-        ExportFormat::Png => export_png(mono, width, height, crop, rotation, &dest, options),
+        ExportFormat::Jpeg => {
+            export_jpeg(mono, width, height, crop, rotation, &dest, tiff.as_deref(), options)
+        }
+        ExportFormat::Png => {
+            export_png(mono, width, height, crop, rotation, &dest, tiff.as_deref(), options)
+        }
     }
 }
 
 /// Writes `dest` as a quality-`options` JPEG, quantizing the sRGB mono buffer
 /// to a single luminance channel (same shared bake as `export_png`). When
 /// `options.ppi` is non-zero the JFIF header tags that dots-per-inch density.
+/// An optional `exif_tiff` blob carries DateTimeOriginal/DateTimeDigitized and
+/// is spliced into the JPEG stream as an Exif APP1 segment right after the SOI
+/// byte-order marker.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(clippy::too_many_arguments)]
 fn export_jpeg(
     mono: Vec<f32>,
     width: u32,
@@ -5703,6 +5743,7 @@ fn export_jpeg(
     crop: edit_manifest::CropMargins,
     rotation: u8,
     dest: &Path,
+    exif_tiff: Option<&[u8]>,
     options: ExportOptions,
 ) -> Result<(), ()> {
     let mut rgba = Vec::with_capacity(mono.len() * 4);
@@ -5730,24 +5771,30 @@ fn export_jpeg(
     let width = u16::try_from(width).map_err(|_| ())?;
     let height = u16::try_from(height).map_err(|_| ())?;
 
-    // Encode to a same-directory temp file, then rename over `dest` only once
-    // the stream is fully written: a mid-encode failure must not truncate (or,
-    // with overwrite on, replace) an existing file.
-    let tmp = temp_export_path(dest);
-    let file = std::fs::File::create(&tmp).map_err(|_| ())?;
-    let mut encoder = jpeg_encoder::Encoder::new(file, options.quality);
+    // Encode into an in-memory buffer so we can splice the optional Exif APP1
+    // after the SOI marker, then atomically flush the final byte stream to disk
+    // with a same-directory rename.
+    let mut bytes = Vec::with_capacity(gray.len() + 200);
+    let mut encoder = jpeg_encoder::Encoder::new(&mut bytes, options.quality);
     // The default header is a bare (1,1) pixel-aspect-ratio; tag a real density
     // so print/layout tools scale the file by its intended PPI.
     if options.ppi != 0 {
         encoder.set_density(jpeg_encoder::PixelDensity::dpi(options.ppi));
     }
     // `encode` consumes the encoder (flush-on-drop), so its output is complete
-    // by the time it returns; only then is the temp renamed into place.
-    let result = encoder.encode(&gray, width, height, jpeg_encoder::ColorType::Luma);
-    if result.is_err() {
-        std::fs::remove_file(&tmp).ok();
-        return result.map_err(|_| ());
+    // by the time it returns; only then can we splice and rename.
+    if encoder
+        .encode(&gray, width, height, jpeg_encoder::ColorType::Luma)
+        .is_err()
+    {
+        return Err(());
     }
+    if let Some(tiff) = exif_tiff {
+        let app1 = exif_writer::jpeg_app1(tiff);
+        bytes = exif_writer::splice_after_soi(&bytes, &app1);
+    }
+    let tmp = temp_export_path(dest);
+    std::fs::write(&tmp, &bytes).map_err(|_| ())?;
     std::fs::rename(&tmp, dest).map_err(|_| ())
 }
 
@@ -5755,8 +5802,11 @@ fn export_jpeg(
 /// quantizing the sRGB mono buffer to `u16` luminance samples (big-endian —
 /// the byte order the PNG container requires, written as-is by the raw `png`
 /// crate). When `options.ppi` is non-zero a `pHYs` chunk tags that density in
-/// pixels-per-meter.
+/// pixels-per-meter. An optional `exif_tiff` blob carries
+/// DateTimeOriginal/DateTimeDigitized as an `eXIf` chunk (the raw TIFF, which
+/// PNG stores without JPEG's `Exif\0\0` prefix).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(clippy::too_many_arguments)]
 fn export_png(
     mono: Vec<f32>,
     width: u32,
@@ -5764,6 +5814,7 @@ fn export_png(
     crop: edit_manifest::CropMargins,
     rotation: u8,
     dest: &Path,
+    exif_tiff: Option<&[u8]>,
     options: ExportOptions,
 ) -> Result<(), ()> {
     let mut rgba = Vec::with_capacity(mono.len() * 4);
@@ -5808,6 +5859,15 @@ fn export_png(
         }));
     }
     let mut writer = encoder.write_header().map_err(|_| ())?;
+    // `eXIf` holds the raw TIFF blob (no `Exif\0\0` prefix — PNG uses the
+    // chunk name to mark EXIF data), written before any IDAT as the spec asks.
+    if let Some(tiff) = exif_tiff
+        && writer.write_chunk(png::chunk::eXIf, tiff).is_err()
+    {
+        drop(writer);
+        std::fs::remove_file(&tmp).ok();
+        return Err(());
+    }
     if writer.write_image_data(&gray).is_err() {
         drop(writer);
         std::fs::remove_file(&tmp).ok();
@@ -8703,6 +8763,7 @@ mod tests {
             Marg::default(),
             0,
             &dest,
+            None,
             ExportOptions {
                 format: ExportFormat::Png,
                 quality: 100,
@@ -8763,6 +8824,7 @@ mod tests {
             Marg::default(),
             0,
             &dest,
+            None,
             ExportOptions {
                 format: ExportFormat::Jpeg,
                 quality: 82,

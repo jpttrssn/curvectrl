@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod detail_area;
 mod edit_manifest;
+mod exif_writer;
 mod film;
 mod i18n;
 mod shader;
