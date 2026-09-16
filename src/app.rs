@@ -2335,9 +2335,18 @@ impl cosmic::Application for AppModel {
                 // view's context drawer. About, if showing, is dismissed and
                 // the view's own remembered state is restored.
                 let view = self.current_view();
-                if self.context_page == ContextPage::About {
+                // A genuinely showing About (menu-opened) is dismissed by
+                // restoring the view's remembered drawer state — see #18.
+                if self.context_page == ContextPage::About && self.core.window.show_context {
                     self.restore_drawer_for(view);
                     return Task::none();
+                }
+                // A "phantom" About is only `ContextPage`'s launch default
+                // (nothing is showing): clear it and fall through so the very
+                // first toggle opens the drawer instead of silently restoring
+                // the remembered-closed state.
+                if self.context_page == ContextPage::About {
+                    self.context_page = view.page();
                 }
                 if self.core.window.show_context {
                     self.drawer_memory.set(view, false);
