@@ -240,6 +240,10 @@ pub struct AppModel {
     /// as strings (not the committed margins) so typing doesn't fight the
     /// read-only view; committed to `crop` on each field's submit.
     crop_drafts: CropDrafts,
+    /// Draft text for the two roll date fields in the roll-info drawer, seeded
+    /// from the selected roll's committed dates on selection change and
+    /// committed back on submit.
+    roll_date_drafts: RollDateDrafts,
     /// Whether the detail view's "view dimmed crop area" overlay is shown:
     /// the full uncropped frame drawn on top of the zoomed crop with everything
     /// outside the crop dimmed. View-only — never persisted.
@@ -335,6 +339,54 @@ impl CropDrafts {
     }
 }
 
+/// Which roll date field a draft/commit message targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollDateField {
+    Start,
+    End,
+}
+
+/// Draft ISO date text for the two roll-info drawer date fields (start and
+/// optional end). Seeded from the selected roll's committed dates; updated by
+/// typing; committed back to the roll and its manifest on submit. Holds plain
+/// `String`s so an in-progress edit stays stable while the read-only view
+/// re-renders. `key` is the roll directory the drafts were seeded from, so a
+/// changed library selection (or a fresh drawer) reseeds on the next sync.
+#[derive(Debug, Clone)]
+struct RollDateDrafts {
+    /// The roll directory the drafts were seeded from (`None` = never seeded).
+    key: Option<PathBuf>,
+    start: String,
+    end: String,
+}
+
+impl RollDateDrafts {
+    /// Fresh drafts from a roll's committed dates.
+    fn from_dates(key: PathBuf, start: Option<&str>, end: Option<&str>) -> Self {
+        Self {
+            key: Some(key),
+            start: start.unwrap_or("").to_owned(),
+            end: end.unwrap_or("").to_owned(),
+        }
+    }
+
+    /// The draft for a given field, updated in place (used for typing).
+    fn set(&mut self, field: RollDateField, value: String) {
+        match field {
+            RollDateField::Start => self.start = value,
+            RollDateField::End => self.end = value,
+        }
+    }
+
+    /// The draft for a given field.
+    fn get(&self, field: RollDateField) -> &str {
+        match field {
+            RollDateField::Start => &self.start,
+            RollDateField::End => &self.end,
+        }
+    }
+}
+
 /// The selectable cell on the library page: either the leading Add Roll tile
 /// (shown only while no search is active) or a real roll. Modeling both with a
 /// single type makes the selection, highlight, keyboard navigation, and the
@@ -368,6 +420,11 @@ pub struct Roll {
     /// in-memory source of truth for decodes; persisted to the roll's edit
     /// manifest (see [`edit_manifest::RollManifest::preset`]).
     pub preset: FilmPreset,
+    /// The roll's start date (ISO `YYYY-MM-DD`), if already set. Mirrors the
+    /// edit manifest; display-only (no decode impact).
+    pub start_date: Option<String>,
+    /// The roll's optional end date (ISO `YYYY-MM-DD`), if already set.
+    pub end_date: Option<String>,
     /// Decoded cover thumbnail state.
     pub thumb: Thumb,
 }
@@ -695,6 +752,14 @@ pub enum Message {
     /// Reset only the crop margins to zero (show the full frame), leaving the
     /// exposure and tone edits untouched, and persist the reset.
     ResetCrop,
+    /// The user typed into a roll date field in the roll-info drawer. Carries
+    /// the affected field and the new draft text (kept in RAM so typing
+    /// doesn't fight a read-only view); nothing is committed until submit.
+    RollDateDraftChange(RollDateField, String),
+    /// A roll date field was submitted (Enter/return): validate the ISO
+    /// `YYYY-MM-DD` draft (empty clears the date), persist it to the roll's
+    /// manifest, and update the in-memory roll and card.
+    RollDateDraftSubmit(RollDateField),
     /// Rotate the detail view counter-clockwise by one 90° quarter-turn and
     /// persist immediately (the editing-drawer button; the keyboard routes the
     /// same rotation through `EditAdjust::RotateCcw` with commit-on-release).
@@ -1082,6 +1147,11 @@ impl cosmic::Application for AppModel {
             exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             crop: edit_manifest::CropMargins::default(),
             crop_drafts: CropDrafts::from_margins(edit_manifest::CropMargins::default()),
+            roll_date_drafts: RollDateDrafts {
+                key: None,
+                start: String::new(),
+                end: String::new(),
+            },
             rotation: 0,
             show_crop_mask: false,
             reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
@@ -1339,7 +1409,11 @@ impl cosmic::Application for AppModel {
 
                 Some(
                     context_drawer::context_drawer(
-                        roll_info_panel(roll),
+                        roll_info_panel(
+                            roll,
+                            &self.roll_date_drafts.start,
+                            &self.roll_date_drafts.end,
+                        ),
                         Message::ToggleContextPage(ContextPage::RollInfo),
                     )
                     .title(fl!("roll-info-title")),
@@ -1541,6 +1615,12 @@ impl cosmic::Application for AppModel {
     /// on the application's async runtime.
     #[allow(clippy::too_many_lines)] // Message dispatch; arms stay inline for readability.
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
+        // Reseed the roll-info drawer's date drafts whenever the library roll
+        // selection changes (a different roll always starts from its own
+        // committed dates; stale uncommitted text is dropped). Runs before
+        // dispatch so every path — navigation, Space, direct selection — is
+        // covered by one guard.
+        self.sync_roll_date_drafts();
         match message {
             Message::DetailClosed => {
                 self.persist_roll();
@@ -1797,6 +1877,49 @@ impl cosmic::Application for AppModel {
                 }
                 self.reclamp_detail_zoom();
                 self.commit_edit()
+            }
+
+            // A roll date field in the roll-info drawer gained a keystroke:
+            // keep the draft text in RAM (never touching the committed date)
+            // so the read-only view can re-render it. Commit happens only on
+            // submit.
+            Message::RollDateDraftChange(field, value) => {
+                self.roll_date_drafts.set(field, value);
+                Task::none()
+            }
+
+            // A roll date field was submitted (Enter/return): an empty draft
+            // clears the date, a valid ISO `YYYY-MM-DD` draft commits it
+            // (normalized), an invalid one is dropped by re-seeding the drafts
+            // from the committed dates. The in-memory roll (and thus the
+            // library card) is updated and the manifest is flushed.
+            Message::RollDateDraftSubmit(field) => {
+                let draft = self.roll_date_drafts.get(field).trim().to_owned();
+                if !draft.is_empty() && !valid_iso_date(&draft) {
+                    self.sync_roll_date_drafts();
+                    return Task::none();
+                }
+                let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
+                    self.sync_roll_date_drafts();
+                    return Task::none();
+                };
+                let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
+                    self.sync_roll_date_drafts();
+                    return Task::none();
+                };
+                let next = if draft.is_empty() { None } else { Some(draft) };
+                match field {
+                    RollDateField::Start => roll.start_date = next,
+                    RollDateField::End => roll.end_date = next,
+                }
+                record_roll_dates(
+                    &roll.dir,
+                    roll.start_date.clone(),
+                    roll.end_date.clone(),
+                );
+                self.roll_date_drafts =
+                    RollDateDrafts::from_dates(dir, roll.start_date.as_deref(), roll.end_date.as_deref());
+                Task::none()
             }
 
             // The editing-drawer rotate button: one CCW quarter-turn applied
@@ -3256,6 +3379,30 @@ impl AppModel {
         self.core_mut().set_show_context(open);
     }
 
+    /// Reseeds the roll-info drawer's date drafts whenever the library roll
+    /// selection no longer matches the key the drafts were seeded from (a
+    /// different roll always starts from its own committed dates; a stale
+    /// selection such as the Add Roll tile clears the key so the next roll
+    /// reseeds). Cheap: a path comparison — it runs at the top of `update` for
+    /// every message.
+    fn sync_roll_date_drafts(&mut self) {
+        let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
+            self.roll_date_drafts.key = None;
+            return;
+        };
+        if self.roll_date_drafts.key.as_deref() == Some(dir.as_path()) {
+            return;
+        }
+        let (start, end) = self
+            .rolls
+            .iter()
+            .find(|roll| roll.dir == dir)
+            .map_or((None, None), |roll| {
+                (roll.start_date.as_deref(), roll.end_date.as_deref())
+            });
+        self.roll_date_drafts = RollDateDrafts::from_dates(dir, start, end);
+    }
+
     /// Kicks off the lazy EXIF parse for the highlighted frame if the frame-info
     /// drawer needs it and it hasn't been parsed (or failed) already. Called on
     /// opening the drawer and whenever the highlight changes while it is open;
@@ -3721,13 +3868,17 @@ async fn load_roll(dir: PathBuf) -> Roll {
         .and_then(|name| name.to_str())
         .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
     let (cover, frame_count) = roll_cover_and_count(&dir).await;
-    let preset = edit_manifest::load_roll_manifest(&dir).preset();
+    let manifest = edit_manifest::load_roll_manifest(&dir);
+    let start_date = manifest.start_date().map(str::to_owned);
+    let end_date = manifest.end_date().map(str::to_owned);
     Roll {
         dir,
         name,
         cover,
         frame_count,
-        preset,
+        preset: manifest.preset(),
+        start_date,
+        end_date,
         thumb: Thumb::Loading,
     }
 }
@@ -3750,6 +3901,59 @@ fn record_roll_preset(dir: &Path, preset: FilmPreset) {
             edit_manifest::manifest_path(dir).display()
         );
     }
+}
+
+/// Persists a roll's start and optional end dates to its edit manifest, the
+/// on-disk source of truth across restarts. Unlike [`record_roll_preset`] a
+/// write always happens: a cleared field must be recorded as absent, so there
+/// is no implicit-default shortcut here.
+fn record_roll_dates(dir: &Path, start: Option<String>, end: Option<String>) {
+    let mut manifest = edit_manifest::load_roll_manifest(dir);
+    manifest.set_dates(start, end);
+    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
+        eprintln!(
+            "failed to write roll manifest {}: {err}",
+            edit_manifest::manifest_path(dir).display()
+        );
+    }
+}
+
+/// Whether `s` is a valid zero-padded ISO date (`YYYY-MM-DD`) with a real
+/// calendar month and day (leap-year aware). The pure validation gate for the
+/// roll-info drawer's date fields; an empty string is handled as "clear" by
+/// the caller and never reaches this check.
+fn valid_iso_date(s: &str) -> bool {
+    let Some((year, rest)) = s.split_once('-') else {
+        return false;
+    };
+    let Some((month, day)) = rest.split_once('-') else {
+        return false;
+    };
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    // Require the zero-padded `YYYY-MM-DD` shape, not `2024-5-9`.
+    if s.len() != 10 || month > 12 || month == 0 || day == 0 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    day <= days
 }
 
 /// Loads roll metadata for each configured roll directory, de-duplicated and
@@ -4509,9 +4713,35 @@ fn crop_margin_field(
         .into()
 }
 
+/// A labeled ISO-date text field for the roll-info drawer, committed on Enter
+/// via [`Message::RollDateDraftSubmit`]. Seeded from the live draft so an
+/// in-progress edit survives view re-renders.
+fn roll_date_field(
+    label: String,
+    value: &str,
+    field: RollDateField,
+) -> Element<'_, Message> {
+    widget::column::with_capacity(2)
+        .push(widget::text(label))
+        .push(
+            widget::text_input(fl!("roll-date-placeholder"), value)
+                .width(Length::Fill)
+                .on_input(move |v| Message::RollDateDraftChange(field, v))
+                .on_submit(move |_| Message::RollDateDraftSubmit(field)),
+        )
+        .spacing(cosmic::theme::spacing().space_xs)
+        .into()
+}
+
 /// Renders the roll metadata drawer: the roll name as heading, its full path,
-/// frame count, and cover file. The drawer pane supplies the width/padding.
-fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
+/// frame count, and cover file, then the roll dates (start + optional end,
+/// committed on Enter), the film preset, and the removal action. The drawer
+/// pane supplies the width/padding.
+fn roll_info_panel<'a>(
+    roll: &'a Roll,
+    start_draft: &'a str,
+    end_draft: &'a str,
+) -> Element<'a, Message> {
     let space_xs = cosmic::theme::spacing().space_xs;
 
     let remove = widget::button::destructive(fl!("remove-roll"))
@@ -4527,7 +4757,7 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
     )
     .width(Length::Fill);
 
-    widget::column::with_capacity(8)
+    widget::column::with_capacity(14)
         .push(widget::text::heading(&roll.name))
         .push(widget::divider::horizontal::default())
         .push(widget::text::body(fl!(
@@ -4542,6 +4772,18 @@ fn roll_info_panel(roll: &Roll) -> Element<'_, Message> {
             "roll-cover",
             cover = roll.cover.clone().unwrap_or_else(|| fl!("roll-no-cover"))
         )))
+        .push(widget::divider::horizontal::default())
+        .push(widget::text(fl!("roll-dates-label")))
+        .push(roll_date_field(
+            fl!("roll-date-start-label"),
+            start_draft,
+            RollDateField::Start,
+        ))
+        .push(roll_date_field(
+            fl!("roll-date-end-label"),
+            end_draft,
+            RollDateField::End,
+        ))
         .push(widget::divider::horizontal::default())
         .push(widget::text(fl!("preset-label")))
         .push(preset)
@@ -4624,17 +4866,39 @@ fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
             .into(),
     };
 
-    // Title + frame count sit in a block padded 12px (`space_xs`) away from the
-    // card's edges; its top padding is also the gap below the full-bleed cover.
+    // Title (flush-left) plus a single caption row: the frame count in its own
+    // left column and, when a start date is set, the date (or start – end
+    // range) in a right column — a display-only mirror of the roll-info
+    // drawer's dates. Both sit in a block padded 12px (`space_xs`) away from
+    // the card's edges; its top padding is also the gap below the full-bleed
+    // cover. The two `Length::Fill` row cells split the row into equal columns;
+    // an undated roll simply leaves the right cell out.
+    let mut meta = widget::row::with_capacity(2);
+    meta = meta.push(
+        widget::container(widget::text::caption(fl!(
+            "roll-frames",
+            count = roll.frame_count
+        )))
+        .width(Length::Fill)
+        .align_x(Horizontal::Left),
+    );
+    if let Some(start) = &roll.start_date {
+        let dates = widget::text::caption(match &roll.end_date {
+            Some(end) => fl!("roll-card-dates", start = start.clone(), end = end.clone()),
+            None => fl!("roll-card-date", start = start.clone()),
+        });
+        meta = meta.push(
+            widget::container(dates)
+                .width(Length::Fill)
+                .align_x(Horizontal::Right),
+        );
+    }
     let info: Element<'_, Message> = widget::container(
         widget::column::with_capacity(2)
             .push(widget::text(&roll.name))
-            .push(widget::text::caption(fl!(
-                "roll-frames",
-                count = roll.frame_count
-            )))
+            .push(meta)
             .spacing(space_xs)
-            .align_x(Horizontal::Center),
+            .align_x(Horizontal::Left),
     )
     .width(Length::Fill)
     .padding(space_xs)
@@ -6683,6 +6947,8 @@ mod tests {
             cover: None,
             frame_count: 0,
             preset: FilmPreset::default(),
+            start_date: None,
+            end_date: None,
             thumb: Thumb::Loading,
         }
     }
@@ -6694,6 +6960,33 @@ mod tests {
             meta: None,
             meta_failed: false,
         }
+    }
+
+    #[test]
+    fn valid_iso_date_accepts_real_dates() {
+        assert!(valid_iso_date("2024-05-09"));
+        assert!(valid_iso_date("2024-02-29")); // leap year
+        assert!(valid_iso_date("2000-02-29")); // 400-year leap
+        assert!(valid_iso_date("1900-12-31"));
+    }
+
+    #[test]
+    fn valid_iso_date_rejects_impossible_dates() {
+        assert!(!valid_iso_date("2023-02-29")); // not a leap year
+        assert!(!valid_iso_date("1900-02-29")); // 100-year non-leap
+        assert!(!valid_iso_date("2024-13-01")); // month 13
+        assert!(!valid_iso_date("2024-00-01")); // month 0
+        assert!(!valid_iso_date("2024-04-31")); // April has 30 days
+        assert!(!valid_iso_date("2024-01-00")); // day 0
+    }
+
+    #[test]
+    fn valid_iso_date_rejects_malformed_input() {
+        assert!(!valid_iso_date("2024-5-9")); // not zero-padded
+        assert!(!valid_iso_date("2024/05/09")); // wrong separator
+        assert!(!valid_iso_date("may 9 2024"));
+        assert!(!valid_iso_date("2024-05-09-10")); // trailing noise
+        assert!(!valid_iso_date(""));
     }
 
     #[test]

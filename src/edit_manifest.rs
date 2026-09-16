@@ -199,17 +199,27 @@ pub struct RollManifest {
     /// recorded. A safety net for uncalibrated setups, never the default.
     #[serde(default)]
     pub base_auto: bool,
+    /// The roll's start date (the first shot), an ISO `YYYY-MM-DD` string set
+    /// from the roll-info context drawer. Absent means undated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    /// The roll's optional end date (the last shot), ISO `YYYY-MM-DD`. Absent
+    /// means the roll is undated or a single-day roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
 }
 
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 6,
+            version: 7,
             name: None,
             edits: HashMap::new(),
             preset: None,
             base: None,
             base_auto: false,
+            start_date: None,
+            end_date: None,
         }
     }
 }
@@ -385,6 +395,29 @@ impl RollManifest {
         self.base
     }
 
+    /// The roll's start date (ISO `YYYY-MM-DD`), or `None` if undated.
+    #[must_use]
+    pub fn start_date(&self) -> Option<&str> {
+        self.start_date.as_deref()
+    }
+
+    /// The roll's optional end date (ISO `YYYY-MM-DD`), or `None` if unset.
+    #[must_use]
+    pub fn end_date(&self) -> Option<&str> {
+        self.end_date.as_deref()
+    }
+
+    /// Records the roll's start and optional end dates as ISO `YYYY-MM-DD`
+    /// strings (raw user input, validated by the UI layer). Passing `None`
+    /// clears the corresponding field; an end date without a start date is
+    /// still accepted but meaningless until a start date is recorded.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_dates(&mut self, start: Option<String>, end: Option<String>) {
+        self.start_date = start;
+        self.end_date = end;
+    }
+
     /// Whether the roll explicitly opts into per-frame automatic base
     /// measurement (never the default: preset-first).
     #[must_use]
@@ -547,7 +580,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 6);
+        assert_eq!(loaded.version, 7);
+    }
+
+    #[test]
+    fn dates_round_trip() {
+        let dir = temp_dir("dates");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_dates(Some("2024-05-09".to_owned()), Some("2024-05-12".to_owned()));
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.start_date(), Some("2024-05-09"));
+        assert_eq!(loaded.end_date(), Some("2024-05-12"));
+    }
+
+    #[test]
+    fn undated_default_round_trip_stays_clean() {
+        let dir = temp_dir("undated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = RollManifest::default();
+
+        save_roll_manifest(&dir, &manifest).unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.start_date(), None);
+        assert_eq!(loaded.end_date(), None);
     }
 
     #[test]
