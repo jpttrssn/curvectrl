@@ -4168,6 +4168,49 @@ fn export_name(name: &str, format: ExportFormat) -> PathBuf {
     out
 }
 
+/// A deterministic 6-hex-char fingerprint of a roll's directory: FNV-1a over
+/// the path's lossy bytes, masked to 24 bits and lowercased. Fixed-width so
+/// filenames built from it sort lexicographically; specified independently of
+/// Rust (`std::hash::DefaultHasher` is not stable across versions, so it is
+/// never used here) and identical on every platform/run — the same directory,
+/// however it was spelled, always yields the same id.
+#[must_use]
+fn roll_hash(dir: &std::path::Path) -> String {
+    let mut hash = 0x811c_9dc5u32;
+    for &byte in dir.to_string_lossy().as_bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:06x}", hash & 0x00ff_ffff)
+}
+
+/// The dated export file name for a frame of a dated roll:
+/// `YYYYMMDD-<roll-hash>-<frame>.<ext>` — e.g. `20240509-1a2b3c-01.jpg` — where
+/// `YYYYMMDD` is the roll's start date (the same prefix for every frame, so
+/// rolled shoots group under one day), `<roll-hash>` is the roll's 6-hex
+/// [`roll_hash`] (the second sort key, so same-day rolls stay grouped when
+/// filenames sort), and `<frame>` is the frame's 1-based full-roll position
+/// padded to two digits (widening naturally past 99). Uses `format.ext()`.
+/// Returns `None` when `start_iso` is not exactly `YYYY-MM-DD` or the position
+/// does not fit a `u16` frame.
+#[must_use]
+fn dated_export_name(
+    format: ExportFormat,
+    start_iso: &str,
+    index: usize,
+    roll_hash: &str,
+) -> Option<PathBuf> {
+    let iso = start_iso.as_bytes();
+    if iso.len() != 10 || iso[4] != b'-' || iso[7] != b'-' {
+        return None;
+    }
+    let date = start_iso.get(..4)?.to_owned() + &start_iso[5..7] + &start_iso[8..10];
+    let frame = u16::try_from(index).ok()? + 1;
+    let mut out = PathBuf::from(format!("{date}-{roll_hash}-{frame:02}"));
+    out.set_extension(format.ext());
+    Some(out)
+}
+
 /// A same-directory sibling for an atomic export write: the encode goes to
 /// `dest`'s `.tmp` neighbor and is renamed over `dest` once it is fully on
 /// disk. Same filesystem, so the rename is atomic — a failed or interrupted
@@ -5638,8 +5681,17 @@ async fn export_frames(
     let mut failed = 0;
     let total = frames.len();
     let mut done = 0;
+    // Dated rolls export under `YYYYMMDD-<roll-hash>-<frame>.<ext>` (see
+    // `dated_export_name`); the roll's directory fingerprint is shared by the
+    // whole batch. Undated rolls keep the plain `<stem>.<ext>` names.
+    let roll_hash = roll_hash(&dir);
     for (name, tone, crop, rotation, index) in frames {
-        let target = dest.join(export_name(&name, options.format));
+        let target = dest.join(
+            start_date
+                .as_deref()
+                .and_then(|start| dated_export_name(options.format, start, index, &roll_hash))
+                .unwrap_or_else(|| export_name(&name, options.format)),
+        );
         // With overwrite off, an already-present file is kept as-is: the frame
         // is skipped before any decode.
         if !options.overwrite && target.exists() {
@@ -8716,6 +8768,76 @@ mod tests {
             export_name(".hidden.cr2", ExportFormat::Jpeg).to_string_lossy(),
             ".hidden.jpg"
         );
+    }
+
+    #[test]
+    fn roll_hash_is_deterministic_6_hex() {
+        let a = std::path::Path::new("/home/user/Films/2024 May Costa Rica");
+        let b = std::path::Path::new("/home/user/Films/2024 May Portugal");
+        let (ha, ha2, hb) = (roll_hash(a), roll_hash(a), roll_hash(b));
+        // Deterministic, exact width, lowercase hex regardless of path content.
+        assert_eq!(ha, ha2);
+        assert_eq!(ha.len(), 6);
+        assert!(ha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        // Different rolls must (almost always) differ.
+        assert_ne!(ha, hb);
+    }
+
+    #[test]
+    fn dated_export_name_builds_the_scheme() {
+        // `YYYYMMDD-<roll-hash>-<frame>.<ext>`; frame is the 1-based full-roll
+        // position padded to two digits; the source stem is deliberately gone.
+        let name = |index, hash| {
+            dated_export_name(ExportFormat::Jpeg, "2024-05-09", index, hash)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(name(0, "1a2b3c"), "20240509-1a2b3c-01.jpg");
+        assert_eq!(name(9, "1a2b3c"), "20240509-1a2b3c-10.jpg");
+        assert_eq!(name(99, "1a2b3c"), "20240509-1a2b3c-100.jpg");
+        assert_eq!(
+            dated_export_name(ExportFormat::Png, "2024-05-09", 1, "1a2b3c")
+                .unwrap()
+                .to_string_lossy(),
+            "20240509-1a2b3c-02.png"
+        );
+    }
+
+    #[test]
+    fn dated_names_group_by_roll_when_sorted() {
+        // Hash-first ordering means a same-day multi-roll folder sorts into
+        // roll groups, each roll's frames in capture order — the property that
+        // put the hash before the frame number.
+        let name = |hash: &str, index: usize| {
+            dated_export_name(ExportFormat::Jpeg, "2024-05-09", index, hash)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut names = vec![
+            name("bbbbbb", 1),
+            name("aaaaaa", 1),
+            name("aaaaaa", 0),
+            name("bbbbbb", 0),
+        ];
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "20240509-aaaaaa-01.jpg",
+                "20240509-aaaaaa-02.jpg",
+                "20240509-bbbbbb-01.jpg",
+                "20240509-bbbbbb-02.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn dated_export_name_rejects_a_malformed_start_date() {
+        assert!(dated_export_name(ExportFormat::Jpeg, "2024-5-09", 0, "1a2b3c").is_none());
+        assert!(dated_export_name(ExportFormat::Jpeg, "2024/05/09", 0, "1a2b3c").is_none());
+        assert!(dated_export_name(ExportFormat::Jpeg, "", 0, "1a2b3c").is_none());
     }
 
     #[test]
