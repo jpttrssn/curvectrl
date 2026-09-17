@@ -95,6 +95,11 @@ const NATIVE_ZOOM_THRESHOLD: f32 = 2.0;
 /// caps its target at this so a >8K sensor never asks for an oversized upload.
 const MAX_TEXTURE_EDGE: u32 = 8192;
 
+/// Debounce window (ms) between the last keystroke in the search input and the
+/// library/grid re-filter. The input text still updates instantly; only the
+/// applied filter (`search_filter`) waits for this quiet period.
+const SEARCH_DEBOUNCE_MS: u64 = 300;
+
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
 pub struct AppModel {
@@ -168,12 +173,26 @@ pub struct AppModel {
     /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
     /// roll tiles never double-spawn against the startup chain (memory bound).
     cover_inflight: Vec<PathBuf>,
-    /// Search state: `None` hides the search input (the header shows only the
-    /// search icon); `Some(term)` shows the input, which filters roll names on
-    /// the library page and frame names inside an open roll. An empty term
-    /// keeps the input open but matches everything — echoing cosmic-files, the
-    /// mere presence of the input is the toggle, not the text.
+    /// Search input state: `None` hides the search input (the header shows only
+    /// the search icon); `Some(term)` shows the input with `term` as the live
+    /// text, updated on every keystroke (echoing cosmic-files, the mere
+    /// presence of the input is the toggle, not the text). The *applied*
+    /// filter lives in [`Self::search_filter`].
     search: Option<String>,
+    /// The applied search filter, committed only after `SEARCH_DEBOUNCE_MS`
+    /// passes with no further keystrokes. The library page and frame grid read
+    /// this instead of [`Self::search`], so typing stays instant while
+    /// re-filtering lags behind it.
+    search_filter: Option<String>,
+    /// Monotonic serial for debounce commits: bumped on every keystroke, clear,
+    /// activate and escape; a `SearchCommitted` message whose serial does not
+    /// match is stale and is discarded.
+    search_version: u64,
+    /// Month-name aliases for the library search, built once at startup from
+    /// the localized `month-01`…`month-12` short names plus the English full
+    /// and 3-letter names. The fluent locale is fixed for the session, so this
+    /// never needs rebuilding.
+    month_aliases: MonthAliases,
     /// File entries from the open roll, displayed as tiles on its frame grid.
     tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
@@ -708,6 +727,10 @@ pub enum Message {
     SearchClear,
     /// The active search term changed (typed into the header input).
     SearchInput(String),
+    /// A debounced search term is ready to apply (fired `SEARCH_DEBOUNCE_MS`
+    /// after the last keystroke). The inner serial must match `search_version`
+    /// or the commit is stale and is discarded.
+    SearchCommitted(String, u64),
     LaunchUrl(String),
     /// A surface action from a menu popup (Wayland): forwarded to the cosmic
     /// runtime, which creates/destroys the popup surface backing the menus.
@@ -1142,7 +1165,25 @@ impl cosmic::Application for AppModel {
             grid_viewport: None,
             window_height: 600.0,
             cover_inflight: Vec::new(),
+            // The localized short month names (month order 1–12) seed the
+            // search aliases; English full/3-letter names fill the rest.
+            month_aliases: MonthAliases::new(&[
+                fl!("month-01"),
+                fl!("month-02"),
+                fl!("month-03"),
+                fl!("month-04"),
+                fl!("month-05"),
+                fl!("month-06"),
+                fl!("month-07"),
+                fl!("month-08"),
+                fl!("month-09"),
+                fl!("month-10"),
+                fl!("month-11"),
+                fl!("month-12"),
+            ]),
             search: None,
+            search_filter: None,
+            search_version: 0,
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
@@ -1351,11 +1392,11 @@ impl cosmic::Application for AppModel {
         // end packs only the search control and (while a batch runs) the
         // export progress ring.
 
-        // Search filters the current view's entries (roll names on the library
-        // page, frame names in a roll). Mirroring cosmic-files, the input is
-        // only shown once search is active: an inactive state packs a search
-        // icon that reveals (and focuses) the input, which then replaces the
-        // icon until it is cleared.
+        // Search filters the current view's entries (roll names and dates on
+        // the library page, frame names in a roll). Mirroring cosmic-files, the
+        // input is only shown once search is active: an inactive state packs a
+        // search icon that reveals (and focuses) the input, which then replaces
+        // the icon until it is cleared.
         let search: Element<'_, Message> = if let Some(term) = &self.search {
             cosmic::widget::text_input::search_input(fl!("search-rolls"), term)
                 .width(Length::Fixed(240.0))
@@ -1649,6 +1690,8 @@ impl cosmic::Application for AppModel {
                 // behavior, mirroring cosmic-files.
                 if self.search.is_some() {
                     self.search = None;
+                    self.search_filter = None;
+                    self.search_version = self.search_version.wrapping_add(1);
                     return Task::none();
                 }
                 // Escape never closes a context drawer (only Space toggles it).
@@ -2169,7 +2212,7 @@ impl cosmic::Application for AppModel {
                     // highlight.
                     if self.selected.is_some() {
                         let matched =
-                            filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+                            filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
                         let current = self
                             .selected
                             .as_ref()
@@ -2184,7 +2227,7 @@ impl cosmic::Application for AppModel {
 
                     // Bare frame grid: move the highlight, then reveal it if it
                     // stepped out of the viewport.
-                    let matched = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+                    let matched = filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
                     let selected = self
                         .frame_selected
                         .as_ref()
@@ -2216,7 +2259,8 @@ impl cosmic::Application for AppModel {
                 // then the filtered rolls — and reveal it out of the viewport.
                 // While a search is active the Add Roll tile is hidden, so an
                 // empty match set yields no destination at all.
-                let cells = library_cells(&self.rolls, self.search.as_deref().unwrap_or(""));
+                let cells =
+                    library_cells(&self.rolls, self.search_filter.as_deref().unwrap_or(""), &self.month_aliases);
                 let selected = library_cell_index(self.library_selection.as_ref(), &cells);
                 let len = cells.len();
                 let cols = self.nav_cols();
@@ -2231,7 +2275,7 @@ impl cosmic::Application for AppModel {
                 // The clicked tile is always the keyboard focus / primary, even
                 // when a multi-select toggle removes it from the selection set.
                 self.frame_selected = Some(name.clone());
-                let order = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+                let order = filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
                 let (updated, anchor) = apply_frame_click(
                     std::mem::take(&mut self.selected_frames),
                     &name,
@@ -2248,7 +2292,7 @@ impl cosmic::Application for AppModel {
             Message::SelectAllFrames => {
                 if self.active.is_some() {
                     self.selected_frames =
-                        filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""))
+                        filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""))
                             .into_iter()
                             .map(|tile| tile.name.clone())
                             .collect();
@@ -2308,7 +2352,7 @@ impl cosmic::Application for AppModel {
                 // Pre-select the first visible frame so the grid always has a
                 // highlight (the detail view stays closed; Enter opens it).
                 if let Some(first) =
-                    filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""))
+                    filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""))
                         .into_iter()
                         .next()
                 {
@@ -2334,6 +2378,8 @@ impl cosmic::Application for AppModel {
             Message::SearchActivate => {
                 if self.search.is_none() {
                     self.search = Some(String::new());
+                    self.search_filter = None;
+                    self.search_version = self.search_version.wrapping_add(1);
                 }
                 // Focus the (now visible) input.
                 cosmic::widget::text_input::focus(search_input_id())
@@ -2341,11 +2387,29 @@ impl cosmic::Application for AppModel {
 
             Message::SearchClear => {
                 self.search = None;
+                self.search_filter = None;
+                self.search_version = self.search_version.wrapping_add(1);
                 Task::none()
             }
 
             Message::SearchInput(term) => {
-                self.search = Some(term);
+                // The input box shows the keystrokes immediately; the applied
+                // filter waits for `SEARCH_DEBOUNCE_MS` of quiet typing.
+                self.search = Some(term.clone());
+                self.search_version = self.search_version.wrapping_add(1);
+                let version = self.search_version;
+                cosmic::task::future(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
+                    Message::SearchCommitted(term, version)
+                })
+            }
+
+            Message::SearchCommitted(term, version) => {
+                // Drop stale commits: any keystroke, clear or escape since this
+                // task spawned bumped `search_version`.
+                if version == self.search_version {
+                    self.search_filter = Some(term);
+                }
                 Task::none()
             }
 
@@ -2621,7 +2685,8 @@ impl AppModel {
         if self.active.is_some() || self.library_selection.is_some() {
             return;
         }
-        let cells = library_cells(&self.rolls, self.search.as_deref().unwrap_or(""));
+        let cells =
+            library_cells(&self.rolls, self.search_filter.as_deref().unwrap_or(""), &self.month_aliases);
         if let Some(LibraryCell::Roll(roll)) = cells
             .iter()
             .find(|cell| matches!(cell, LibraryCell::Roll(_)))
@@ -3331,7 +3396,7 @@ impl AppModel {
             return Task::none();
         };
 
-        let matched = filtered_tiles(&self.tiles, self.search.as_deref().unwrap_or(""));
+        let matched = filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
         let Some(current) = matched.iter().position(|tile| tile.name == name) else {
             return Task::none();
         };
@@ -4203,14 +4268,160 @@ async fn load_files_in(dir: PathBuf) -> Vec<String> {
     files
 }
 
-/// Rolls whose name matches the toolbar query (case-insensitive substring).
+/// Localized month-name aliases for the library search, mapping a typed
+/// month token (lowercased) to its month number. In practice this is the
+/// localized short names from `month-01`…`month-12` plus the English full and
+/// 3-letter names, so `May`, `may`, `September`, and `Sep` all resolve. Built
+/// once at startup (the fluent locale is fixed for the session) and reused by
+/// the view and the pure search helpers.
+struct MonthAliases {
+    /// Lowercased alias → month 1–12. Linear scan is fine: ~20 entries.
+    names: Vec<(String, u32)>,
+}
+
+impl MonthAliases {
+    /// `Some(month)` when `token` names a month; `None` otherwise. Matches case-
+    /// insensitively (`May` and `may` both resolve to 5).
+    fn lookup(&self, token: &str) -> Option<u32> {
+        let token = token.to_lowercase();
+        self.names
+            .iter()
+            .find(|(alias, _)| alias == &token)
+            .map(|&(_, month)| month)
+    }
+
+    /// Builds the aliases: the given localized short month names (from
+    /// `month-01`…`month-12`) plus the always-recognized English full and
+    /// 3-letter names. `localized_short` must be in month order 1–12.
+    fn new(localized_short: &[String; 12]) -> Self {
+        let mut names: Vec<(String, u32)> = localized_short
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let month = u32::try_from(i)
+                    .expect("the 12-element month array index always fits in u32")
+                    + 1;
+                (name.to_lowercase(), month)
+            })
+            .collect();
+        names.extend(Self::english_aliases());
+        MonthAliases { names }
+    }
+
+    /// The English full and 3-letter month names, always recognized regardless
+    /// of the active locale (the universal typing fallback for dates).
+    fn english_aliases() -> Vec<(String, u32)> {
+        let pairs: [(&str, u32); 12] = [
+            ("january", 1),
+            ("february", 2),
+            ("march", 3),
+            ("april", 4),
+            ("may", 5),
+            ("june", 6),
+            ("july", 7),
+            ("august", 8),
+            ("september", 9),
+            ("october", 10),
+            ("november", 11),
+            ("december", 12),
+        ];
+        let mut names: Vec<(String, u32)> = pairs
+            .into_iter()
+            .flat_map(|(full, month)| {
+                let short = &full[..3];
+                [(full.to_owned(), month), (short.to_owned(), month)]
+            })
+            .collect();
+        // "sept" is a common extra September spelling beside the "sep" slice.
+        names.push(("sept".to_owned(), 9));
+        names
+    }
+}
+
+/// One whitespace-separated library search token. `Text` matches the roll name
+/// as a case-insensitive substring; `Date` matches the roll name the same way
+/// OR a committed roll date. Additional searchable roll data (tags, film type,
+/// …) is a new variant plus a `roll_matches_terms` arm — nothing else changes.
+enum SearchTerm {
+    /// A plain term matched against the roll name (case-insensitive substring).
+    Text(String),
+    /// A date-shaped term matched against the roll name as a substring OR the
+    /// committed dates (`None` predicate fields are wildcards). `2026` → year
+    /// only; `may` → month only; adjacent tokens stay independent (`may 2026`
+    /// is a May AND a 2026 predicate, per the chosen simple semantics).
+    Date {
+        /// The lowercased source token, for the name-substring fallback.
+        text: String,
+        month: Option<u32>,
+        year: Option<u32>,
+    },
+}
+
+/// Splits `query` into independent search terms: whitespace-separated, each
+/// token classified as a 4-digit year, a month-name, or plain text. An empty
+/// (or whitespace-only) query yields `[]`, which matches every roll.
+fn parse_search_query(query: &str, months: &MonthAliases) -> Vec<SearchTerm> {
+    query
+        .split_whitespace()
+        .map(|token| {
+            let token = token.to_lowercase();
+            // A 4-digit number is a calendar year; other lengths stay text.
+            if token.len() == 4
+                && let Some(year) = token.parse::<u32>().ok()
+            {
+                return SearchTerm::Date {
+                    text: token,
+                    month: None,
+                    year: Some(year),
+                };
+            }
+            if let Some(month) = months.lookup(&token) {
+                return SearchTerm::Date {
+                    text: token,
+                    month: Some(month),
+                    year: None,
+                };
+            }
+            SearchTerm::Text(token)
+        })
+        .collect()
+}
+
+/// Whether `roll` satisfies every term in `terms` (AND-across-tokens). `[]`
+/// matches every roll. A `Date` term matches when the source token appears in
+/// the roll name (so an undated roll named "Trip 2026" answers `2026`, and
+/// "Mayfield" answers `may`) OR when either committed date satisfies the
+/// month/year predicate (`parse_iso_date`) — a roll spanning two months answers
+/// both month queries.
+fn roll_matches_terms(roll: &Roll, terms: &[SearchTerm]) -> bool {
+    terms.iter().all(|term| match term {
+        SearchTerm::Text(text) => roll.name.to_lowercase().contains(text),
+        SearchTerm::Date { text, month, year } => {
+            let name_matches = roll.name.to_lowercase().contains(text);
+            name_matches
+                || [roll.start_date.as_deref(), roll.end_date.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|iso| {
+                        let Some((y, m, _)) = parse_iso_date(iso) else {
+                            return false;
+                        };
+                        (year.is_none_or(|wanted| wanted == y))
+                            && (month.is_none_or(|wanted| wanted == m))
+                    })
+        }
+    })
+}
+
+/// Rolls matching the toolbar query: every token must match the roll name
+/// (case-insensitive substring) or a committed roll date (year / month).
 /// Shared by the library view and arrow-key navigation so both move over the
 /// same visible set.
-fn filtered_rolls<'a>(rolls: &'a [Roll], query: &str) -> Vec<&'a Roll> {
-    let query = query.trim().to_lowercase();
+fn filtered_rolls<'a>(rolls: &'a [Roll], query: &str, months: &MonthAliases) -> Vec<&'a Roll> {
+    let terms = parse_search_query(query, months);
     rolls
         .iter()
-        .filter(move |roll| query.is_empty() || roll.name.to_lowercase().contains(&query))
+        .filter(|roll| roll_matches_terms(roll, &terms))
         .collect()
 }
 
@@ -4249,17 +4460,21 @@ impl LibraryCell<'_> {
 }
 
 /// Every selectable cell in the library grid: the Add Roll tile always first,
-/// then the rolls whose name matches the query — undated rolls leading, the
-/// dated ones newest-first (see [`roll_date_cmp`]). Since the add tile is
+/// then the rolls whose name or dates match the query — undated rolls leading,
+/// the dated ones newest-first (see [`roll_date_cmp`]). Since the add tile is
 /// always present, the returned slice is never empty.
-fn library_cells<'a>(rolls: &'a [Roll], query: &str) -> Vec<LibraryCell<'a>> {
+fn library_cells<'a>(
+    rolls: &'a [Roll],
+    query: &str,
+    months: &MonthAliases,
+) -> Vec<LibraryCell<'a>> {
     // The Add Roll tile leads the grid only while no search is active: while
     // searching, only the matching rolls are shown (and `cells` may be empty).
     let mut cells: Vec<LibraryCell<'a>> = Vec::with_capacity(rolls.len().saturating_add(1));
     if query.trim().is_empty() {
         cells.push(LibraryCell::AddRoll);
     }
-    let mut matching = filtered_rolls(rolls, query);
+    let mut matching = filtered_rolls(rolls, query, months);
     matching.sort_by(|a, b| roll_date_cmp(a, b));
     cells.extend(matching.into_iter().map(LibraryCell::Roll));
     cells
@@ -4564,7 +4779,11 @@ fn reveal_target_y(
 fn library_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let cells = library_cells(&app.rolls, app.search.as_deref().unwrap_or(""));
+    let cells = library_cells(
+        &app.rolls,
+        app.search_filter.as_deref().unwrap_or(""),
+        &app.month_aliases,
+    );
     let selected_index = library_cell_index(app.library_selection.as_ref(), &cells);
     // The hint overlays only when a search filters every real roll away (the
     // Add Roll tile is hidden while searching, so `cells` can be empty).
@@ -4631,7 +4850,7 @@ fn search_input_id() -> cosmic::iced::widget::Id {
 fn frames_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let matched = filtered_tiles(&app.tiles, app.search.as_deref().unwrap_or(""));
+    let matched = filtered_tiles(&app.tiles, app.search_filter.as_deref().unwrap_or(""));
 
     let tiles: Element<'_, Message> = if matched.is_empty() {
         widget::container(widget::text(fl!("no-files")))
@@ -7354,6 +7573,13 @@ mod tests {
         ]
     }
 
+    /// A test `MonthAliases` with the English short names plus the full/3-letter
+    /// aliases (which the app builds from `fl!` at startup).
+    fn test_aliases() -> MonthAliases {
+        let localized: [String; 12] = std::array::from_fn(|i| months_jan_to_dec()[i].to_owned());
+        MonthAliases::new(&localized)
+    }
+
     #[test]
     fn format_roll_card_dates_single_date_and_equal_range() {
         let months = months_jan_to_dec();
@@ -7435,7 +7661,7 @@ mod tests {
     fn filtered_rolls_matches_case_insensitive_substring() {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "chicago")];
 
-        let matched = filtered_rolls(&rolls, "CHI");
+        let matched = filtered_rolls(&rolls, "CHI", &test_aliases());
 
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].name, "chicago");
@@ -7445,15 +7671,187 @@ mod tests {
     fn filtered_rolls_returns_all_on_empty_query() {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
 
-        assert_eq!(filtered_rolls(&rolls, "").len(), 2);
-        assert_eq!(filtered_rolls(&rolls, "   ").len(), 2);
+        assert_eq!(filtered_rolls(&rolls, "", &test_aliases()).len(), 2);
+        assert_eq!(filtered_rolls(&rolls, "   ", &test_aliases()).len(), 2);
+    }
+
+    #[test]
+    fn month_aliases_lookup_full_and_abbreviated_names() {
+        let aliases = test_aliases();
+
+        assert_eq!(aliases.lookup("may"), Some(5));
+        assert_eq!(aliases.lookup("May"), Some(5));
+        assert_eq!(aliases.lookup("september"), Some(9));
+        assert_eq!(aliases.lookup("sep"), Some(9));
+        assert_eq!(aliases.lookup("sept"), Some(9));
+        assert_eq!(aliases.lookup("dec"), Some(12));
+        assert_eq!(aliases.lookup("nope"), None);
+    }
+
+    #[test]
+    fn parse_search_query_classifies_year_month_and_text() {
+        let aliases = test_aliases();
+
+        let terms = parse_search_query("chi 2026", &aliases);
+        assert!(matches!(&terms[0], SearchTerm::Text(t) if t == "chi"));
+        assert!(matches!(
+            &terms[1],
+            SearchTerm::Date { text, month: None, year: Some(2026) } if text == "2026"
+        ));
+
+        let terms = parse_search_query("may", &aliases);
+        assert!(matches!(
+            &terms[0],
+            SearchTerm::Date { text, month: Some(5), year: None } if text == "may"
+        ));
+
+        let terms = parse_search_query("may 2026", &aliases);
+        assert!(matches!(
+            &terms[0],
+            SearchTerm::Date { month: Some(5), year: None, .. }
+        ));
+        assert!(matches!(
+            &terms[1],
+            SearchTerm::Date { month: None, year: Some(2026), .. }
+        ));
+
+        // Shorter numbers stay text (a name can contain "400", "2880", etc.).
+        let terms = parse_search_query("trip  400", &aliases);
+        assert!(matches!(&terms[0], SearchTerm::Text(t) if t == "trip"));
+        assert!(matches!(&terms[1], SearchTerm::Text(t) if t == "400"));
+
+        // Empty query parses to nothing (matches everything).
+        assert!(parse_search_query("", &aliases).is_empty());
+        assert!(parse_search_query("   ", &aliases).is_empty());
+    }
+
+    #[test]
+    fn search_matches_year_only() {
+        let aliases = test_aliases();
+        let mut dated = roll("/a", "Archives");
+        dated.start_date = Some("2024-06-01".into());
+        let mut other = roll("/b", "Older");
+        other.start_date = Some("2023-12-31".into());
+        let undated = roll("/c", "No-roll");
+        let rolls = [dated, other, undated];
+
+        let matched = filtered_rolls(&rolls, "2024", &aliases);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "Archives");
+    }
+
+    #[test]
+    fn search_matches_month_only() {
+        let aliases = test_aliases();
+        let mut may_roll = roll("/a", "Spring");
+        may_roll.start_date = Some("2024-05-10".into());
+        let mut june_roll = roll("/b", "Summer");
+        june_roll.start_date = Some("2024-06-03".into());
+        let rolls = [may_roll, june_roll];
+
+        let matched = filtered_rolls(&rolls, "may", &aliases);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "Spring");
+    }
+
+    #[test]
+    fn search_matches_month_and_year() {
+        let aliases = test_aliases();
+        let mut may26 = roll("/a", "May2026");
+        may26.start_date = Some("2026-05-03".into());
+        let mut may25 = roll("/b", "May2025");
+        may25.start_date = Some("2025-05-09".into());
+        let mut mar26 = roll("/c", "Mar2026");
+        mar26.start_date = Some("2026-03-15".into());
+        let rolls = [may26, may25, mar26];
+
+        // Only the May 2026 roll satisfies both independent tokens.
+        let matched = filtered_rolls(&rolls, "may 2026", &aliases);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "May2026");
+    }
+
+    #[test]
+    fn search_matches_name_plus_year() {
+        let aliases = test_aliases();
+        let mut chicago = roll("/a", "chicago trip");
+        chicago.start_date = Some("2026-05-03".into());
+        let mut orlando = roll("/b", "orlando trip");
+        orlando.start_date = Some("2026-06-01".into());
+        let rolls = [chicago, orlando];
+
+        let matched = filtered_rolls(&rolls, "chi 2026", &aliases);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "chicago trip");
+    }
+
+    #[test]
+    fn search_matches_end_date() {
+        let aliases = test_aliases();
+        let mut spanning = roll("/a", "Trip");
+        spanning.start_date = Some("2026-05-30".into());
+        spanning.end_date = Some("2026-06-02".into());
+        let rolls = [spanning.clone()];
+
+        // A range spans both months: it answers both "may" and "june", and the
+        // "june 2026" query via the end date alone.
+        assert_eq!(filtered_rolls(&rolls, "may", &aliases).len(), 1);
+        assert_eq!(filtered_rolls(&rolls, "june", &aliases).len(), 1);
+        assert_eq!(filtered_rolls(&rolls, "june 2026", &aliases).len(), 1);
+    }
+
+    #[test]
+    fn search_tokens_are_and_composed() {
+        let aliases = test_aliases();
+        let mut dated = roll("/a", "Trip");
+        dated.start_date = Some("2026-05-03".into());
+        let rolls = [dated.clone()];
+
+        // Both tokens must match the same roll: a date AND a name term.
+        assert_eq!(filtered_rolls(&rolls, "trip may 2026", &aliases).len(), 1);
+        assert!(filtered_rolls(&rolls, "trip june", &aliases).is_empty());
+        // A contradiction (two years) matches nothing.
+        assert!(filtered_rolls(&rolls, "2026 2025", &aliases).is_empty());
+    }
+
+    #[test]
+    fn search_month_like_name_wins_via_name() {
+        let aliases = test_aliases();
+        // A roll named "Mayfield" dated in June still matches "may" — the name
+        // substring counts alongside any date interpretation.
+        let mut mayfield = roll("/a", "Mayfield");
+        mayfield.start_date = Some("2026-06-03".into());
+        let rolls = [mayfield];
+
+        let matched = filtered_rolls(&rolls, "may", &aliases);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "Mayfield");
+    }
+
+    #[test]
+    fn search_digit_in_name_matches_via_name() {
+        let aliases = test_aliases();
+        // A roll literally named "Trip 2026" (undated) matches the year token
+        // through its name even with no committed date.
+        let undated = roll("/a", "Trip 2026");
+        let rolls = [undated];
+
+        let matched = filtered_rolls(&rolls, "2026", &aliases);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "Trip 2026");
     }
 
     #[test]
     fn library_cells_keep_the_add_tile_first() {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
 
-        let cells = library_cells(&rolls, "");
+        let cells = library_cells(&rolls, "", &test_aliases());
 
         assert_eq!(cells.len(), 3);
         assert!(matches!(cells[0], LibraryCell::AddRoll));
@@ -7461,7 +7859,7 @@ mod tests {
         assert!(matches!(cells[1], LibraryCell::Roll(r) if r.name == "Alpha"));
         assert!(matches!(cells[2], LibraryCell::Roll(r) if r.name == "Beta"));
         // A whitespace-only query is an inactive search: the add tile stays.
-        assert_eq!(library_cells(&rolls, "   ").len(), 3);
+        assert_eq!(library_cells(&rolls, "   ", &test_aliases()).len(), 3);
     }
 
     #[test]
@@ -7469,15 +7867,15 @@ mod tests {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
 
         // A non-empty query drops the Add Roll tile: only matches remain.
-        let cells = library_cells(&rolls, "beta");
+        let cells = library_cells(&rolls, "beta", &test_aliases());
         assert_eq!(cells.len(), 1);
         assert!(matches!(cells[0], LibraryCell::Roll(r) if r.name == "Beta"));
 
         // A query matching nothing yields an entirely empty cell set.
-        let cells = library_cells(&rolls, "zzz");
+        let cells = library_cells(&rolls, "zzz", &test_aliases());
         assert!(cells.is_empty());
         // No rolls at all: still the add tile while idle.
-        assert_eq!(library_cells(&[], "").len(), 1);
+        assert_eq!(library_cells(&[], "", &test_aliases()).len(), 1);
     }
 
     #[test]
@@ -7499,7 +7897,7 @@ mod tests {
             newest.clone(),
             undated.clone(),
         ];
-        let cells = library_cells(&mixed, "");
+        let cells = library_cells(&mixed, "", &test_aliases());
 
         // Add Roll cell 0, then undated roll, then dated newest-first, with
         // same-day rolls tied by name.
@@ -7515,7 +7913,7 @@ mod tests {
         let mut undated = undated.clone();
         undated.start_date = Some("2025-01-01".into());
         let reordered = [newest.clone(), undated.clone(), same_date_alpha];
-        let cells = library_cells(&reordered, "");
+        let cells = library_cells(&reordered, "", &test_aliases());
         assert!(matches!(cells[1], LibraryCell::Roll(r) if r.name == "No-roll"));
         assert!(matches!(cells[2], LibraryCell::Roll(r) if r.name == "Started"));
     }
@@ -7523,7 +7921,7 @@ mod tests {
     #[test]
     fn library_cell_index_finds_add_and_roll_slots() {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
-        let cells = library_cells(&rolls, "");
+        let cells = library_cells(&rolls, "", &test_aliases());
 
         assert_eq!(
             library_cell_index(Some(&LibrarySelection::AddRoll), &cells),
@@ -7544,7 +7942,7 @@ mod tests {
     #[test]
     fn nav_can_land_on_and_leave_the_add_tile() {
         let rolls = vec![roll("/a", "Alpha"), roll("/b", "Beta")];
-        let cells = library_cells(&rolls, "");
+        let cells = library_cells(&rolls, "", &test_aliases());
 
         // From nothing, Down selects cell 0 (the add tile).
         let target = nav_target(None, cells.len(), 2, MoveDir::Down).unwrap();
