@@ -3965,27 +3965,22 @@ fn record_roll_dates(dir: &Path, start: Option<String>, end: Option<String>) {
     }
 }
 
-/// Whether `s` is a valid zero-padded ISO date (`YYYY-MM-DD`) with a real
-/// calendar month and day (leap-year aware). The pure validation gate for the
-/// roll-info drawer's date fields; an empty string is handled as "clear" by
-/// the caller and never reaches this check.
-fn valid_iso_date(s: &str) -> bool {
-    let Some((year, rest)) = s.split_once('-') else {
-        return false;
-    };
-    let Some((month, day)) = rest.split_once('-') else {
-        return false;
-    };
+/// Parses a zero-padded ISO date (`YYYY-MM-DD`) with a real calendar month and
+/// day (leap-year aware) into `(year, month, day)`. `None` for anything else —
+/// including a non-zero-padded shape like `2024-5-9`.
+fn parse_iso_date(s: &str) -> Option<(u32, u32, u32)> {
+    let (year, rest) = s.split_once('-')?;
+    let (month, day) = rest.split_once('-')?;
     let (Ok(year), Ok(month), Ok(day)) = (
         year.parse::<u32>(),
         month.parse::<u32>(),
         day.parse::<u32>(),
     ) else {
-        return false;
+        return None;
     };
     // Require the zero-padded `YYYY-MM-DD` shape, not `2024-5-9`.
     if s.len() != 10 || month > 12 || month == 0 || day == 0 {
-        return false;
+        return None;
     }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days = match month {
@@ -3998,9 +3993,17 @@ fn valid_iso_date(s: &str) -> bool {
                 28
             }
         }
-        _ => return false,
+        _ => return None,
     };
-    day <= days
+    (day <= days).then_some((year, month, day))
+}
+
+/// Whether `s` is a valid zero-padded ISO date (`YYYY-MM-DD`) with a real
+/// calendar month and day (leap-year aware). The pure validation gate for the
+/// roll-info drawer's date fields; an empty string is handled as "clear" by
+/// the caller and never reaches this check.
+fn valid_iso_date(s: &str) -> bool {
+    parse_iso_date(s).is_some()
 }
 
 /// Whether a roll's committed dates are coherent: either may be absent, but when
@@ -4013,6 +4016,34 @@ fn roll_dates_valid(start: Option<&str>, end: Option<&str>) -> bool {
         (Some(start), Some(end)) => start <= end,
         _ => true,
     }
+}
+
+/// Formats a roll's start/end ISO dates for the library card, de-duplicated:
+/// `May 3 - 4 2026` (month- and year-unique), `May 30 - Jun 2 2026`
+/// (year-unique, each side keeps its month), `Dec 30 2025 - Jan 2 2026`
+/// (each side keeps its year), or a single `May 3 2026` when there is no end
+/// date (or it equals the start). `months` supplies the localized short month
+/// names; `None` is returned for any malformed date so the caller can fall
+/// back to raw ISO text.
+fn format_roll_card_dates(months: &[&str; 12], start: &str, end: Option<&str>) -> Option<String> {
+    let (start_year, start_month, start_day) = parse_iso_date(start)?;
+    let (end_year, end_month, end_day) = match end {
+        Some(end) => parse_iso_date(end)?,
+        None => (start_year, start_month, start_day),
+    };
+    let start_name = months[(start_month - 1) as usize];
+    let end_name = months[(end_month - 1) as usize];
+    let single = end.is_none() || (start_year, start_month, start_day) == (end_year, end_month, end_day);
+    Some(match (single, start_year == end_year, start_month == end_month) {
+        (true, _, _) => format!("{start_name} {start_day} {start_year}"),
+        (false, true, true) => format!("{start_name} {start_day} - {end_day} {start_year}"),
+        (false, true, false) => {
+            format!("{start_name} {start_day} - {end_name} {end_day} {start_year}")
+        }
+        (false, false, _) => format!(
+            "{start_name} {start_day} {start_year} - {end_name} {end_day} {end_year}"
+        ),
+    })
 }
 
 /// Loads roll metadata for each configured roll directory, de-duplicated and
@@ -5029,10 +5060,32 @@ fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
         .align_x(Horizontal::Left),
     );
     if let Some(start) = &roll.start_date {
-        let dates = widget::text::caption(match &roll.end_date {
-            Some(end) => fl!("roll-card-dates", start = start.clone(), end = end.clone()),
-            None => fl!("roll-card-date", start = start.clone()),
-        });
+        let month_names: [String; 12] = [
+            fl!("month-01"),
+            fl!("month-02"),
+            fl!("month-03"),
+            fl!("month-04"),
+            fl!("month-05"),
+            fl!("month-06"),
+            fl!("month-07"),
+            fl!("month-08"),
+            fl!("month-09"),
+            fl!("month-10"),
+            fl!("month-11"),
+            fl!("month-12"),
+        ];
+        let months: [&str; 12] = std::array::from_fn(|i| month_names[i].as_str());
+        let dates = widget::text::caption(
+            match format_roll_card_dates(&months, start, roll.end_date.as_deref()) {
+                // Malformed dates (hand-edited manifests) keep today's raw ISO
+                // display instead of inventing a format.
+                None => match &roll.end_date {
+                    Some(end) => fl!("roll-card-dates", start = start.clone(), end = end.clone()),
+                    None => fl!("roll-card-date", start = start.clone()),
+                },
+                Some(formatted) => formatted,
+            },
+        );
         meta = meta.push(
             widget::container(dates)
                 .width(Length::Fill)
@@ -7181,6 +7234,66 @@ mod tests {
         assert!(!valid_iso_date("2024-00-01")); // month 0
         assert!(!valid_iso_date("2024-04-31")); // April has 30 days
         assert!(!valid_iso_date("2024-01-00")); // day 0
+    }
+
+    /// The English short month table, exercising the localized-format path
+    /// with the fallback locale's values.
+    fn months_jan_to_dec() -> [&'static str; 12] {
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+    }
+
+    #[test]
+    fn format_roll_card_dates_single_date_and_equal_range() {
+        let months = months_jan_to_dec();
+        assert_eq!(
+            format_roll_card_dates(&months, "2026-05-03", None),
+            Some("May 3 2026".to_owned())
+        );
+        // A one-day range collapses to the single-date form.
+        assert_eq!(
+            format_roll_card_dates(&months, "2026-05-03", Some("2026-05-03")),
+            Some("May 3 2026".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_roll_card_dates_same_month_share_month_and_year() {
+        let months = months_jan_to_dec();
+        assert_eq!(
+            format_roll_card_dates(&months, "2026-05-03", Some("2026-05-04")),
+            Some("May 3 - 4 2026".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_roll_card_dates_same_year_keep_both_months() {
+        let months = months_jan_to_dec();
+        assert_eq!(
+            format_roll_card_dates(&months, "2026-05-30", Some("2026-06-02")),
+            Some("May 30 - Jun 2 2026".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_roll_card_dates_cross_year_keep_both_years() {
+        let months = months_jan_to_dec();
+        assert_eq!(
+            format_roll_card_dates(&months, "2025-12-30", Some("2026-01-02")),
+            Some("Dec 30 2025 - Jan 2 2026".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_roll_card_dates_rejects_malformed_input() {
+        let months = months_jan_to_dec();
+        assert_eq!(format_roll_card_dates(&months, "not-a-date", None), None);
+        assert_eq!(
+            format_roll_card_dates(&months, "2026-05-03", Some("not-a-date")),
+            None
+        );
+        assert_eq!(format_roll_card_dates(&months, "2026-02-30", None), None);
     }
 
     #[test]
