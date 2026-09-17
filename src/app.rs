@@ -795,12 +795,15 @@ pub enum Message {
     ExportChosen(Option<(PathBuf, ExportOptions)>),
     /// The export batch finished, carrying how many frames succeeded, how many
     /// were skipped (already present when overwrite was off), how many failed,
-    /// and the destination folder for the completion toast.
+    /// the destination folder for the completion toast, and — when the roll had
+    /// a start date — that date, so the toast can say the exports are stamped
+    /// and dated.
     ExportDone {
         ok: usize,
         skipped: usize,
         failed: usize,
         dest: PathBuf,
+        start_date: Option<String>,
     },
     /// A toast's duration elapsed (or its close button was pressed): dismiss
     /// it from the toaster.
@@ -1909,6 +1912,18 @@ impl cosmic::Application for AppModel {
                     return Task::none();
                 };
                 let next = if draft.is_empty() { None } else { Some(draft) };
+                // A committed date must not contradict the other one: the roll
+                // may not end before it starts (ending the export-relevant
+                // start/end coherence). A conflicting submit is dropped by
+                // re-seeding the drafts, like a malformed date.
+                let coherent = match field {
+                    RollDateField::Start => roll_dates_valid(next.as_deref(), roll.end_date.as_deref()),
+                    RollDateField::End => roll_dates_valid(roll.start_date.as_deref(), next.as_deref()),
+                };
+                if !coherent {
+                    self.sync_roll_date_drafts();
+                    return Task::none();
+                }
                 match field {
                     RollDateField::Start => roll.start_date = next,
                     RollDateField::End => roll.end_date = next,
@@ -2450,16 +2465,25 @@ impl cosmic::Application for AppModel {
                 skipped,
                 failed,
                 dest,
+                start_date,
             } => {
                 // The batch is over: hide the header ring before the summary
                 // toast lands.
                 self.export_progress = None;
                 let toast = if failed == 0 && skipped == 0 {
-                    toaster::Toast::new(fl!(
-                        "export-done",
-                        count = ok,
-                        dir = dest.display().to_string()
-                    ))
+                    toaster::Toast::new(match start_date {
+                        Some(date) => fl!(
+                            "export-done-dated",
+                            count = ok,
+                            dir = dest.display().to_string(),
+                            date = date
+                        ),
+                        None => fl!(
+                            "export-done",
+                            count = ok,
+                            dir = dest.display().to_string()
+                        ),
+                    })
                 } else if failed == 0 {
                     toaster::Toast::new(fl!(
                         "export-done-skipped",
@@ -2734,7 +2758,7 @@ impl AppModel {
                 options,
                 preset,
                 base_config,
-                start_date,
+                start_date.clone(),
                 &mut tick,
             )
             .await;
@@ -2744,6 +2768,7 @@ impl AppModel {
                     skipped,
                     failed,
                     dest,
+                    start_date,
                 })
                 .await;
         }))
@@ -3975,6 +4000,18 @@ fn valid_iso_date(s: &str) -> bool {
         _ => return false,
     };
     day <= days
+}
+
+/// Whether a roll's committed dates are coherent: either may be absent, but when
+/// both are set the start date must not be after the end date. ISO `YYYY-MM-DD`
+/// strings compare lexicographically == chronologically (zero-padded), so this
+/// is a plain ordering check.
+#[must_use]
+fn roll_dates_valid(start: Option<&str>, end: Option<&str>) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => start <= end,
+        _ => true,
+    }
 }
 
 /// Loads roll metadata for each configured roll directory, de-duplicated and
@@ -7138,6 +7175,22 @@ mod tests {
         assert!(!valid_iso_date("may 9 2024"));
         assert!(!valid_iso_date("2024-05-09-10")); // trailing noise
         assert!(!valid_iso_date(""));
+    }
+
+    #[test]
+    fn roll_dates_require_start_before_end_when_both_set() {
+        // Either date alone is always coherent.
+        assert!(roll_dates_valid(None, None));
+        assert!(roll_dates_valid(Some("2024-05-09"), None));
+        assert!(roll_dates_valid(None, Some("2024-05-09")));
+        // Equal dates are a valid single-day roll.
+        assert!(roll_dates_valid(Some("2024-05-09"), Some("2024-05-09")));
+        // A start before its end is the healthy case.
+        assert!(roll_dates_valid(Some("2024-05-09"), Some("2024-05-11")));
+        // The roll must not end before it starts.
+        assert!(!roll_dates_valid(Some("2024-05-11"), Some("2024-05-09")));
+        // Cross-year comparisons are plain ISO ordering, not calendar math.
+        assert!(roll_dates_valid(Some("2023-12-31"), Some("2024-01-01")));
     }
 
     #[test]

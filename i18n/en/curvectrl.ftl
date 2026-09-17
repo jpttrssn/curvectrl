@@ -58,6 +58,7 @@ menu-preset-base = Use preset base
 menu-details = Details…
 menu-export = Export…
 export-done = Exported {$count} images to {$dir}
+export-done-dated = Exported {$count} images to {$dir} (dated {$date})
 export-progress = Exporting {$done} of {$total}
 export-done-skipped = Exported {$count} images to {$dir} ({$skipped} already exist and were kept)
 export-failed = {$failed} of {$count} images failed to export
