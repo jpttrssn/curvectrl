@@ -9,6 +9,7 @@ search-toggle = Search
 no-rolls-found = No rolls match your search
 no-files = No images in this roll
 roll-info-title = Roll info
+roll-name-placeholder = Roll name
 roll-path = Path: {$path}
 roll-frames-line = Frames: {$frames}
 roll-cover = Cover: {$cover}

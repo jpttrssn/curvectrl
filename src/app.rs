@@ -246,6 +246,10 @@ pub struct AppModel {
     /// from the selected roll's committed dates on selection change and
     /// committed back on submit.
     roll_date_drafts: RollDateDrafts,
+    /// Draft text for the roll-info drawer's editable name heading, seeded from
+    /// the selected roll's current name on selection change and committed on
+    /// submit.
+    roll_name_draft: String,
     /// Whether the detail view's "view dimmed crop area" overlay is shown:
     /// the full uncropped frame drawn on top of the zoomed crop with everything
     /// outside the crop dimmed. View-only — never persisted.
@@ -411,7 +415,8 @@ enum LibrarySelection {
 pub struct Roll {
     /// Absolute directory holding this roll's negatives.
     pub dir: PathBuf,
-    /// Display name (the directory's final component).
+    /// Display name: the manifest's human-readable label when set, otherwise
+    /// the directory's final component.
     pub name: String,
     /// The roll's cover file name (first sorted non-dot file), if any.
     pub cover: Option<String>,
@@ -762,6 +767,14 @@ pub enum Message {
     /// `YYYY-MM-DD` draft (empty clears the date), persist it to the roll's
     /// manifest, and update the in-memory roll and card.
     RollDateDraftSubmit(RollDateField),
+    /// The user typed into the roll-info drawer's editable name heading.
+    /// Carries the new draft text (kept in RAM so typing doesn't fight a
+    /// read-only view); nothing is committed until submit.
+    RollNameDraftChange(String),
+    /// The editable name heading was submitted (Enter/return): persist the
+    /// trimmed draft (empty reverts to the directory leaf) to the roll's
+    /// manifest and update the in-memory roll and card.
+    RollNameDraftSubmit,
     /// Rotate the detail view counter-clockwise by one 90° quarter-turn and
     /// persist immediately (the editing-drawer button; the keyboard routes the
     /// same rotation through `EditAdjust::RotateCcw` with commit-on-release).
@@ -1157,6 +1170,7 @@ impl cosmic::Application for AppModel {
                 start: String::new(),
                 end: String::new(),
             },
+            roll_name_draft: String::new(),
             rotation: 0,
             show_crop_mask: false,
             reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
@@ -1416,6 +1430,7 @@ impl cosmic::Application for AppModel {
                     context_drawer::context_drawer(
                         roll_info_panel(
                             roll,
+                            &self.roll_name_draft,
                             &self.roll_date_drafts.start,
                             &self.roll_date_drafts.end,
                         ),
@@ -1939,6 +1954,43 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
+            // The roll-info drawer's editable name heading gained a keystroke:
+            // keep the draft text in RAM (never touching the committed name) so
+            // the read-only view can re-render it. Commit happens only on submit.
+            Message::RollNameDraftChange(value) => {
+                self.roll_name_draft = value;
+                Task::none()
+            }
+
+            // The editable heading was submitted (Enter/return): the trimmed
+            // draft becomes the roll's display name — an empty draft clears
+            // the label so the roll falls back to its directory leaf. The
+            // in-memory roll (and thus the library card, search, and sort) is
+            // updated and the manifest is flushed.
+            Message::RollNameDraftSubmit => {
+                let draft = self.roll_name_draft.trim().to_owned();
+                let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
+                    self.sync_roll_date_drafts();
+                    return Task::none();
+                };
+                let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
+                    self.sync_roll_date_drafts();
+                    return Task::none();
+                };
+                roll.name = if draft.is_empty() {
+                    // Clear the label: the directory leaf is derived at load.
+                    record_roll_name(&roll.dir, None);
+                    dir.file_name()
+                        .and_then(|name| name.to_str())
+                        .map_or_else(|| roll.name.clone(), str::to_owned)
+                } else {
+                    record_roll_name(&roll.dir, Some(draft.clone()));
+                    draft
+                };
+                self.roll_name_draft = roll.name.clone();
+                Task::none()
+            }
+
             // The editing-drawer rotate button: one CCW quarter-turn applied
             // live (RAM + shader) and persisted immediately, mirroring the
             // discrete crop commits (typed submit / reset) rather than the
@@ -2019,7 +2071,7 @@ impl cosmic::Application for AppModel {
                 // Mark the new roll selected (the selection survives roll exit,
                 // so backing out lands on it). The cover scan for the card
                 // continues in parallel.
-                self.library_selection = Some(LibrarySelection::Roll(dir.clone()));
+                self.set_library_selection(LibrarySelection::Roll(dir.clone()));
                 let scan_dir = dir.clone();
                 let card = cosmic::task::future(async move {
                     Message::RollInfoLoaded(load_roll(scan_dir).await)
@@ -2075,12 +2127,12 @@ impl cosmic::Application for AppModel {
             Message::UsePresetBase => self.set_base_mode(RollManifest::use_preset_base),
 
             Message::RollSelected(dir) => {
-                self.library_selection = Some(LibrarySelection::Roll(dir));
+                self.set_library_selection(LibrarySelection::Roll(dir));
                 Task::none()
             }
 
             Message::AddRollSelected => {
-                self.library_selection = Some(LibrarySelection::AddRoll);
+                self.set_library_selection(LibrarySelection::AddRoll);
                 Task::none()
             }
 
@@ -2169,7 +2221,7 @@ impl cosmic::Application for AppModel {
                 let len = cells.len();
                 let cols = self.nav_cols();
                 if let Some(target) = nav_target(selected, len, cols, dir) {
-                    self.library_selection = Some(cells[target].selection());
+                    self.set_library_selection(cells[target].selection());
                     return self.scroll_selection_into_view("rolls-grid", target, len, cols);
                 }
                 Task::none()
@@ -2574,8 +2626,15 @@ impl AppModel {
             .iter()
             .find(|cell| matches!(cell, LibraryCell::Roll(_)))
         {
-            self.library_selection = Some(LibrarySelection::Roll(roll.dir.clone()));
+            self.set_library_selection(LibrarySelection::Roll(roll.dir.clone()));
         }
+    }
+
+    /// Selects a library cell and reseeds the roll-info drafts in the same pass
+    /// the selection changes, so the drawer never shows a previous roll's edits.
+    fn set_library_selection(&mut self, selection: LibrarySelection) {
+        self.library_selection = Some(selection);
+        self.sync_roll_date_drafts();
     }
 
     /// Drills into a roll's frame grid (double click, or Enter on the selected
@@ -3440,14 +3499,19 @@ impl AppModel {
         if self.roll_date_drafts.key.as_deref() == Some(dir.as_path()) {
             return;
         }
-        let (start, end) = self
+        let (start, end, name) = self
             .rolls
             .iter()
             .find(|roll| roll.dir == dir)
-            .map_or((None, None), |roll| {
-                (roll.start_date.as_deref(), roll.end_date.as_deref())
+            .map_or((None, None, None), |roll| {
+                (
+                    roll.start_date.as_deref(),
+                    roll.end_date.as_deref(),
+                    Some(roll.name.as_str()),
+                )
             });
         self.roll_date_drafts = RollDateDrafts::from_dates(dir, start, end);
+        self.roll_name_draft = name.unwrap_or("").to_owned();
     }
 
     /// Kicks off the lazy EXIF parse for the highlighted frame if the frame-info
@@ -3905,17 +3969,18 @@ fn rebake_trace(args: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Loads one roll's metadata: display name (directory leaf), cover file (first
-/// sorted non-dot file), the count of frame files, and the film preset recorded
-/// in the roll's edit manifest (defaulting to the non-inverted `None`) — with
-/// nothing decoded yet.
+/// Loads one roll's metadata: display name (manifest label, falling back to
+/// the directory leaf), cover file (first sorted non-dot file), the count of
+/// frame files, and the film preset recorded in the roll's edit manifest
+/// (defaulting to the non-inverted `None`) — with nothing decoded yet.
 async fn load_roll(dir: PathBuf) -> Roll {
-    let name = dir
+    let leaf = dir
         .file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
     let (cover, frame_count) = roll_cover_and_count(&dir).await;
     let manifest = edit_manifest::load_roll_manifest(&dir);
+    let name = manifest.name().unwrap_or(&leaf).to_owned();
     let start_date = manifest.start_date().map(str::to_owned);
     let end_date = manifest.end_date().map(str::to_owned);
     Roll {
@@ -3957,6 +4022,20 @@ fn record_roll_preset(dir: &Path, preset: FilmPreset) {
 fn record_roll_dates(dir: &Path, start: Option<String>, end: Option<String>) {
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_dates(start, end);
+    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
+        eprintln!(
+            "failed to write roll manifest {}: {err}",
+            edit_manifest::manifest_path(dir).display()
+        );
+    }
+}
+
+/// Persists a roll's display label to its edit manifest, the on-disk source of
+/// truth across restarts. `None` clears the label so the roll falls back to
+/// its directory leaf, mirroring [`record_roll_dates`]'s always-write rule.
+fn record_roll_name(dir: &Path, name: Option<String>) {
+    let mut manifest = edit_manifest::load_roll_manifest(dir);
+    manifest.set_name(name);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
         eprintln!(
             "failed to write roll manifest {}: {err}",
@@ -4910,12 +4989,13 @@ fn roll_date_field(
         .into()
 }
 
-/// Renders the roll metadata drawer: the roll name as heading, its full path,
-/// frame count, and cover file, then the roll dates (start + optional end,
-/// committed on Enter), the film preset, and the removal action. The drawer
-/// pane supplies the width/padding.
+/// Renders the roll metadata drawer: the editable roll name heading, its full
+/// path, frame count, and cover file, then the roll dates (start + optional
+/// end, committed on Enter), the film preset, and the removal action. The
+/// drawer pane supplies the width/padding.
 fn roll_info_panel<'a>(
     roll: &'a Roll,
+    name_draft: &'a str,
     start_draft: &'a str,
     end_draft: &'a str,
 ) -> Element<'a, Message> {
@@ -4923,6 +5003,16 @@ fn roll_info_panel<'a>(
 
     let remove = widget::button::destructive(fl!("remove-roll"))
         .on_press(Message::RemoveRoll(roll.dir.clone()));
+
+    // The roll's display name is the drawer heading, editable in place: typing
+    // feeds the draft, Enter commits it (empty reverts to the directory leaf).
+    let name = widget::container(
+        widget::text_input(fl!("roll-name-placeholder"), name_draft)
+            .width(Length::Fill)
+            .on_input(Message::RollNameDraftChange)
+            .on_submit(|_| Message::RollNameDraftSubmit),
+    )
+    .width(Length::Fill);
 
     // The film preset selector: non-inverted (regular RAW) by default, or the
     // HP5+ negative profile. Index order must match `FilmPreset::index()`.
@@ -4935,7 +5025,7 @@ fn roll_info_panel<'a>(
     .width(Length::Fill);
 
     widget::column::with_capacity(14)
-        .push(widget::text::heading(&roll.name))
+        .push(name)
         .push(widget::divider::horizontal::default())
         .push(widget::text::body(fl!(
             "roll-path",
@@ -7216,6 +7306,26 @@ mod tests {
             meta: None,
             meta_failed: false,
         }
+    }
+
+    #[test]
+    fn load_roll_prefers_the_manifest_label_over_the_directory_leaf() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("exposure-app-roll-name-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = edit_manifest::RollManifest::default();
+        manifest.set_name(Some("Rollerskates".to_owned()));
+        edit_manifest::save_roll_manifest(&dir, &manifest).unwrap();
+        let leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
+
+        let labeled = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(load_roll(dir.clone()));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_ne!(leaf, "Rollerskates");
+        assert_eq!(labeled.name, "Rollerskates");
     }
 
     #[test]

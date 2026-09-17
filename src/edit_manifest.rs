@@ -374,6 +374,22 @@ impl RollManifest {
             .map_or_else(FilmPreset::default, FilmPreset::from_key)
     }
 
+    /// The roll's human-readable label, or `None` when it uses the directory
+    /// leaf as its display name.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Records the roll's display label. `Some` overrides the directory leaf;
+    /// `None` clears it back to the leaf (the key disappears on the next save,
+    /// keeping the default manifest clean for never-renamed rolls).
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+
     /// Records the film-inversion preset for the roll. Only a non-default
     /// preset is written: [`FilmPreset::Hp5Plus`] stores its choice key,
     /// [`FilmPreset::None`] clears it back to the implicit default (the key
@@ -597,6 +613,27 @@ mod tests {
 
         assert_eq!(loaded.start_date(), Some("2024-05-09"));
         assert_eq!(loaded.end_date(), Some("2024-05-12"));
+    }
+
+    #[test]
+    fn name_round_trips_and_clears() {
+        let dir = temp_dir("name");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        assert_eq!(manifest.name(), None);
+
+        manifest.set_name(Some("Rollerskates".to_owned()));
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let mut loaded = load_roll_manifest(&dir);
+        assert_eq!(loaded.name(), Some("Rollerskates"));
+
+        // Clearing the label writes it back to None (defaulted on load), so a
+        // renamed roll reverts to its directory leaf.
+        loaded.set_name(None);
+        save_roll_manifest(&dir, &loaded).unwrap();
+        let cleared = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(cleared.name(), None);
     }
 
     #[test]
