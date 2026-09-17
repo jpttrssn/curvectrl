@@ -430,4 +430,33 @@ mod tests {
         // hyphen-normalized display form.
         assert_eq!(got, Some("2024:05:09 00:00:00".to_owned()));
     }
+
+    #[test]
+    fn png_exif_round_trips_the_raw_tiff() {
+        // Mirrors `export_png`: a 16-bit grayscale PNG written via the raw `png`
+        // crate with the TIFF blob carried as an `eXIf` chunk before the IDAT,
+        // read back through kamadak (which scans PNG chunks for `eXIf`) — the
+        // other half of the export stamping, in addition to the JPEG splice.
+        let tiff = build_tiff("2024:05:09 18:24:36", Some("2024:05:10 09:00:00")).unwrap();
+        let mut png_bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut png_bytes, 4, 4);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_chunk(png::chunk::eXIf, &tiff).unwrap();
+        writer.write_image_data(&[0u8; 32]).unwrap();
+        drop(writer);
+
+        let parsed = Reader::new()
+            .read_from_container(&mut Cursor::new(&png_bytes))
+            .unwrap();
+        assert_eq!(
+            ascii_bytes(&parsed, Tag::DateTimeOriginal),
+            b"2024:05:09 18:24:36"
+        );
+        assert_eq!(
+            ascii_bytes(&parsed, Tag::DateTimeDigitized),
+            b"2024:05:10 09:00:00"
+        );
+    }
 }
