@@ -20,6 +20,7 @@ use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{ContentFit, Length, Point, Size, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -4015,7 +4016,8 @@ fn roll_dates_valid(start: Option<&str>, end: Option<&str>) -> bool {
 }
 
 /// Loads roll metadata for each configured roll directory, de-duplicated and
-/// sorted by display name.
+/// sorted by display name. Name order is the stable backing order: the library
+/// view derives its date-descending display order from it per render.
 async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
     let mut seen = HashSet::new();
     let mut loaded = Vec::with_capacity(rolls.len());
@@ -4102,6 +4104,20 @@ fn filtered_rolls<'a>(rolls: &'a [Roll], query: &str) -> Vec<&'a Roll> {
         .collect()
 }
 
+/// Orders two rolls for the library grid: undated rolls lead (by name), then
+/// dated rolls newest-start-date first. ISO `YYYY-MM-DD` start dates compare
+/// lexicographically == chronologically; name decides ties so the order is
+/// deterministic. The sort is derived per-view, so a roll's committed date
+/// reorders it on the next render — never mutating `rolls`.
+fn roll_date_cmp(a: &Roll, b: &Roll) -> Ordering {
+    match (a.start_date.as_deref(), b.start_date.as_deref()) {
+        (Some(a_date), Some(b_date)) => b_date.cmp(a_date).then_with(|| a.name.cmp(&b.name)),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => a.name.cmp(&b.name),
+    }
+}
+
 /// A selectable cell in the library grid: the always-first Add Roll tile, or a
 /// search-filtered roll. One type so rendering and arrow-key navigation walk
 /// the same set, keeping the Add Roll tile selectable just like a roll card.
@@ -4123,8 +4139,9 @@ impl LibraryCell<'_> {
 }
 
 /// Every selectable cell in the library grid: the Add Roll tile always first,
-/// then the rolls whose name matches the query. Since the add tile is always
-/// present, the returned slice is never empty.
+/// then the rolls whose name matches the query — undated rolls leading, the
+/// dated ones newest-first (see [`roll_date_cmp`]). Since the add tile is
+/// always present, the returned slice is never empty.
 fn library_cells<'a>(rolls: &'a [Roll], query: &str) -> Vec<LibraryCell<'a>> {
     // The Add Roll tile leads the grid only while no search is active: while
     // searching, only the matching rolls are shown (and `cells` may be empty).
@@ -4132,11 +4149,9 @@ fn library_cells<'a>(rolls: &'a [Roll], query: &str) -> Vec<LibraryCell<'a>> {
     if query.trim().is_empty() {
         cells.push(LibraryCell::AddRoll);
     }
-    cells.extend(
-        filtered_rolls(rolls, query)
-            .into_iter()
-            .map(LibraryCell::Roll),
-    );
+    let mut matching = filtered_rolls(rolls, query);
+    matching.sort_by(|a, b| roll_date_cmp(a, b));
+    cells.extend(matching.into_iter().map(LibraryCell::Roll));
     cells
 }
 
@@ -7240,6 +7255,46 @@ mod tests {
         assert!(cells.is_empty());
         // No rolls at all: still the add tile while idle.
         assert_eq!(library_cells(&[], "").len(), 1);
+    }
+
+    #[test]
+    fn library_cells_put_undated_first_then_newest_dated_rolls() {
+        let mut newest = roll("/a", "Started");
+        newest.start_date = Some("2024-06-01".into());
+        let mut older = roll("/b", "Winter");
+        older.start_date = Some("2023-12-31".into());
+        let mut same_date_zeta = roll("/c", "Zulu");
+        same_date_zeta.start_date = Some("2024-05-09".into());
+        let mut same_date_alpha = roll("/d", "Alpha");
+        same_date_alpha.start_date = Some("2024-05-09".into());
+        let undated = roll("/e", "No-roll");
+
+        let mixed = [
+            same_date_alpha.clone(),
+            older.clone(),
+            same_date_zeta.clone(),
+            newest.clone(),
+            undated.clone(),
+        ];
+        let cells = library_cells(&mixed, "");
+
+        // Add Roll cell 0, then undated roll, then dated newest-first, with
+        // same-day rolls tied by name.
+        assert!(matches!(cells[0], LibraryCell::AddRoll));
+        assert!(matches!(cells[1], LibraryCell::Roll(r) if r.name == "No-roll"));
+        assert!(matches!(cells[2], LibraryCell::Roll(r) if r.name == "Started"));
+        assert!(matches!(cells[3], LibraryCell::Roll(r) if r.name == "Alpha"));
+        assert!(matches!(cells[4], LibraryCell::Roll(r) if r.name == "Zulu"));
+        assert!(matches!(cells[5], LibraryCell::Roll(r) if r.name == "Winter"));
+
+        // The sort is derived: committing a date to the undated roll reorders
+        // it on the next render without touching the backing slice.
+        let mut undated = undated.clone();
+        undated.start_date = Some("2025-01-01".into());
+        let reordered = [newest.clone(), undated.clone(), same_date_alpha];
+        let cells = library_cells(&reordered, "");
+        assert!(matches!(cells[1], LibraryCell::Roll(r) if r.name == "No-roll"));
+        assert!(matches!(cells[2], LibraryCell::Roll(r) if r.name == "Started"));
     }
 
     #[test]
