@@ -96,7 +96,7 @@ const NATIVE_ZOOM_THRESHOLD: f32 = 2.0;
 const MAX_TEXTURE_EDGE: u32 = 8192;
 
 /// Debounce window (ms) between the last keystroke in the search input and the
-/// library/grid re-filter. The input text still updates instantly; only the
+/// library re-filter. The input text still updates instantly; only the
 /// applied filter (`search_filter`) waits for this quiet period.
 const SEARCH_DEBOUNCE_MS: u64 = 300;
 
@@ -137,10 +137,10 @@ pub struct AppModel {
     /// Multi-selected frames on the open roll's grid. A plain click (or the
     /// primary `frame_selected`) always lands here; Ctrl+click toggles a frame
     /// in/out, Shift+click selects the range from the anchor through the
-    /// clicked frame, and Ctrl+A selects everything in the filtered set. Used
-    /// as the batch target for copy/paste edits.
+    /// clicked frame, and Ctrl+A selects every frame in the roll. Used as the
+    /// batch target for copy/paste edits.
     selected_frames: HashSet<String>,
-    /// Last frame used as the Shift+click range anchor within the filtered set.
+    /// Last frame used as the Shift+click range anchor within the grid.
     selection_anchor: Option<String>,
     /// Whether the Ctrl modifier is currently held. Tracked from the global
     /// keyboard subscription so a frame click can distinguish a plain click
@@ -173,16 +173,18 @@ pub struct AppModel {
     /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
     /// roll tiles never double-spawn against the startup chain (memory bound).
     cover_inflight: Vec<PathBuf>,
-    /// Search input state: `None` hides the search input (the header shows only
-    /// the search icon); `Some(term)` shows the input with `term` as the live
-    /// text, updated on every keystroke (echoing cosmic-files, the mere
-    /// presence of the input is the toggle, not the text). The *applied*
-    /// filter lives in [`Self::search_filter`].
+    /// Search is library-only: while a roll is open the frame grid is never
+    /// searched and the header control is hidden. Input state: `None` hides
+    /// the search input (the header shows only the search icon); `Some(term)`
+    /// shows the input with `term` as the live text, updated on every
+    /// keystroke (echoing cosmic-files, the mere presence of the input is the
+    /// toggle, not the text). The *applied* filter lives in
+    /// [`Self::search_filter`].
     search: Option<String>,
     /// The applied search filter, committed only after `SEARCH_DEBOUNCE_MS`
-    /// passes with no further keystrokes. The library page and frame grid read
-    /// this instead of [`Self::search`], so typing stays instant while
-    /// re-filtering lags behind it.
+    /// passes with no further keystrokes. The library page reads this instead
+    /// of [`Self::search`], so typing stays instant while re-filtering lags
+    /// behind it.
     search_filter: Option<String>,
     /// Monotonic serial for debounce commits: bumped on every keystroke, clear,
     /// activate and escape; a `SearchCommitted` message whose serial does not
@@ -702,7 +704,7 @@ pub enum Message {
     /// click clears and selects, Ctrl+click toggles membership, Shift+click
     /// selects the range from the anchor through this frame.
     FrameSelected(String),
-    /// Select every frame in the open roll's filtered set (Ctrl+A).
+    /// Select every frame in the open roll (Ctrl+A).
     SelectAllFrames,
     /// A modifier key was pressed. Tracks Ctrl/Shift state so frame clicks can
     /// distinguish plain/Ctrl/Shift selection (iced's `MouseArea` carries no
@@ -1392,31 +1394,35 @@ impl cosmic::Application for AppModel {
         // end packs only the search control and (while a batch runs) the
         // export progress ring.
 
-        // Search filters the current view's entries (roll names and dates on
-        // the library page, frame names in a roll). Mirroring cosmic-files, the
-        // input is only shown once search is active: an inactive state packs a
-        // search icon that reveals (and focuses) the input, which then replaces
-        // the icon until it is cleared.
-        let search: Element<'_, Message> = if let Some(term) = &self.search {
-            cosmic::widget::text_input::search_input(fl!("search-rolls"), term)
-                .width(Length::Fixed(240.0))
-                .id(search_input_id())
-                .on_clear(Message::SearchClear)
-                .on_input(Message::SearchInput)
-                .into()
-        } else {
-            widget::button::icon(icon::from_name("system-search-symbolic"))
-                .tooltip(fl!("search-toggle"))
-                .on_press(Message::SearchActivate)
-                .padding(8)
-                .into()
-        };
+        // Search is library-only: it filters roll names and dates on the
+        // library page and is hidden entirely while a roll is open (the frame
+        // grid is never searched). Mirroring cosmic-files, the input is only
+        // shown once search is active: an inactive state packs a search icon
+        // that reveals (and focuses) the input, which then replaces the icon
+        // until it is cleared.
+        let mut end = Vec::new();
+        if self.active.is_none() {
+            let search: Element<'_, Message> = if let Some(term) = &self.search {
+                cosmic::widget::text_input::search_input(fl!("search-rolls"), term)
+                    .width(Length::Fixed(240.0))
+                    .id(search_input_id())
+                    .on_clear(Message::SearchClear)
+                    .on_input(Message::SearchInput)
+                    .into()
+            } else {
+                widget::button::icon(icon::from_name("system-search-symbolic"))
+                    .tooltip(fl!("search-toggle"))
+                    .on_press(Message::SearchActivate)
+                    .padding(8)
+                    .into()
+            };
+            end.push(search);
+        }
 
         // The COSMIC-Files-style export indicator sits at the far right of the
         // header: a small circular determinate progress ring that exists only
         // while a batch is running — zero screen space when idle. Hovering
         // shows which frame the batch is on.
-        let mut end = vec![search];
         if let Some((done, total)) = self.export_progress {
             let ring =
                 cosmic::widget::determinate_circular(export_fraction(done, total)).size(18.0);
@@ -1583,7 +1589,7 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if modifiers.control() && character == "f" => Some(Message::SearchActivate),
-                // Ctrl+A selects every frame in the open roll's filtered set.
+                // Ctrl+A selects every frame in the open roll.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
                     modifiers,
@@ -1687,8 +1693,10 @@ impl cosmic::Application for AppModel {
                 self.persist_roll();
                 // Escape first deactivates an active search (hiding the header
                 // input back to the search icon) before any other close
-                // behavior, mirroring cosmic-files.
-                if self.search.is_some() {
+                // behavior, mirroring cosmic-files. Search is library-only, so
+                // this applies only on the library page — inside a roll the
+                // term is left intact for the return to the library.
+                if self.active.is_none() && self.search.is_some() {
                     self.search = None;
                     self.search_filter = None;
                     self.search_version = self.search_version.wrapping_add(1);
@@ -2211,31 +2219,28 @@ impl cosmic::Application for AppModel {
                     // through the frames; on the bare grid they move the
                     // highlight.
                     if self.selected.is_some() {
-                        let matched =
-                            filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
                         let current = self
                             .selected
                             .as_ref()
-                            .and_then(|name| matched.iter().position(|tile| tile.name == *name));
+                            .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
                         if let Some(target) =
-                            current.and_then(|idx| paginate(idx, matched.len(), dir))
+                            current.and_then(|idx| paginate(idx, self.tiles.len(), dir))
                         {
-                            return self.open_frame(matched[target].name.clone());
+                            return self.open_frame(self.tiles[target].name.clone());
                         }
                         return Task::none();
                     }
 
                     // Bare frame grid: move the highlight, then reveal it if it
                     // stepped out of the viewport.
-                    let matched = filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
                     let selected = self
                         .frame_selected
                         .as_ref()
-                        .and_then(|name| matched.iter().position(|tile| tile.name == *name));
-                    let len = matched.len();
+                        .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
+                    let len = self.tiles.len();
                     let cols = self.nav_cols();
                     if let Some(target) = nav_target(selected, len, cols, dir) {
-                        let name = matched[target].name.clone();
+                        let name = self.tiles[target].name.clone();
                         self.frame_selected = Some(name.clone());
                         // Shift+arrow extends the multi-selection (keeping it
                         // additive); a plain arrow collapses to the new primary.
@@ -2275,14 +2280,13 @@ impl cosmic::Application for AppModel {
                 // The clicked tile is always the keyboard focus / primary, even
                 // when a multi-select toggle removes it from the selection set.
                 self.frame_selected = Some(name.clone());
-                let order = filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
                 let (updated, anchor) = apply_frame_click(
                     std::mem::take(&mut self.selected_frames),
                     &name,
                     self.ctrl_down,
                     self.shift_down,
                     self.selection_anchor.as_deref(),
-                    &order,
+                    &self.tiles,
                 );
                 self.selected_frames = updated;
                 self.selection_anchor = anchor;
@@ -2292,10 +2296,7 @@ impl cosmic::Application for AppModel {
             Message::SelectAllFrames => {
                 if self.active.is_some() {
                     self.selected_frames =
-                        filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""))
-                            .into_iter()
-                            .map(|tile| tile.name.clone())
-                            .collect();
+                        self.tiles.iter().map(|tile| tile.name.clone()).collect();
                 }
                 Task::none()
             }
@@ -2349,13 +2350,9 @@ impl cosmic::Application for AppModel {
                     })
                     .collect();
 
-                // Pre-select the first visible frame so the grid always has a
+                // Pre-select the first frame so the grid always has a
                 // highlight (the detail view stays closed; Enter opens it).
-                if let Some(first) =
-                    filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""))
-                        .into_iter()
-                        .next()
-                {
+                if let Some(first) = self.tiles.first() {
                     self.frame_selected = Some(first.name.clone());
                     self.selected_frames.clear();
                     self.selected_frames.insert(first.name.clone());
@@ -2376,6 +2373,11 @@ impl cosmic::Application for AppModel {
             }
 
             Message::SearchActivate => {
+                // Search is library-only; a roll's frame grid is never
+                // searched, so activation is a no-op while a roll is open.
+                if self.active.is_some() {
+                    return Task::none();
+                }
                 if self.search.is_none() {
                     self.search = Some(String::new());
                     self.search_filter = None;
@@ -3387,17 +3389,16 @@ impl AppModel {
     }
 
     /// Preloads the frames `DETAIL_PRELOAD_DISTANCE` either side of `name` in
-    /// the search-filtered set into the LRU cache, so Left/Right paging to a
-    /// neighbor is instant. Runs on its own bounded channel, separate from the
-    /// single critical detail slot. Already-cached and already-in-flight frames
-    /// are skipped.
+    /// the roll into the LRU cache, so Left/Right paging to a neighbor is
+    /// instant. Runs on its own bounded channel, separate from the single
+    /// critical detail slot. Already-cached and already-in-flight frames are
+    /// skipped.
     fn preload_detail_neighbors(&mut self, name: &str) -> Task<cosmic::Action<Message>> {
         let Some(dir) = self.active.clone() else {
             return Task::none();
         };
 
-        let matched = filtered_tiles(&self.tiles, self.search_filter.as_deref().unwrap_or(""));
-        let Some(current) = matched.iter().position(|tile| tile.name == name) else {
+        let Some(current) = self.tiles.iter().position(|tile| tile.name == name) else {
             return Task::none();
         };
 
@@ -3406,10 +3407,10 @@ impl AppModel {
         let mut neighbors = Vec::new();
         for step in 1..=DETAIL_PRELOAD_DISTANCE {
             if let Some(prev) = current.checked_sub(step) {
-                neighbors.push(matched[prev].name.clone());
+                neighbors.push(self.tiles[prev].name.clone());
             }
-            if let Some(next) = current.checked_add(step).filter(|&i| i < matched.len()) {
-                neighbors.push(matched[next].name.clone());
+            if let Some(next) = current.checked_add(step).filter(|&i| i < self.tiles.len()) {
+                neighbors.push(self.tiles[next].name.clone());
             }
         }
 
@@ -4636,21 +4637,10 @@ fn nav_target(selected: Option<usize>, len: usize, cols: usize, dir: MoveDir) ->
     })
 }
 
-/// Frames whose name matches the toolbar query (case-insensitive substring).
-/// Shared by the frame grid view and frame navigation so both move over the
-/// same visible set.
-fn filtered_tiles<'a>(tiles: &'a [Tile], query: &str) -> Vec<&'a Tile> {
-    let query = query.trim().to_lowercase();
-    tiles
-        .iter()
-        .filter(move |tile| query.is_empty() || tile.name.to_lowercase().contains(&query))
-        .collect()
-}
-
-/// When a detail view is open, Left/Right step one frame through the visible,
-/// search-filtered set. The step is clamped at both ends (no wrap): `None` when
-/// there is no current frame anchored (or the list is empty), matching the
-/// selection-driven grid nav. Up/Down never page.
+/// When a detail view is open, Left/Right step one frame through the set. The
+/// step is clamped at both ends (no wrap): `None` when there is no current
+/// frame anchored (or the list is empty), matching the selection-driven grid
+/// nav. Up/Down never page.
 fn paginate(current: usize, len: usize, dir: MoveDir) -> Option<usize> {
     if len == 0 {
         return None;
@@ -4681,9 +4671,9 @@ fn apply_frame_click(
     ctrl: bool,
     shift: bool,
     anchor: Option<&str>,
-    order: &[&Tile],
+    order: &[Tile],
 ) -> (HashSet<String>, Option<String>) {
-    // Index of the clicked frame in the visible order (None when filtered out).
+    // Index of the clicked frame in the grid order (None when not present).
     let click_idx = order.iter().position(|tile| tile.name == clicked);
 
     if shift {
@@ -4842,17 +4832,15 @@ fn search_input_id() -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new("search-input")
 }
 
-/// Renders an open roll's frame grid (search-filtered), with the detail view
-/// overlaid on an opaque surface when a frame is selected.
+/// Renders an open roll's frame grid, with the detail view overlaid on an
+/// opaque surface when a frame is selected.
 ///
 /// The grid stays mounted (scroll position persists) under the detail surface
 /// that captures input, so the detail view cannot leak wheel/clicks to it.
 fn frames_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let matched = filtered_tiles(&app.tiles, app.search_filter.as_deref().unwrap_or(""));
-
-    let tiles: Element<'_, Message> = if matched.is_empty() {
+    let tiles: Element<'_, Message> = if app.tiles.is_empty() {
         widget::container(widget::text(fl!("no-files")))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -4861,8 +4849,8 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
             .into()
     } else {
         let grid = Grid::with_children(
-            matched
-                .into_iter()
+            app.tiles
+                .iter()
                 .map(|tile| tile_view(tile, app.selected_frames.contains(&tile.name))),
         )
         .fluid(THUMB_SIZE)
@@ -8001,24 +7989,6 @@ mod tests {
     }
 
     #[test]
-    fn filtered_tiles_matches_case_insensitive_substring() {
-        let tiles = vec![tile("DSC_0001.CR2"), tile("scan-roll2.tif")];
-
-        let matched = filtered_tiles(&tiles, "dsc");
-
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].name, "DSC_0001.CR2");
-    }
-
-    #[test]
-    fn filtered_tiles_returns_all_on_empty_query() {
-        let tiles = vec![tile("a"), tile("b")];
-
-        assert_eq!(filtered_tiles(&tiles, "").len(), 2);
-        assert_eq!(filtered_tiles(&tiles, "   ").len(), 2);
-    }
-
-    #[test]
     fn paginate_steps_left_and_right_within_visible_set() {
         assert_eq!(paginate(1, 5, MoveDir::Left), Some(0));
         assert_eq!(paginate(1, 5, MoveDir::Right), Some(2));
@@ -8970,8 +8940,7 @@ mod tests {
     #[test]
     fn plain_click_selects_a_single_frame() {
         let tiles = vec![tile("a"), tile("b"), tile("c")];
-        let ord: Vec<&Tile> = tiles.iter().collect();
-        let (set, anchor) = apply_frame_click(HashSet::new(), "b", false, false, None, &ord);
+        let (set, anchor) = apply_frame_click(HashSet::new(), "b", false, false, None, &tiles);
         let mut v: Vec<_> = set.into_iter().collect();
         v.sort();
         assert_eq!(v, vec!["b".to_string()]);
@@ -8981,31 +8950,29 @@ mod tests {
     #[test]
     fn ctrl_click_toggles_membership() {
         let tiles = vec![tile("a"), tile("b"), tile("c")];
-        let ord: Vec<&Tile> = tiles.iter().collect();
         let start: HashSet<String> = ["a", "b"].into_iter().map(str::to_owned).collect();
         // Toggle "b" off.
-        let (set, anchor) = apply_frame_click(start.clone(), "b", true, false, Some("a"), &ord);
+        let (set, anchor) = apply_frame_click(start.clone(), "b", true, false, Some("a"), &tiles);
         assert_eq!(set.len(), 1);
         assert!(set.contains("a"));
         assert!(!set.contains("b"));
         assert_eq!(anchor.as_deref(), Some("a"));
         // Toggle "c" on.
-        let (set, _) = apply_frame_click(start, "c", true, false, Some("a"), &ord);
+        let (set, _) = apply_frame_click(start, "c", true, false, Some("a"), &tiles);
         assert_eq!(set.len(), 3);
     }
 
     #[test]
     fn shift_click_selects_range_anchor_to_clicked() {
         let tiles = vec![tile("a"), tile("b"), tile("c"), tile("d")];
-        let ord: Vec<&Tile> = tiles.iter().collect();
         // Anchor "a", click "c" → selects a..=c.
-        let (set, anchor) = apply_frame_click(HashSet::new(), "c", false, true, Some("a"), &ord);
+        let (set, anchor) = apply_frame_click(HashSet::new(), "c", false, true, Some("a"), &tiles);
         let mut v: Vec<_> = set.into_iter().collect();
         v.sort();
         assert_eq!(v, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
         assert_eq!(anchor.as_deref(), Some("c"));
         // Reverse range: anchor "d", click "b" → selects b..=d.
-        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, Some("d"), &ord);
+        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, Some("d"), &tiles);
         assert_eq!(set.len(), 3);
         assert!(set.contains("b") && set.contains("c") && set.contains("d"));
     }
@@ -9013,8 +8980,7 @@ mod tests {
     #[test]
     fn shift_click_without_anchor_collapses_to_single() {
         let tiles = vec![tile("a"), tile("b"), tile("c")];
-        let ord: Vec<&Tile> = tiles.iter().collect();
-        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, None, &ord);
+        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, None, &tiles);
         assert_eq!(set.len(), 1);
         assert!(set.contains("b"));
     }
