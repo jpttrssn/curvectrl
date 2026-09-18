@@ -842,6 +842,10 @@ pub struct DetailPrimitive {
 impl Primitive for DetailPrimitive {
     type Pipeline = DetailPipeline;
 
+    // Sequential wgpu uploads (texture, tone LUT, then uniforms) that must run
+    // in this exact order each frame; splitting them into helper methods would
+    // only scatter the pipeline state they all touch.
+    #[allow(clippy::too_many_lines)]
     fn prepare(
         &self,
         pipeline: &mut Self::Pipeline,

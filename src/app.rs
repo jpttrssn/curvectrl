@@ -102,6 +102,11 @@ const SEARCH_DEBOUNCE_MS: u64 = 300;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
+// Keep the handful of independent state flags as plain bools: they gate
+// mutually-unrelated behavior (multi-select, detail decode levels, crop mask,
+// export, async decode failures, overwrite dialog), so a shared bitmask or
+// nested structs would only obscure each flag's meaning.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppModel {
     /// Application state which is managed by the COSMIC runtime.
     core: cosmic::Core,
@@ -142,15 +147,12 @@ pub struct AppModel {
     selected_frames: HashSet<String>,
     /// Last frame used as the Shift+click range anchor within the grid.
     selection_anchor: Option<String>,
-    /// Whether the Ctrl modifier is currently held. Tracked from the global
-    /// keyboard subscription so a frame click can distinguish a plain click
-    /// (clear + select) from a Ctrl+click (toggle a frame in/out of the
-    /// multi-selection), since iced's `MouseArea` delivers no modifier info.
-    ctrl_down: bool,
-    /// Whether the Shift modifier is currently held. Drives Shift+click range
-    /// selection (and whether control shortcuts activate). Tracked from the
-    /// global keyboard subscription like `ctrl_down`.
-    shift_down: bool,
+    /// The modifier keys currently held, delivered by the global keyboard
+    /// subscription's `ModifiersChanged` event. A frame click reads this to
+    /// distinguish a plain click (clear + select) from a Ctrl+click (toggle a
+    /// frame in/out of the multi-selection) or a Shift+click (range), since
+    /// iced's `MouseArea` delivers no modifier info.
+    modifiers: keyboard::Modifiers,
     /// Whether an editing shortcut key (an `AdjustEdit` character) is currently
     /// held. Keyboard steps mutate the live preview (RAM + shader) on every
     /// press/repeat like a slider drag, and commit once when the key is
@@ -706,12 +708,11 @@ pub enum Message {
     FrameSelected(String),
     /// Select every frame in the open roll (Ctrl+A).
     SelectAllFrames,
-    /// A modifier key was pressed. Tracks Ctrl/Shift state so frame clicks can
-    /// distinguish plain/Ctrl/Shift selection (iced's `MouseArea` carries no
-    /// modifier info).
-    ModifierDown(Mod),
-    /// A modifier key was released; see [`Message::ModifierDown`].
-    ModifierUp(Mod),
+    /// The held modifier keys changed (delivered as `ModifiersChanged` by the
+    /// global keyboard subscription). Stored so frame clicks can distinguish
+    /// plain/Ctrl/Shift selection (iced's `MouseArea` carries no modifier
+    /// info).
+    ModifiersChanged(keyboard::Modifiers),
     /// A grid scrollable reported its geometry (bounds, content height, current
     /// translation). Cached so keyboard navigation can reveal the highlighted
     /// tile by scrolling the grid when it moves out of the visible viewport.
@@ -886,14 +887,6 @@ pub enum EditAdjust {
     /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
     /// magnitude, but the edit-key machinery still commits on release).
     RotateCcw,
-}
-
-/// A tracked modifier key whose held state a frame click needs to decide its
-/// multi-select behavior (iced's `MouseArea` does not deliver modifier state).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mod {
-    Ctrl,
-    Shift,
 }
 
 /// A curated export preset: the default combination of format, bit depth, and
@@ -1157,8 +1150,7 @@ impl cosmic::Application for AppModel {
             frame_selected: None,
             selected_frames: HashSet::new(),
             selection_anchor: None,
-            ctrl_down: false,
-            shift_down: false,
+            modifiers: keyboard::Modifiers::default(),
             editing_key_held: false,
             // A 3-wide grid is a safe initial guess until the first resize.
             grid_cols: 3,
@@ -1250,6 +1242,21 @@ impl cosmic::Application for AppModel {
         let spacing = f32::from(cosmic::theme::spacing().space_s);
         self.grid_cols = grid_num_cols(width, spacing).max(1);
         self.window_height = height;
+    }
+
+    /// Escape pressed outside any widget that captured it (routed here by
+    /// libcosmic's `keyboard_nav` subscription). Closes the detail view / roll
+    /// — and first clears an active library search — via the shared
+    /// `DetailClosed` path, so the header stays in sync with the grid.
+    fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
+        cosmic::task::message(Message::DetailClosed)
+    }
+
+    /// Ctrl+F pressed outside any widget that captured it (routed here by
+    /// libcosmic's `keyboard_nav` subscription). Reveals and focuses the header
+    /// search input, exactly like clicking the search icon.
+    fn on_search(&mut self) -> Task<cosmic::Action<Self::Message>> {
+        cosmic::task::message(Message::SearchActivate)
     }
 
     /// Elements to pack at the start of the header bar.
@@ -1544,35 +1551,25 @@ impl cosmic::Application for AppModel {
     fn subscription(&self) -> Subscription<Self::Message> {
         // Add subscriptions which are always active.
         let mut subscriptions = vec![
-            // Close the detail view when Escape is pressed outside any widget
-            // that captures the key first; the other bindings drive the
-            // library grid selection and the roll-info drawer.
+            // Escape, Ctrl+F, Tab, and F11 are handled by libcosmic's built-in
+            // `keyboard_nav` subscription (routed to `on_escape`/`on_search`),
+            // so this subscription only maps the app-specific keys below.
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(named),
                     ..
                 } => match named {
-                    keyboard::key::Named::Escape => Some(Message::DetailClosed),
                     keyboard::key::Named::Enter => Some(Message::OpenSelected),
                     keyboard::key::Named::ArrowLeft => Some(Message::Nav(MoveDir::Left)),
                     keyboard::key::Named::ArrowRight => Some(Message::Nav(MoveDir::Right)),
                     keyboard::key::Named::ArrowUp => Some(Message::Nav(MoveDir::Up)),
                     keyboard::key::Named::ArrowDown => Some(Message::Nav(MoveDir::Down)),
-                    keyboard::key::Named::Control => Some(Message::ModifierDown(Mod::Ctrl)),
-                    keyboard::key::Named::Shift => Some(Message::ModifierDown(Mod::Shift)),
                     _ => None,
                 },
-                // Mirror the modifier releases so `ctrl_down`/`shift_down`
-                // stay accurate even when the frame click that reads them
-                // happens later.
-                keyboard::Event::KeyReleased {
-                    key: keyboard::Key::Named(named),
-                    ..
-                } => match named {
-                    keyboard::key::Named::Control => Some(Message::ModifierUp(Mod::Ctrl)),
-                    keyboard::key::Named::Shift => Some(Message::ModifierUp(Mod::Shift)),
-                    _ => None,
-                },
+                // Track the held modifier state (Ctrl/Shift/Alt) delivered by
+                // the platform so frame clicks can decide their selection
+                // behavior — iced's `MouseArea` carries no modifier info.
+                keyboard::Event::ModifiersChanged(modifiers) => Some(Message::ModifiersChanged(modifiers)),
                 // The spacebar carries no Named variant in this iced fork, so it arrives
                 // as a character — matched by payload. A bare space (no
                 // modifiers) toggles the active page's context drawer, which
@@ -1583,12 +1580,6 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if !modifiers.control() && character == " " => Some(Message::ToggleContext),
-                // Ctrl+F reveals (and focuses) the search field.
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if modifiers.control() && character == "f" => Some(Message::SearchActivate),
                 // Ctrl+A selects every frame in the open roll.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
@@ -1751,7 +1742,7 @@ impl cosmic::Application for AppModel {
                 self.handle_detail_preloaded(&dir, &name, preset, result)
             }
 
-            Message::ThumbnailActivated(name) => self.open_frame(name),
+            Message::ThumbnailActivated(name) => self.open_frame(&name),
 
             Message::DetailFadeTick => {
                 let dt = self
@@ -2187,10 +2178,10 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::RemoveRoll(dir) => self.remove_roll(dir),
+            Message::RemoveRoll(dir) => self.remove_roll(&dir),
 
             Message::RemoveSelectedRoll => match self.library_selection.clone() {
-                Some(LibrarySelection::Roll(dir)) => self.remove_roll(dir),
+                Some(LibrarySelection::Roll(dir)) => self.remove_roll(&dir),
                 _ => Task::none(),
             },
 
@@ -2198,7 +2189,7 @@ impl cosmic::Application for AppModel {
                 if self.active.is_some() {
                     // Frame page: open the highlighted frame in the detail view.
                     if let Some(name) = self.frame_selected.clone() {
-                        self.open_frame(name)
+                        self.open_frame(&name)
                     } else {
                         Task::none()
                     }
@@ -2226,7 +2217,8 @@ impl cosmic::Application for AppModel {
                         if let Some(target) =
                             current.and_then(|idx| paginate(idx, self.tiles.len(), dir))
                         {
-                            return self.open_frame(self.tiles[target].name.clone());
+                            let name = self.tiles[target].name.clone();
+                        return self.open_frame(&name);
                         }
                         return Task::none();
                     }
@@ -2244,7 +2236,7 @@ impl cosmic::Application for AppModel {
                         self.frame_selected = Some(name.clone());
                         // Shift+arrow extends the multi-selection (keeping it
                         // additive); a plain arrow collapses to the new primary.
-                        if self.shift_down {
+                        if self.modifiers.shift() {
                             self.selected_frames.insert(name.clone());
                         } else {
                             self.selected_frames.clear();
@@ -2283,8 +2275,8 @@ impl cosmic::Application for AppModel {
                 let (updated, anchor) = apply_frame_click(
                     std::mem::take(&mut self.selected_frames),
                     &name,
-                    self.ctrl_down,
-                    self.shift_down,
+                    self.modifiers.control(),
+                    self.modifiers.shift(),
                     self.selection_anchor.as_deref(),
                     &self.tiles,
                 );
@@ -2301,19 +2293,8 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::ModifierDown(modifier) => {
-                match modifier {
-                    Mod::Ctrl => self.ctrl_down = true,
-                    Mod::Shift => self.shift_down = true,
-                }
-                Task::none()
-            }
-
-            Message::ModifierUp(modifier) => {
-                match modifier {
-                    Mod::Ctrl => self.ctrl_down = false,
-                    Mod::Shift => self.shift_down = false,
-                }
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
                 Task::none()
             }
 
@@ -2734,35 +2715,35 @@ impl AppModel {
     /// tile, or Left/Right paging while a detail view is open). Persists unsaved
     /// tweaks to the outgoing file, loads the stored edits, updates both the
     /// detail selection and the grid highlight, and starts the decode chain.
-    fn open_frame(&mut self, name: String) -> Task<cosmic::Action<Message>> {
-        if self.selected.as_deref() != Some(name.as_str()) {
+    fn open_frame(&mut self, name: &str) -> Task<cosmic::Action<Message>> {
+        if self.selected.as_deref() != Some(name) {
             // Persist unsaved tweaks to the outgoing file first.
             self.persist_roll();
             // Read the stored edits BEFORE the decode builds the shader, which
             // consumes `self.exposure_ev` and the tone (via `set_curve` in
             // `handle_detail_ready`).
-            let stored_tone = self.roll.tone(name.as_str());
-            self.selected = Some(name.clone());
-            self.frame_selected = Some(name.clone());
+            let stored_tone = self.roll.tone(name);
+            self.selected = Some(name.to_owned());
+            self.frame_selected = Some(name.to_owned());
             // The opened frame becomes the primary of the multi-selection (and
             // the Shift+click anchor), so copy/paste batches stay consistent
             // with what is on screen.  Shift+open extends; a plain open
             // collapses the set to the single opened frame.
-            if self.shift_down {
-                self.selected_frames.insert(name.clone());
+            if self.modifiers.shift() {
+                self.selected_frames.insert(name.to_owned());
             } else {
                 self.selected_frames.clear();
-                self.selected_frames.insert(name.clone());
+                self.selected_frames.insert(name.to_owned());
             }
-            self.selection_anchor = Some(name.clone());
+            self.selection_anchor = Some(name.to_owned());
             self.clear_detail();
             self.exposure_ev = stored_tone.exposure_ev;
             self.curve_contrast = stored_tone.curve_contrast;
             self.curve_rolloff = stored_tone.curve_rolloff;
             self.curve_shadows = stored_tone.curve_shadows;
-            self.crop = self.roll.crop(name.as_str());
+            self.crop = self.roll.crop(name);
             self.crop_drafts = CropDrafts::from_margins(self.crop);
-            self.rotation = self.roll.rotation(name.as_str()) & 3;
+            self.rotation = self.roll.rotation(name) & 3;
             // Entering the detail view: the drawer (if the detail's memory says
             // open) shows the editing panel; navigation never closes it.
             self.restore_drawer_for(DrawerView::Detail);
@@ -2783,7 +2764,7 @@ impl AppModel {
 
         Task::batch([
             self.decode_detail_next(),
-            self.preload_detail_neighbors(&name),
+            self.preload_detail_neighbors(name),
         ])
     }
 
@@ -3767,12 +3748,8 @@ impl AppModel {
             .selected_frames
             .iter()
             .cloned()
-            .chain(
-                self.frame_selected
-                    .clone()
-                    .into_iter()
-                    .chain(self.selected.clone().into_iter()),
-            )
+            .chain(self.frame_selected.clone())
+            .chain(self.selected.clone())
             .collect();
         targets.sort();
         targets.dedup();
@@ -3787,16 +3764,16 @@ impl AppModel {
 
         // If the live detail frame is a target, sync the on-screen preview
         // state and the GPU shader to the pasted values.
-        if let Some(open) = self.selected.as_deref() {
-            if targets.iter().any(|name| name == open) {
-                self.exposure_ev = tone.exposure_ev;
-                self.curve_contrast = tone.curve_contrast;
-                self.curve_rolloff = tone.curve_rolloff;
-                self.curve_shadows = tone.curve_shadows;
-                if let Some(shader) = &mut self.detail_shader {
-                    shader.set_exposure(tone.exposure_ev);
-                    shader.set_curve(tone.curve_contrast, tone.curve_rolloff, tone.curve_shadows);
-                }
+        if let Some(open) = self.selected.as_deref()
+            && targets.iter().any(|name| name == open)
+        {
+            self.exposure_ev = tone.exposure_ev;
+            self.curve_contrast = tone.curve_contrast;
+            self.curve_rolloff = tone.curve_rolloff;
+            self.curve_shadows = tone.curve_shadows;
+            if let Some(shader) = &mut self.detail_shader {
+                shader.set_exposure(tone.exposure_ev);
+                shader.set_curve(tone.curve_contrast, tone.curve_rolloff, tone.curve_shadows);
             }
         }
 
@@ -3812,17 +3789,17 @@ impl AppModel {
         tasks.push(self.decode_next());
         // If the open roll's cover is among the targets, its library card also
         // re-bakes to mirror the edit.
-        if let Some(active) = self.active.as_ref() {
-            if let Some(roll) = self.rolls.iter_mut().find(|roll| {
+        if let Some(active) = self.active.as_ref()
+            && let Some(roll) = self.rolls.iter_mut().find(|roll| {
                 roll.dir == *active
                     && roll
                         .cover
                         .as_deref()
                         .is_some_and(|cover| targets.iter().any(|t| t == cover))
-            }) {
-                roll.thumb = Thumb::Loading;
-                tasks.push(self.decode_covers());
-            }
+            })
+        {
+            roll.thumb = Thumb::Loading;
+            tasks.push(self.decode_covers());
         }
         Task::batch(tasks)
     }
@@ -3834,7 +3811,7 @@ impl AppModel {
     /// manifest are left untouched — only the library listing changes, so the
     /// roll can be re-added later without losing edits. No-ops when the roll
     /// is not in the library (e.g. a stale reference) or while it is open.
-    fn remove_roll(&mut self, dir: PathBuf) -> Task<cosmic::Action<Message>> {
+    fn remove_roll(&mut self, dir: &Path) -> Task<cosmic::Action<Message>> {
         // Only the library page owns the roll list; an open roll cannot be
         // removed from under its frame grid.
         if self.active.is_some() {
@@ -3847,7 +3824,7 @@ impl AppModel {
 
         self.config
             .rolls
-            .retain(|candidate| Path::new(candidate) != dir.as_path());
+            .retain(|candidate| Path::new(candidate) != dir);
         self.persist_config();
         self.rolls.retain(|roll| roll.dir != dir);
 
@@ -4678,21 +4655,20 @@ fn apply_frame_click(
 
     if shift {
         // Range: anchor through clicked, inclusive, in display order.
-        if let Some(anchor) = anchor {
-            if let (Some(click_idx), Some(anchor_idx)) =
+        if let Some(anchor) = anchor
+            && let (Some(click_idx), Some(anchor_idx)) =
                 (click_idx, order.iter().position(|tile| tile.name == anchor))
-            {
-                let (lo, hi) = if anchor_idx <= click_idx {
-                    (anchor_idx, click_idx)
-                } else {
-                    (click_idx, anchor_idx)
-                };
-                selected.clear();
-                for tile in &order[lo..=hi] {
-                    selected.insert(tile.name.clone());
-                }
-                return (selected, Some(clicked.to_owned()));
+        {
+            let (lo, hi) = if anchor_idx <= click_idx {
+                (anchor_idx, click_idx)
+            } else {
+                (click_idx, anchor_idx)
+            };
+            selected.clear();
+            for tile in &order[lo..=hi] {
+                selected.insert(tile.name.clone());
             }
+            return (selected, Some(clicked.to_owned()));
         }
         // No usable anchor: fall through to a plain single selection.
     }
