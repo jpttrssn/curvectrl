@@ -79,6 +79,11 @@ pub struct DetailProgram {
     /// uncropped frame drawn on top of the zoomed crop with everything outside
     /// the crop rectangle dimmed. View-only — never persisted or baked.
     show_mask: bool,
+    /// Minimum padding (logical points) kept around the image in crop mode:
+    /// the WGSL contain-fit base shrinks by `pad` on every side so a white
+    /// margin is always visible; zooming in grows the image into it. `0.0`
+    /// (normal mode) is the exact previous layout. Set via [`Self::set_pad`].
+    pad: f32,
     /// Whether the mono texture holds a true sensor-linear NEGATIVE that the
     /// shader must density-invert per fragment (a film preset), instead of an
     /// already-positive scan. When inverted, the exposure gain multiplies the
@@ -203,6 +208,7 @@ impl DetailProgram {
             crop,
             rotation,
             show_mask: false,
+            pad: 0.0,
             inverted,
             inv_base,
             inv_d_max,
@@ -303,6 +309,14 @@ impl DetailProgram {
         self.show_mask = on;
     }
 
+    /// Set the minimum padding (logical points) kept around the image in crop
+    /// mode. The WGSL contain-fit base shrinks by `pad` on every side so a
+    /// white margin is always visible; zooming in grows the image into it.
+    /// `0.0` (normal mode) restores the exact unpadded layout.
+    pub fn set_pad(&mut self, pad: f32) {
+        self.pad = pad;
+    }
+
     /// The full-resolution display-oriented source dimensions the persisted
     /// crop margins are authored against (the sensor's post-masked-border dims,
     /// oriented, before any downscale). The crop keyboard math must bound its
@@ -327,8 +341,11 @@ impl DetailProgram {
         let (_, (cw, ch)) =
             crop_uv_geometry(self.crop, self.width, self.height, self.src_w, self.src_h);
         let (dw, dh) = if (self.rotation & 1) != 0 { (ch, cw) } else { (cw, ch) };
-        let sc_w = (widget_w * scale_factor).max(1.0);
-        let sc_h = (widget_h * scale_factor).max(1.0);
+        // The 1:1 cap mirrors the WGSL contain-fit, which in crop mode shrinks
+        // the available box by the minimum padding on every side (`pad` is in
+        // logical points, converted to physical like the scissor rect).
+        let sc_w = ((widget_w - 2.0 * self.pad) * scale_factor).max(1.0);
+        let sc_h = ((widget_h - 2.0 * self.pad) * scale_factor).max(1.0);
         1.0 + (dw / sc_w).max(dh / sc_h).log2().max(0.0)
     }
 
@@ -360,6 +377,7 @@ impl Clone for DetailProgram {
             crop: self.crop,
             rotation: self.rotation,
             show_mask: self.show_mask,
+            pad: self.pad,
             inverted: self.inverted,
             inv_base: self.inv_base,
             inv_d_max: self.inv_d_max,
@@ -392,6 +410,7 @@ impl std::fmt::Debug for DetailProgram {
             .field("crop", &self.crop)
             .field("rotation", &self.rotation)
             .field("show_mask", &self.show_mask)
+            .field("pad", &self.pad)
             .field("inverted", &self.inverted)
             .field("inv_base", &self.inv_base)
             .field("inv_d_max", &self.inv_d_max)
@@ -428,6 +447,7 @@ impl<M> Program<M> for DetailProgram {
             crop: self.crop,
             rotation: self.rotation,
             show_mask: self.show_mask,
+            pad: self.pad,
             width: self.width,
             height: self.height,
             src_w: self.src_w,
@@ -816,6 +836,8 @@ pub struct DetailPrimitive {
     /// Whether the "view dimmed crop area" overlay is shown (full frame on top
     /// of the zoomed crop, dimmed outside the crop rect).
     show_mask: bool,
+    /// Minimum padding (logical points) kept around the image in crop mode.
+    pad: f32,
     /// Whether the mono is a true sensor-linear NEGATIVE to density-invert per
     /// fragment (film preset). Inverts the exposure gain sign (see
     /// [`sensor_gain`]) and drives the WGSL inversion branch.
@@ -1026,6 +1048,9 @@ impl Primitive for DetailPrimitive {
             rot,
             // Whether to draw the full-frame dim overlay (see set_show_mask).
             show_mask: if self.show_mask { 1.0 } else { 0.0 },
+            // Crop-mode minimum padding, logical points → physical pixels like
+            // the pan (see set_pad).
+            pad: self.pad * sf,
             // Film-negative inversion: on when the texture is a true
             // sensor-linear negative the WGSL must density-invert per fragment.
             inv: if self.inverted { 1.0 } else { 0.0 },
@@ -1342,6 +1367,10 @@ struct Uniforms {
     /// draws the full uncropped frame on top of the zoomed crop and dims
     /// everything outside the crop rectangle.
     show_mask: f32,
+    /// Minimum padding (physical pixels) kept around the image in crop mode.
+    /// The WGSL contain-fit base shrinks by `pad` on every side so a white
+    /// margin is always visible; zooming in grows the image into it.
+    pad: f32,
     /// Non-zero when the texture is a true sensor-linear NEGATIVE the shader
     /// must density-invert per fragment (a film preset). Drives the WGSL
     /// inversion branch in `shade()`.
@@ -1579,6 +1608,24 @@ mod tests {
 
         // A widget larger than the texture never drops the cap below contain.
         assert!((program.zoom_100(4000.0, 4000.0, 1.0) - 1.0).abs() < 1e-5);
+
+        // Crop-mode padding shrinks the contain-fit base: on a 2000×1000
+        // texture in a 1000×1000 widget, 100px padding leaves 800×800 for the
+        // image, so the width axis needs 2.5× (2000/800) → cap 1 + log2(2.5).
+        let mut padded = program.clone();
+        padded.set_pad(100.0);
+        assert!((padded.zoom_100(1000.0, 1000.0, 1.0) - (1.0 + 2.5f32.log2())).abs() < 1e-5);
+
+        // A widget smaller than 2× the padding clamps the available box to 1
+        // physical pixel on each side (no divide-by-zero / negative cap) —
+        // the cap is then just the 1:1 point for a 1px box.
+        assert!(
+            (padded.zoom_100(50.0, 50.0, 1.0) - (1.0 + 2000.0f32.log2())).abs() < 1e-5
+        );
+
+        // Zero padding is the unpadded layout (regression guard for the mirror).
+        padded.set_pad(0.0);
+        assert!((padded.zoom_100(1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
     }
 
     #[test]

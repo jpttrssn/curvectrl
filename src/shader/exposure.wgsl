@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// How much to darken the region outside the crop in the "view dimmed crop
+// area" overlay: the outside-crop color is multiplied by `1 - DIM_AMOUNT`.
+// 0.5 keeps the surrounding frame readable at half brightness.
+const DIM_AMOUNT: f32 = 0.5;
+
 // Canonical fullscreen triangle: three NDC vertices whose triangle
 // clips to the entire viewport rectangle. The (-1,-1) corner is
 // shared; the other two overshoot to x=3 or y=3 so the diagonal
@@ -46,6 +51,11 @@ struct Uniforms {
     // overlay reuses the same zoom/pan; anything beyond the shader region is
     // clipped by the viewport. 0.0 = base zoom-crop view only.
     show_mask: f32,
+    // Minimum padding (physical pixels) kept around the image in crop mode: the
+    // contain-fit base shrinks by `pad` on every side, so a white margin is
+    // always visible around the frame. Zooming in grows the image into the
+    // padding (it is a minimum, not a clip). 0.0 = no padding (normal mode).
+    pad: f32,
     // When non-zero, the texture is a TRUE sensor-linear NEGATIVE (a film
     // preset) that must be density-inverted per fragment: `exposure` multiplies
     // the sensor data FIRST, then the inversion maps transmission → positive,
@@ -168,12 +178,13 @@ fn crop_box_display(rot: f32, u0: f32, u1: f32, v0: f32, v1: f32) -> vec4<f32> {
     return vec4<f32>(u0, u1, v0, v1);
 }
 
-/// The full-frame "view dimmed crop area" overlay sample: `inside` is true when
-/// the fragment lies on the full uncropped frame (its own contain-fit box), and
-/// `dim` is 1.0 when it falls OUTSIDE the crop rectangle (in that full-frame
-/// layout) so [`fs_main`] can darken it. Reuses the same zoom/pan as the base
-/// view; the overlay never re-sizes or re-zooms the image. Any part of the full
-/// frame beyond the shader region is clipped by the render-pass viewport.
+/// The "view dimmed crop area" overlay sample: `inside` is true when the
+/// fragment lies on the full uncropped frame (laid out over the SAME contain-fit
+/// box as the base view, so the mask is always exactly the size of the image),
+/// and `dim` is 1.0 when it falls OUTSIDE the crop rectangle (in that layout) so
+/// [`fs_main`] can darken it. Reuses the same zoom/pan as the base view; the
+/// overlay never re-sizes or re-zooms the image. Any part of the full frame
+/// beyond the shader region is clipped by the render-pass viewport.
 struct OverlaySample {
     uv: vec2<f32>,
     inside: bool,
@@ -182,10 +193,17 @@ struct OverlaySample {
 
 fn overlay_sample(frag: vec2<f32>) -> OverlaySample {
     let rot = uniforms.rot;
-    // Contain both axes of the FULL source texture as DISPLAYED (rotated),
-    // independent of the base zoom-crop layout, with the same zoom/pan.
-    let dims = rotated_dims(uniforms.tex_w, uniforms.tex_h, rot);
-    let contain = min(uniforms.sc_w / dims.x, uniforms.sc_h / dims.y);
+    // Contain both axes of the CROPPED frame as DISPLAYED (rotated) — the same
+    // contain-fit box the base view uses — so the dim overlay is always the
+    // same size as the image and covers it exactly, whatever the crop's aspect.
+    // (The overlay still samples the FULL texture over that box; the crop rect
+    // and dim logic are expressed in full-frame fractions, unchanged.) The
+    // crop-mode minimum padding (`uniforms.pad`) shrinks the available box on
+    // every side so the overlay's white margin matches the base view's.
+    let dims = rotated_dims(uniforms.crop_w, uniforms.crop_h, rot);
+    let avail_w = max(uniforms.sc_w - 2.0 * uniforms.pad, 1.0);
+    let avail_h = max(uniforms.sc_h - 2.0 * uniforms.pad, 1.0);
+    let contain = min(avail_w / dims.x, avail_h / dims.y);
     let scale = contain * exp2(uniforms.zoom - 1.0);
     let rw = dims.x * scale;
     let rh = dims.y * scale;
@@ -217,9 +235,14 @@ fn view_uv(frag: vec2<f32>) -> ViewSample {
     let rot = uniforms.rot;
     // Contain both axes of the CROPPED frame AS DISPLAYED (rotated); an odd
     // rotation swaps which frame axis contains the widget. Trimming re-fits/
-    // zooms the kept content to fill the box at zoom 1.
+    // zooms the kept content to fill the box at zoom 1. In crop mode the
+    // minimum padding (`uniforms.pad`) shrinks the available box on every side,
+    // so a white margin always surrounds the image at contain fit; zooming in
+    // grows the image into the padding.
     let dims = rotated_dims(uniforms.crop_w, uniforms.crop_h, rot);
-    let contain = min(uniforms.sc_w / dims.x, uniforms.sc_h / dims.y);
+    let avail_w = max(uniforms.sc_w - 2.0 * uniforms.pad, 1.0);
+    let avail_h = max(uniforms.sc_h - 2.0 * uniforms.pad, 1.0);
+    let contain = min(avail_w / dims.x, avail_h / dims.y);
     let scale = contain * exp2(uniforms.zoom - 1.0);
     let rw = dims.x * scale;
     let rh = dims.y * scale;
@@ -302,7 +325,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         if overlay.inside {
             let overlay_srgb = shade(overlay.uv);
             // Dim (multiply down) the region outside the crop rectangle.
-            let factor = 1.0 - 0.85 * overlay.dim;
+            let factor = 1.0 - DIM_AMOUNT * overlay.dim;
             rgb = overlay_srgb * factor;
             alpha = 1.0;
         }

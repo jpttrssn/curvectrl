@@ -74,12 +74,25 @@ const EDIT_NUDGE_EV: f32 = 0.05;
 const EDIT_STEP_CURVE: f32 = 0.20;
 /// Keyboard shortcut nudge step for a tone-curve power with the Shift modifier.
 const EDIT_NUDGE_CURVE: f32 = 0.05;
-/// Keyboard shortcut step for a crop trim: a bare edge key removes this many
-/// source pixels from the edge (positive = trim more / shrink the frame).
+/// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
+/// or an arrow) translates the crop window by this many source pixels.
 const CROP_STEP_PX: i32 = 2;
-/// Keyboard shortcut nudge step for a crop trim with the Shift modifier (a
-/// 1px fine adjustment).
+/// Keyboard shortcut nudge step for a crop move with the Shift modifier (a 1px
+/// fine adjustment).
 const CROP_NUDGE_PX: i32 = 1;
+/// Keyboard shortcut step for a crop-window resize: a bare `-`/`=` grows or
+/// shrinks the crop window (about its center, aspect-locked) so its long edge
+/// changes by this many source pixels. Shift switches to the 1px `CROP_NUDGE_PX`.
+const CROP_RESIZE_STEP_PX: i32 = 4;
+/// The smallest crop-window long edge (source pixels) a resize is allowed to
+/// shrink to, so a resize can never collapse the crop to a degenerate sliver.
+const MIN_CROP_WINDOW: u32 = 4;
+
+/// Minimum padding (logical points) kept around the image on every side while
+/// the detail view is in crop mode: the shader's contain-fit base shrinks by
+/// this amount so a white margin is always visible, even when the image aspect
+/// exactly matches the widget. Zooming in grows the image into the padding.
+const CROP_MODE_PADDING: f32 = 100.0;
 
 /// Maximum detail-view zoom in `log2` units: 1.0 = contain fit, each +1
 /// doubles the rendered scale, so this caps at 2^6 = 64× the fit scale.
@@ -261,10 +274,6 @@ pub struct AppModel {
     /// 90° quarter-turns (`0`…`3`) on top of the EXIF orientation. Loaded from
     /// the stored manifest per open and applied to the GPU shader as a uniform.
     rotation: u8,
-    /// Draft text for the four crop margin fields in the editing drawer. Kept
-    /// as strings (not the committed margins) so typing doesn't fight the
-    /// read-only view; committed to `crop` on each field's submit.
-    crop_drafts: CropDrafts,
     /// Draft text for the two roll date fields in the roll-info drawer, seeded
     /// from the selected roll's committed dates on selection change and
     /// committed back on submit.
@@ -273,10 +282,13 @@ pub struct AppModel {
     /// the selected roll's current name on selection change and committed on
     /// submit.
     roll_name_draft: String,
-    /// Whether the detail view's "view dimmed crop area" overlay is shown:
-    /// the full uncropped frame drawn on top of the zoomed crop with everything
-    /// outside the crop dimmed. View-only — never persisted.
-    show_crop_mask: bool,
+    /// Whether the detail view is in crop mode — a focused, VIM-like modal
+    /// state toggled by the bare `c` key or the View → Crop mode menu item.
+    /// Only meaningfully on with a detail view open. While active the surround
+    /// renders white and the shader dims everything outside the crop (the old
+    /// "view dimmed crop area" overlay), frame paging is disabled, and the
+    /// keyboard accepts only the h/j/k/l crop trims. Never persisted.
+    crop_mode: bool,
     /// Edit values as they were when the detail panel was opened — the stored
     /// manifest values for the selected file. `ResetAll` restores these, not
     /// the identity, so reset reverts the panel to its opened state.
@@ -319,53 +331,6 @@ pub struct AppModel {
     /// is running. Drives the header's circular progress ring; the stream task
     /// clears it via [`Message::ExportDone`] when the batch finishes.
     export_progress: Option<(usize, usize)>,
-}
-
-/// Draft text (source-pixel strings) for the four crop margin fields in the
-/// editing drawer, one per edge. Initialized from the committed margins on
-/// open; updated by typing; committed back into `AppModel.crop` on submit.
-/// Holds a `String` (never a parsed margin) so an in-progress edit stays
-/// stable while the read-only view re-renders.
-#[derive(Debug, Clone)]
-struct CropDrafts {
-    top: String,
-    right: String,
-    bottom: String,
-    left: String,
-}
-
-impl CropDrafts {
-    /// Fresh drafts from a set of committed margins.
-    fn from_margins(crop: edit_manifest::CropMargins) -> Self {
-        Self {
-            top: crop.top.to_string(),
-            right: crop.right.to_string(),
-            bottom: crop.bottom.to_string(),
-            left: crop.left.to_string(),
-        }
-    }
-
-    /// The draft for a given edge, updated in place (used for typing).
-    fn set(&mut self, direction: edit_manifest::CropDirection, value: String) {
-        use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
-        match direction {
-            Top => self.top = value,
-            Right => self.right = value,
-            Bottom => self.bottom = value,
-            Left => self.left = value,
-        }
-    }
-
-    /// The draft for a given edge.
-    fn get(&self, direction: edit_manifest::CropDirection) -> &str {
-        use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
-        match direction {
-            Top => &self.top,
-            Right => &self.right,
-            Bottom => &self.bottom,
-            Left => &self.left,
-        }
-    }
 }
 
 /// Which roll date field a draft/commit message targets.
@@ -773,15 +738,6 @@ pub enum Message {
     /// Reset every first-class edit (exposure + tone curve) to their
     /// identities in one action, and persist the reset like any other edit.
     ResetAll,
-    /// The user typed into a crop margin field. Carries the affected edge and
-    /// the new draft text (kept in RAM so typing doesn't fight a read-only
-    /// view); nothing is committed until the field is submitted.
-    CropDraftChange(edit_manifest::CropDirection, String),
-    /// A crop margin field was submitted (Enter/return): parse the draft,
-    /// clamp it, and apply it as an absolute source-pixel margin for that
-    /// edge — re-deriving the perpendicular pair to preserve aspect — then
-    /// persist like any other edit.
-    CropDraftSubmit(edit_manifest::CropDirection),
     /// Reset only the crop margins to zero (show the full frame), leaving the
     /// exposure and tone edits untouched, and persist the reset.
     ResetCrop,
@@ -801,14 +757,11 @@ pub enum Message {
     /// trimmed draft (empty reverts to the directory leaf) to the roll's
     /// manifest and update the in-memory roll and card.
     RollNameDraftSubmit,
-    /// Rotate the detail view counter-clockwise by one 90° quarter-turn and
-    /// persist immediately (the editing-drawer button; the keyboard routes the
-    /// same rotation through `EditAdjust::RotateCcw` with commit-on-release).
-    RotateCcw,
-    /// Toggle the detail view's "view dimmed crop area" overlay: on shows the
-    /// full uncropped frame on top of the zoomed crop with everything outside
-    /// the crop dimmed; off shows the plain zoomed crop. View-only state.
-    ToggleCropMask,
+    /// Toggle the detail view's crop mode: a focused modal state (bare `c` or
+    /// View → Crop mode) in which the surround renders white and the shader
+    /// dims everything outside the crop, frame paging is disabled, and only
+    /// the h/j/k/l crop trims act. A no-op outside a detail view.
+    ToggleCropMode,
     /// Flush the in-memory roll edits to the manifest file on disk.
     EditSave,
     /// Copy the focused frame's full edit (exposure + tone curve) to the
@@ -879,7 +832,10 @@ pub enum EditAdjust {
     Contrast(f32),
     Rolloff(f32),
     Shadows(f32),
-    Crop {
+    /// Translate the crop window by `delta` source pixels in `direction` (the
+    /// window's position moves; its size and aspect are untouched). Clamped so
+    /// the window stays inside the source frame.
+    CropMove {
         direction: edit_manifest::CropDirection,
         delta: i32,
     },
@@ -1130,6 +1086,15 @@ impl cosmic::Application for AppModel {
                     },
                     MenuAction::Export,
                 ),
+                // Bare `c` toggles crop mode; same label-only convention as
+                // `e` above.
+                (
+                    menu::KeyBind {
+                        modifiers: vec![],
+                        key: keyboard::Key::Character("c".into()),
+                    },
+                    MenuAction::ToggleCropMode,
+                ),
             ]),
             // Optional configuration file for an application.
             config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
@@ -1199,7 +1164,6 @@ impl cosmic::Application for AppModel {
             curve_shadows: 1.0,
             exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             crop: edit_manifest::CropMargins::default(),
-            crop_drafts: CropDrafts::from_margins(edit_manifest::CropMargins::default()),
             roll_date_drafts: RollDateDrafts {
                 key: None,
                 start: String::new(),
@@ -1207,7 +1171,7 @@ impl cosmic::Application for AppModel {
             },
             roll_name_draft: String::new(),
             rotation: 0,
-            show_crop_mask: false,
+            crop_mode: false,
             reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             reset_curve_contrast: 1.0,
             reset_curve_rolloff: 1.0,
@@ -1245,11 +1209,16 @@ impl cosmic::Application for AppModel {
     }
 
     /// Escape pressed outside any widget that captured it (routed here by
-    /// libcosmic's `keyboard_nav` subscription). Closes the detail view / roll
-    /// — and first clears an active library search — via the shared
-    /// `DetailClosed` path, so the header stays in sync with the grid.
+    /// libcosmic's `keyboard_nav` subscription). While a detail view is in crop
+    /// mode it exits the mode first — a VIM-like "leave the focused mode" — and
+    /// a second Escape then closes the roll / detail view (also clearing an
+    /// active library search) via the shared `DetailClosed` path.
     fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
-        cosmic::task::message(Message::DetailClosed)
+        if self.crop_mode {
+            cosmic::task::message(Message::ToggleCropMode)
+        } else {
+            cosmic::task::message(Message::DetailClosed)
+        }
     }
 
     /// Ctrl+F pressed outside any widget that captured it (routed here by
@@ -1378,6 +1347,9 @@ impl cosmic::Application for AppModel {
                 vec![
                     menu::Item::Button(fl!("about"), None, MenuAction::About),
                     details,
+                    menu::Item::Divider,
+                    // Crop mode only means something over a detail view.
+                    menu::Item::CheckBox(fl!("menu-crop-mode"), None, self.crop_mode, MenuAction::ToggleCropMode),
                 ],
             ),
         );
@@ -1554,6 +1526,11 @@ impl cosmic::Application for AppModel {
             // Escape, Ctrl+F, Tab, and F11 are handled by libcosmic's built-in
             // `keyboard_nav` subscription (routed to `on_escape`/`on_search`),
             // so this subscription only maps the app-specific keys below.
+            //
+            // `Subscription::filter_map` requires a NON-CAPTURING (zero-sized)
+            // closure, so the crop-mode routing below cannot read `self` — it
+            // maps key events unconditionally and the message handlers do the
+            // crop-mode gating (`Message::Nav` and `Message::AdjustEdit`).
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(named),
@@ -1569,7 +1546,9 @@ impl cosmic::Application for AppModel {
                 // Track the held modifier state (Ctrl/Shift/Alt) delivered by
                 // the platform so frame clicks can decide their selection
                 // behavior — iced's `MouseArea` carries no modifier info.
-                keyboard::Event::ModifiersChanged(modifiers) => Some(Message::ModifiersChanged(modifiers)),
+                keyboard::Event::ModifiersChanged(modifiers) => {
+                    Some(Message::ModifiersChanged(modifiers))
+                }
                 // The spacebar carries no Named variant in this iced fork, so it arrives
                 // as a character — matched by payload. A bare space (no
                 // modifiers) toggles the active page's context drawer, which
@@ -1610,10 +1589,26 @@ impl cosmic::Application for AppModel {
                     modifiers,
                     ..
                 } if !modifiers.control() && character == "e" => Some(Message::ExportRequested),
+                // Bare `c` toggles crop mode — the focused, VIM-like modal
+                // state for trimming the crop with h/j/k/l. Placed before the
+                // editing-key wildcard and the arrow-nav arms so `c` never
+                // routes into an edit adjust; the handler no-ops outside a
+                // detail view. Auto-repeat is ignored so a held `c` toggles
+                // once rather than flapping the mode.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    repeat,
+                    ..
+                } if !modifiers.control() && !repeat && character == "c" => {
+                    Some(Message::ToggleCropMode)
+                }
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
-                // step. The handler no-ops unless a detail view is open, so
-                // these stay inert on the library/grid pages.
+                // step. Mapped unconditionally — the `AdjustEdit` handler gates
+                // on crop mode (only h/j/k/l crop trims pass through while it
+                // is on, and they are inert outside it) and no-ops without a
+                // detail view.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
                     modifiers,
@@ -1767,9 +1762,47 @@ impl cosmic::Application for AppModel {
             Message::AdjustEdit(adjust) => {
                 // Keyboard shortcuts only make sense while a detail view (and
                 // its editing controls) are on screen.
-                self.editing_key_held = true;
-                self.apply_edit_adjust(adjust);
-                Task::none()
+                //
+                // Crop mode is a focused modal state: the h/j/k/l keys MOVE the
+                // crop window, and `-`/`=` (which normally adjust exposure)
+                // RESIZE it about its center. Every OTHER edit key is inert
+                // inside it. Blocked adjusts never set `editing_key_held`, so a
+                // later key release stays a no-op instead of committing a stale
+                // hold.
+                if self.crop_mode {
+                    let step = if self.modifiers.shift() {
+                        CROP_NUDGE_PX
+                    } else {
+                        CROP_RESIZE_STEP_PX
+                    };
+                    match adjust {
+                        EditAdjust::CropMove { direction, delta } => {
+                            self.editing_key_held = true;
+                            self.apply_crop_move(direction, delta);
+                        }
+                        // `-`/`=` arrive as `Exposure(∓ev)`; the sign picks the
+                        // resize direction (negative shrinks, positive grows)
+                        // and the step/nudge is taken from the Shift state.
+                        EditAdjust::Exposure(delta) => {
+                            self.editing_key_held = true;
+                            let delta = if delta < 0.0 { -step } else { step };
+                            self.apply_crop_resize(delta);
+                        }
+                        _ => {}
+                    }
+                    return Task::none();
+                }
+                // Outside crop mode the crop-window keys stay unbound (reserved
+                // for the planned VIM-style navigation); every other adjust acts
+                // as usual.
+                match adjust {
+                    EditAdjust::CropMove { .. } => Task::none(),
+                    adjust => {
+                        self.editing_key_held = true;
+                        self.apply_edit_adjust(adjust);
+                        Task::none()
+                    }
+                }
             }
 
             Message::EditKeyReleased => {
@@ -1860,7 +1893,6 @@ impl cosmic::Application for AppModel {
                 self.curve_rolloff = self.reset_curve_rolloff;
                 self.curve_shadows = self.reset_curve_shadows;
                 self.crop = self.reset_crop;
-                self.crop_drafts = CropDrafts::from_margins(self.reset_crop);
                 self.rotation = self.reset_rotation;
                 if let Some(selected) = &self.selected {
                     self.roll.set_exposure(selected, self.reset_exposure_ev);
@@ -1887,50 +1919,10 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            // A crop margin field gained a keystroke: keep the draft text in
-            // RAM (never touching the committed edit) so the read-only view
-            // can re-render it. Commit happens only on submit.
-            Message::CropDraftChange(direction, value) => {
-                self.crop_drafts.set(direction, value);
-                Task::none()
-            }
-
-            // A crop margin field was submitted (Enter/return): parse the
-            // draft as a non-negative source-pixel margin, set that edge
-            // absolutely (clamped to the frame), re-derive the perpendicular
-            // pair to preserve aspect, and persist like any other edit. A
-            // non-numeric draft is dropped by restoring the committed margins.
-            Message::CropDraftSubmit(direction) => {
-                let draft = self.crop_drafts.get(direction);
-                let Ok(abs_px) = draft.trim().parse::<u32>() else {
-                    self.crop_drafts = CropDrafts::from_margins(self.crop);
-                    return Task::none();
-                };
-                let Some((w, h)) = self
-                    .detail_shader
-                    .as_ref()
-                    .map(shader::DetailProgram::source_dimensions)
-                else {
-                    return Task::none();
-                };
-                let next = set_crop_edge(self.crop, direction, abs_px, w, h);
-                self.crop = next;
-                self.crop_drafts = CropDrafts::from_margins(next);
-                if let Some(selected) = &self.selected {
-                    self.roll.set_crop(selected, next);
-                }
-                if let Some(shader) = &mut self.detail_shader {
-                    shader.set_crop(next);
-                }
-                self.reclamp_detail_zoom();
-                self.commit_edit()
-            }
-
             // Reset ONLY the crop to zero (full frame), leaving exposure/tone
             // untouched, and persist the reset immediately.
             Message::ResetCrop => {
                 self.crop = edit_manifest::CropMargins::default();
-                self.crop_drafts = CropDrafts::from_margins(self.crop);
                 if let Some(selected) = &self.selected {
                     self.roll.set_crop(selected, self.crop);
                 }
@@ -1975,8 +1967,12 @@ impl cosmic::Application for AppModel {
                 // start/end coherence). A conflicting submit is dropped by
                 // re-seeding the drafts, like a malformed date.
                 let coherent = match field {
-                    RollDateField::Start => roll_dates_valid(next.as_deref(), roll.end_date.as_deref()),
-                    RollDateField::End => roll_dates_valid(roll.start_date.as_deref(), next.as_deref()),
+                    RollDateField::Start => {
+                        roll_dates_valid(next.as_deref(), roll.end_date.as_deref())
+                    }
+                    RollDateField::End => {
+                        roll_dates_valid(roll.start_date.as_deref(), next.as_deref())
+                    }
                 };
                 if !coherent {
                     self.sync_roll_date_drafts();
@@ -1986,13 +1982,12 @@ impl cosmic::Application for AppModel {
                     RollDateField::Start => roll.start_date = next,
                     RollDateField::End => roll.end_date = next,
                 }
-                record_roll_dates(
-                    &roll.dir,
-                    roll.start_date.clone(),
-                    roll.end_date.clone(),
+                record_roll_dates(&roll.dir, roll.start_date.clone(), roll.end_date.clone());
+                self.roll_date_drafts = RollDateDrafts::from_dates(
+                    dir,
+                    roll.start_date.as_deref(),
+                    roll.end_date.as_deref(),
                 );
-                self.roll_date_drafts =
-                    RollDateDrafts::from_dates(dir, roll.start_date.as_deref(), roll.end_date.as_deref());
                 Task::none()
             }
 
@@ -2033,21 +2028,32 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            // The editing-drawer rotate button: one CCW quarter-turn applied
-            // live (RAM + shader) and persisted immediately, mirroring the
-            // discrete crop commits (typed submit / reset) rather than the
-            // hold-then-release keyboard path.
-            Message::RotateCcw => {
-                self.apply_rotate_ccw();
-                self.commit_edit()
-            }
-
-            Message::ToggleCropMask => {
-                self.show_crop_mask = !self.show_crop_mask;
+            Message::ToggleCropMode => {
+                // Crop mode only means anything over the detail view; without
+                // one the toggle is a no-op (the bare `c` key reaches it from
+                // any page).
                 if let Some(shader) = &mut self.detail_shader {
-                    shader.set_show_mask(self.show_crop_mask);
+                    self.crop_mode = !self.crop_mode;
+                    shader.set_show_mask(self.crop_mode);
+                    shader.set_pad(if self.crop_mode {
+                        CROP_MODE_PADDING
+                    } else {
+                        0.0
+                    });
                 }
-                Task::none()
+                // The minimum padding shrinks the contain-fit base, which
+                // changes the 1:1 zoom cap; pull the current zoom back into
+                // range if the cap dropped.
+                self.reclamp_detail_zoom();
+                // Leaving crop mode commits the crop session (persist + re-bake
+                // the tile/cover), so any trims made while the mode was on land
+                // on disk exactly when it closes — via `c`, Escape (routed here
+                // by `on_escape`), or the View menu checkbox.
+                if self.crop_mode {
+                    Task::none()
+                } else {
+                    self.commit_edit()
+                }
             }
 
             Message::RollsLoaded(rolls) => {
@@ -2205,6 +2211,27 @@ impl cosmic::Application for AppModel {
             }
 
             Message::Nav(dir) => {
+                // Crop mode is a focused, VIM-like modal state: arrow keys MOVE
+                // the crop window (Left/Right/Up/Down) instead of paging frames
+                // or moving a grid highlight, which stay disabled while it is
+                // on. Outside crop mode the arrows page the detail view or move
+                // the grid highlight as usual.
+                if self.crop_mode {
+                    let direction = match dir {
+                        MoveDir::Left => edit_manifest::CropDirection::Left,
+                        MoveDir::Right => edit_manifest::CropDirection::Right,
+                        MoveDir::Up => edit_manifest::CropDirection::Top,
+                        MoveDir::Down => edit_manifest::CropDirection::Bottom,
+                    };
+                    let delta = if self.modifiers.shift() {
+                        CROP_NUDGE_PX
+                    } else {
+                        CROP_STEP_PX
+                    };
+                    self.editing_key_held = true;
+                    self.apply_crop_move(direction, delta);
+                    return Task::none();
+                }
                 if self.active.is_some() {
                     // Inside a roll. With the detail view open, Left/Right page
                     // through the frames; on the bare grid they move the
@@ -2218,7 +2245,7 @@ impl cosmic::Application for AppModel {
                             current.and_then(|idx| paginate(idx, self.tiles.len(), dir))
                         {
                             let name = self.tiles[target].name.clone();
-                        return self.open_frame(&name);
+                            return self.open_frame(&name);
                         }
                         return Task::none();
                     }
@@ -2256,8 +2283,11 @@ impl cosmic::Application for AppModel {
                 // then the filtered rolls — and reveal it out of the viewport.
                 // While a search is active the Add Roll tile is hidden, so an
                 // empty match set yields no destination at all.
-                let cells =
-                    library_cells(&self.rolls, self.search_filter.as_deref().unwrap_or(""), &self.month_aliases);
+                let cells = library_cells(
+                    &self.rolls,
+                    self.search_filter.as_deref().unwrap_or(""),
+                    &self.month_aliases,
+                );
                 let selected = library_cell_index(self.library_selection.as_ref(), &cells);
                 let len = cells.len();
                 let cols = self.nav_cols();
@@ -2578,11 +2608,7 @@ impl cosmic::Application for AppModel {
                             dir = dest.display().to_string(),
                             date = date
                         ),
-                        None => fl!(
-                            "export-done",
-                            count = ok,
-                            dir = dest.display().to_string()
-                        ),
+                        None => fl!("export-done", count = ok, dir = dest.display().to_string()),
                     })
                 } else if failed == 0 {
                     toaster::Toast::new(fl!(
@@ -2668,8 +2694,11 @@ impl AppModel {
         if self.active.is_some() || self.library_selection.is_some() {
             return;
         }
-        let cells =
-            library_cells(&self.rolls, self.search_filter.as_deref().unwrap_or(""), &self.month_aliases);
+        let cells = library_cells(
+            &self.rolls,
+            self.search_filter.as_deref().unwrap_or(""),
+            &self.month_aliases,
+        );
         if let Some(LibraryCell::Roll(roll)) = cells
             .iter()
             .find(|cell| matches!(cell, LibraryCell::Roll(_)))
@@ -2742,7 +2771,6 @@ impl AppModel {
             self.curve_rolloff = stored_tone.curve_rolloff;
             self.curve_shadows = stored_tone.curve_shadows;
             self.crop = self.roll.crop(name);
-            self.crop_drafts = CropDrafts::from_margins(self.crop);
             self.rotation = self.roll.rotation(name) & 3;
             // Entering the detail view: the drawer (if the detail's memory says
             // open) shows the editing panel; navigation never closes it.
@@ -3321,6 +3349,14 @@ impl AppModel {
             shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
             shader.set_crop(self.crop);
             shader.set_rotation(self.rotation);
+            // A fresh program starts with the mask off; re-assert the current
+            // crop-mode state so the dim overlay survives re-installs.
+            shader.set_show_mask(self.crop_mode);
+            shader.set_pad(if self.crop_mode {
+                CROP_MODE_PADDING
+            } else {
+                0.0
+            });
         }
         // A new texture (first decode or the native level-up) changes the 1:1
         // cap, so re-derive it and clamp the current zoom.
@@ -3453,9 +3489,8 @@ impl AppModel {
         self.curve_shadows = 1.0;
         self.exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
         self.crop = edit_manifest::CropMargins::default();
-        self.crop_drafts = CropDrafts::from_margins(self.crop);
         self.rotation = 0;
-        self.show_crop_mask = false;
+        self.crop_mode = false;
         // The reset snapshot mirrors the live edit values' lifecycle: reset
         // to identity on close; the next `ThumbnailActivated` re-syncs it.
         self.reset_exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
@@ -3546,17 +3581,17 @@ impl AppModel {
         if self.roll_date_drafts.key.as_deref() == Some(dir.as_path()) {
             return;
         }
-        let (start, end, name) = self
-            .rolls
-            .iter()
-            .find(|roll| roll.dir == dir)
-            .map_or((None, None, None), |roll| {
-                (
-                    roll.start_date.as_deref(),
-                    roll.end_date.as_deref(),
-                    Some(roll.name.as_str()),
-                )
-            });
+        let (start, end, name) =
+            self.rolls
+                .iter()
+                .find(|roll| roll.dir == dir)
+                .map_or((None, None, None), |roll| {
+                    (
+                        roll.start_date.as_deref(),
+                        roll.end_date.as_deref(),
+                        Some(roll.name.as_str()),
+                    )
+                });
         self.roll_date_drafts = RollDateDrafts::from_dates(dir, start, end);
         self.roll_name_draft = name.unwrap_or("").to_owned();
     }
@@ -3674,29 +3709,10 @@ impl AppModel {
                 let shadows = clamp_curve_power(self.curve_shadows + delta);
                 self.set_curve(self.curve_contrast, self.curve_rolloff, shadows);
             }
-            // A crop trims one edge by `delta` source pixels (positive = trim
-            // more / shrink, negative = trim less / grow), preserving aspect
-            // via the perpendicular-pair re-derivation. The trim must be bounded
-            // by the FULL-RESOLUTION display-oriented source dims the persisted
-            // crop is authored against (NOT the downscaled texture dims — those
-            // change between the 2048 overview and the native level-up, and
-            // would shift the meaning of the stored margins); with no ready
-            // detail (decode still in flight) it stays a no-op.
-            EditAdjust::Crop { direction, delta } => {
-                let (w, h) = match &self.detail_shader {
-                    Some(shader) => shader.source_dimensions(),
-                    None => return,
-                };
-                let next = apply_crop_amount(self.crop, direction, delta, w, h);
-                self.crop = next;
-                if let Some(selected) = &self.selected {
-                    self.roll.set_crop(selected, next);
-                }
-                if let Some(shader) = &mut self.detail_shader {
-                    shader.set_crop(next);
-                }
-                self.reclamp_detail_zoom();
-            }
+            // Crop-window moves never reach here: they are applied
+            // directly by the crop-mode `AdjustEdit` / `Nav` branches (and stay
+            // blocked outside crop mode), so this arm is unreachable.
+            EditAdjust::CropMove { .. } => {}
             // A display rotation steps one quarter-turn counter-clockwise
             // (authoring the composite of the crop + the EXIF-upright frame;
             // the crop margins themselves are untouched). Live-only until the
@@ -3705,6 +3721,56 @@ impl AppModel {
                 self.apply_rotate_ccw();
             }
         }
+    }
+
+    /// Translates the crop window by `delta` source pixels in `direction`,
+    /// writing the RAM roll edit and the live GPU shader uniform. Bounded by the
+    /// FULL-RESOLUTION display-oriented source dims the persisted crop is
+    /// authored against (`DetailProgram::source_dimensions`); with no ready
+    /// detail (decode still in flight) it stays a no-op. Live-only until the
+    /// edit key's release (or crop-mode close) commits.
+    fn apply_crop_move(&mut self, direction: edit_manifest::CropDirection, delta: i32) {
+        let Some((w, h)) = self
+            .detail_shader
+            .as_ref()
+            .map(shader::DetailProgram::source_dimensions)
+        else {
+            return;
+        };
+        let next = move_crop_box(self.crop, direction, delta, w, h);
+        self.crop = next;
+        if let Some(selected) = &self.selected {
+            self.roll.set_crop(selected, next);
+        }
+        if let Some(shader) = &mut self.detail_shader {
+            shader.set_crop(next);
+        }
+        self.reclamp_detail_zoom();
+    }
+
+    /// Resizes the crop window about its center by `delta` source pixels
+    /// (positive grows, negative shrinks; aspect preserved), writing the RAM
+    /// roll edit and the live GPU shader uniform. Bounded by the
+    /// FULL-RESOLUTION display-oriented source dims (see
+    /// [`Self::apply_crop_move`]); with no ready detail it stays a no-op.
+    /// Live-only until the edit key's release (or crop-mode close) commits.
+    fn apply_crop_resize(&mut self, delta: i32) {
+        let Some((w, h)) = self
+            .detail_shader
+            .as_ref()
+            .map(shader::DetailProgram::source_dimensions)
+        else {
+            return;
+        };
+        let next = resize_crop_box(self.crop, delta, w, h);
+        self.crop = next;
+        if let Some(selected) = &self.selected {
+            self.roll.set_crop(selected, next);
+        }
+        if let Some(shader) = &mut self.detail_shader {
+            shader.set_crop(next);
+        }
+        self.reclamp_detail_zoom();
     }
 
     /// Rotates the open frame's display one quarter-turn counter-clockwise by
@@ -3928,13 +3994,14 @@ impl AppModel {
                     // was in flight (the program starts at contain fit).
                     if let Some(shader) = &mut self.detail_shader {
                         shader.set_view(self.detail_zoom, self.detail_pan);
-                        shader.set_curve(
-                            self.curve_contrast,
-                            self.curve_rolloff,
-                            self.curve_shadows,
-                        );
+                        shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
                         shader.set_crop(self.crop);
                         shader.set_rotation(self.rotation);
+                        // A fresh program starts with the mask off; re-assert
+                        // the current crop-mode state so the dim overlay
+                        // survives the level-up re-install.
+                        shader.set_show_mask(self.crop_mode);
+                        shader.set_pad(if self.crop_mode { CROP_MODE_PADDING } else { 0.0 });
                     }
                     // The native texture widens the 1:1 cap; re-derive it.
                     self.reclamp_detail_zoom();
@@ -4155,17 +4222,20 @@ fn format_roll_card_dates(months: &[&str; 12], start: &str, end: Option<&str>) -
     };
     let start_name = months[(start_month - 1) as usize];
     let end_name = months[(end_month - 1) as usize];
-    let single = end.is_none() || (start_year, start_month, start_day) == (end_year, end_month, end_day);
-    Some(match (single, start_year == end_year, start_month == end_month) {
-        (true, _, _) => format!("{start_name} {start_day} {start_year}"),
-        (false, true, true) => format!("{start_name} {start_day} - {end_day} {start_year}"),
-        (false, true, false) => {
-            format!("{start_name} {start_day} - {end_name} {end_day} {start_year}")
-        }
-        (false, false, _) => format!(
-            "{start_name} {start_day} {start_year} - {end_name} {end_day} {end_year}"
-        ),
-    })
+    let single =
+        end.is_none() || (start_year, start_month, start_day) == (end_year, end_month, end_day);
+    Some(
+        match (single, start_year == end_year, start_month == end_month) {
+            (true, _, _) => format!("{start_name} {start_day} {start_year}"),
+            (false, true, true) => format!("{start_name} {start_day} - {end_day} {start_year}"),
+            (false, true, false) => {
+                format!("{start_name} {start_day} - {end_name} {end_day} {start_year}")
+            }
+            (false, false, _) => {
+                format!("{start_name} {start_day} {start_year} - {end_name} {end_day} {end_year}")
+            }
+        },
+    )
 }
 
 /// Loads roll metadata for each configured roll directory, de-duplicated and
@@ -4860,9 +4930,16 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|theme| cosmic::iced::widget::container::Style {
-                background: Some(cosmic::iced::Background::Color(
-                    theme.cosmic().background(false).base.into(),
-                )),
+                // The shader renders the letterbox/pillarbox bars transparent,
+                // so this container color shows through around the image. In
+                // crop mode the surround goes white — the working backdrop for
+                // judging the crop — and the dim overlay marks the excluded
+                // area.
+                background: Some(cosmic::iced::Background::Color(if app.crop_mode {
+                    cosmic::iced::Color::WHITE
+                } else {
+                    theme.cosmic().background(false).base.into()
+                })),
                 ..Default::default()
             }),
         );
@@ -4923,53 +5000,19 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     .step(0.05_f32)
     .on_release(Message::EditSave);
     // Keyboard crop readout + arm hint. The four values are the live margins
-    // removed from each edge in source pixels (T/R/B/L); a `Crop: T0 R0 B0 L0`
-    // readout is the untrimmed frame. The hint doubles as the arm table (which
-    // key trims which edge, and how to grow/nudge instead).
-    let crop_label = widget::text(fl!("crop-summary"));
-    let crop_readout = widget::text(format!(
-        "T{} R{} B{} L{}",
-        app.crop.top, app.crop.right, app.crop.bottom, app.crop.left
+    // removed from each edge in source pixels (top/right/bottom/left).
+    let crop_readout = widget::text(fl!(
+        "crop-readout",
+        top = app.crop.top,
+        right = app.crop.right,
+        bottom = app.crop.bottom,
+        left = app.crop.left
     ));
-    // Manual crop controls: a labeled text field per edge (Top/Right/Bottom/
-    // Left) in source pixels, committed on Enter. Editing one edge re-centers
-    // the perpendicular pair to preserve the aspect ratio, matching the
-    // keyboard trim. The fields are seeded from the draft strings (not the
-    // committed margins) so typing doesn't fight the read-only view.
-    let crop_top = crop_margin_field(
-        fl!("crop-top"),
-        app.crop_drafts.get(edit_manifest::CropDirection::Top),
-        edit_manifest::CropDirection::Top,
-    );
-    let crop_right = crop_margin_field(
-        fl!("crop-right"),
-        app.crop_drafts.get(edit_manifest::CropDirection::Right),
-        edit_manifest::CropDirection::Right,
-    );
-    let crop_bottom = crop_margin_field(
-        fl!("crop-bottom"),
-        app.crop_drafts.get(edit_manifest::CropDirection::Bottom),
-        edit_manifest::CropDirection::Bottom,
-    );
-    let crop_left = crop_margin_field(
-        fl!("crop-left"),
-        app.crop_drafts.get(edit_manifest::CropDirection::Left),
-        edit_manifest::CropDirection::Left,
-    );
-    let crop_hint = widget::text(fl!("crop-hint"));
-    // View-only toggle: on shows the full uncropped frame on top of the zoomed
-    // crop with everything outside the crop dimmed (to see where the crop
-    // lands); off shows the plain zoomed crop. Never persisted.
-    let crop_mask = widget::toggler(app.show_crop_mask)
-        .on_toggle(|_| Message::ToggleCropMask)
-        .label(fl!("crop-mask-toggle"));
-    // Display rotation controls: a cumulative counter-clockwise quarter-turn
-    // readout (0° / 90° / 180° / 270°) plus a button stepping it, on top of
-    // the EXIF orientation like the crop bake. The keyboard (`r`) routes the
-    // same step through the edit-key machinery; the button commits on press.
-    let rotate_label = widget::text(fl!("orientation-label"));
-    let rotate_readout = widget::text(format!("{}°", u32::from(app.rotation) * 90));
-    let rotate_button = widget::button::standard(fl!("rotate-ccw")).on_press(Message::RotateCcw);
+    // Display rotation readout: a cumulative counter-clockwise quarter-turn
+    // value (0° / 90° / 180° / 270°) on top of the EXIF orientation. The
+    // keyboard (`r`) routes the step through the edit-key machinery.
+    let rotation_degrees = u32::from(app.rotation) * 90_u32;
+    let rotation_readout = widget::text(fl!("rotation-readout", degrees = rotation_degrees));
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
@@ -4982,25 +5025,11 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(rolloff_slider)
         .push(shadows_label)
         .push(shadows_slider)
+        .push(reset_all)
         .push(widget::divider::horizontal::default())
-        .push(crop_label)
+        .push(rotation_readout)
         .push(crop_readout)
-        .push(crop_top)
-        .push(crop_right)
-        .push(crop_bottom)
-        .push(crop_left)
-        .push(crop_hint)
-        .push(crop_mask)
-        .push(widget::divider::horizontal::default())
-        .push(rotate_label)
-        .push(rotate_readout)
-        .push(rotate_button)
-        .push(
-            widget::row::with_capacity(2)
-                .push(reset_all)
-                .push(reset_crop)
-                .spacing(space_s),
-        )
+        .push(reset_crop)
         .spacing(space_s)
         .width(Length::Fill)
         .into()
@@ -5059,62 +5088,59 @@ fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
     // seconds (the tile order is the grid order, which is also the export
     // order). Only present when the roll carries a start date; independent of
     // the file's own EXIF.
-    let dated = app
-        .roll
-        .start_date()
-        .and_then(|start| {
-            app.tiles
-                .iter()
-                .position(|tile| tile.name == name)
-                .and_then(|index| exif_writer::shifted_datetime(start, index))
-        });
+    let dated = app.roll.start_date().and_then(|start| {
+        app.tiles
+            .iter()
+            .position(|tile| tile.name == name)
+            .and_then(|index| exif_writer::shifted_datetime(start, index))
+    });
 
     let tile = app.tiles.iter().find(|tile| tile.name == name);
-    let meta_rows: Vec<Element<'_, Message>> = if let Some(meta) = tile.and_then(|t| t.meta.as_ref())
-    {
-        let mut rows = Vec::with_capacity(8);
-        if let (Some(width), Some(height)) = (&meta.width, &meta.height) {
-            rows.push(
-                widget::text::body(fl!(
-                    "frame-dimensions",
-                    dimensions = format!("{width} × {height}")
-                ))
-                .into(),
-            );
-        }
-        let camera = match (&meta.make, &meta.model) {
-            (Some(make), Some(model)) => format!("{make} {model}"),
-            (Some(make), None) => make.clone(),
-            (None, Some(model)) => model.clone(),
-            _ => String::new(),
+    let meta_rows: Vec<Element<'_, Message>> =
+        if let Some(meta) = tile.and_then(|t| t.meta.as_ref()) {
+            let mut rows = Vec::with_capacity(8);
+            if let (Some(width), Some(height)) = (&meta.width, &meta.height) {
+                rows.push(
+                    widget::text::body(fl!(
+                        "frame-dimensions",
+                        dimensions = format!("{width} × {height}")
+                    ))
+                    .into(),
+                );
+            }
+            let camera = match (&meta.make, &meta.model) {
+                (Some(make), Some(model)) => format!("{make} {model}"),
+                (Some(make), None) => make.clone(),
+                (None, Some(model)) => model.clone(),
+                _ => String::new(),
+            };
+            if !camera.is_empty() {
+                rows.push(widget::text::body(fl!("frame-camera", camera = camera)).into());
+            }
+            if let Some(value) = meta.iso.clone() {
+                rows.push(widget::text::body(fl!("frame-iso", iso = value)).into());
+            }
+            if let Some(value) = meta.exposure.clone() {
+                rows.push(widget::text::body(fl!("frame-exposure", exposure = value)).into());
+            }
+            if let Some(value) = meta.aperture.clone() {
+                rows.push(widget::text::body(fl!("frame-aperture", aperture = value)).into());
+            }
+            if let Some(value) = meta.focal.clone() {
+                rows.push(widget::text::body(fl!("frame-focal", focal = value)).into());
+            }
+            if let Some(value) = meta.lens.clone() {
+                rows.push(widget::text::body(fl!("frame-lens", lens = value)).into());
+            }
+            if let Some(value) = meta.date.clone() {
+                rows.push(widget::text::body(fl!("frame-date", date = value)).into());
+            }
+            rows
+        } else if tile.is_some_and(|t| t.meta_failed) {
+            vec![widget::text(fl!("frame-info-unavailable")).into()]
+        } else {
+            vec![widget::text(fl!("frame-info-loading")).into()]
         };
-        if !camera.is_empty() {
-            rows.push(widget::text::body(fl!("frame-camera", camera = camera)).into());
-        }
-        if let Some(value) = meta.iso.clone() {
-            rows.push(widget::text::body(fl!("frame-iso", iso = value)).into());
-        }
-        if let Some(value) = meta.exposure.clone() {
-            rows.push(widget::text::body(fl!("frame-exposure", exposure = value)).into());
-        }
-        if let Some(value) = meta.aperture.clone() {
-            rows.push(widget::text::body(fl!("frame-aperture", aperture = value)).into());
-        }
-        if let Some(value) = meta.focal.clone() {
-            rows.push(widget::text::body(fl!("frame-focal", focal = value)).into());
-        }
-        if let Some(value) = meta.lens.clone() {
-            rows.push(widget::text::body(fl!("frame-lens", lens = value)).into());
-        }
-        if let Some(value) = meta.date.clone() {
-            rows.push(widget::text::body(fl!("frame-date", date = value)).into());
-        }
-        rows
-    } else if tile.is_some_and(|t| t.meta_failed) {
-        vec![widget::text(fl!("frame-info-unavailable")).into()]
-    } else {
-        vec![widget::text(fl!("frame-info-loading")).into()]
-    };
 
     // The roll-derived stamp leads the panel, above whatever the file itself
     // carries, so a frame with no (or unreadable) EXIF still shows the date it
@@ -5132,34 +5158,10 @@ fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a, Message> {
         .into()
 }
 
-/// A labeled text field for one crop edge margin (source pixels), committed on
-/// Enter via [`Message::CropDraftSubmit`]. Seeded from the live draft so an
-/// in-progress edit survives view re-renders.
-fn crop_margin_field(
-    label: String,
-    value: &str,
-    direction: edit_manifest::CropDirection,
-) -> Element<'_, Message> {
-    widget::column::with_capacity(2)
-        .push(widget::text(label))
-        .push(
-            widget::text_input(fl!("crop-field-placeholder"), value)
-                .width(Length::Fill)
-                .on_input(move |v| Message::CropDraftChange(direction, v))
-                .on_submit(move |_| Message::CropDraftSubmit(direction)),
-        )
-        .spacing(cosmic::theme::spacing().space_xs)
-        .into()
-}
-
 /// A labeled ISO-date text field for the roll-info drawer, committed on Enter
 /// via [`Message::RollDateDraftSubmit`]. Seeded from the live draft so an
 /// in-progress edit survives view re-renders.
-fn roll_date_field(
-    label: String,
-    value: &str,
-    field: RollDateField,
-) -> Element<'_, Message> {
+fn roll_date_field(label: String, value: &str, field: RollDateField) -> Element<'_, Message> {
     widget::column::with_capacity(2)
         .push(widget::text(label))
         .push(
@@ -5635,54 +5637,16 @@ fn clamp_curve_power(power: f32) -> f32 {
     power.clamp(0.2, 3.0)
 }
 
-/// Derives the four source-pixel crop margins for trimming a single edge by
-/// `amount_px`, keeping the frame's natural aspect ratio and auto-selecting the
-/// anchor (the opposite edge's midpoint).
+/// Translates the crop window by `delta_px` in `direction`, keeping the window
+/// size (and thus aspect) untouched. The window stays clamped inside the source
+/// frame `[0, w] × [0, h]`.
 ///
-/// Trimming one edge cascades into the two perpendicular edges proportionally to
-/// the aspect ratio, so the cropped region satisfies
-/// `(w − left − right) / (h − top − bottom) == w / h` exactly. `amount_px` is
-/// clamped to the largest trim that keeps a non-empty, non-inverted frame.
-/// Test-only convenience: build margins from zero via [`apply_crop_amount`],
-/// so a unit test can express "trim the bottom edge by 100" without carrying a
-/// current-margin value.
-#[cfg(test)]
-#[allow(clippy::cast_possible_wrap)]
-fn crop_margins(
-    direction: edit_manifest::CropDirection,
-    amount_px: u32,
-    width: u32,
-    height: u32,
-) -> edit_manifest::CropMargins {
-    apply_crop_amount(
-        edit_manifest::CropMargins::default(),
-        direction,
-        amount_px as i32,
-        width,
-        height,
-    )
-}
-
-/// Incrementally adjusts one edge's crop margin by `delta_px` (positive = trim
-/// more / shrink the frame, negative = trim less / grow it), preserving the
-/// natural aspect ratio and the anchor (the opposite edge stays fixed).
-///
-/// The chosen edge's margin accumulates on top of `current`; the two
-/// perpendicular margins stay equal (centered) and are re-derived so the
-/// cropped region keeps the source's aspect ratio:
-///
-/// - trimming **top/bottom**: `left = right = round(ar·(top+bottom)/2)`
-/// - trimming **left/right**: `top = bottom = round((left+right)/(2·ar))`
-///
-/// with `ar = width/height`. `delta_px` and the resulting margin are clamped so
-/// the frame never inverts or collapses to a zero-area region.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
-fn apply_crop_amount(
-    current: edit_manifest::CropMargins,
+/// The margins model the window's top-left as `(left, top)` and its bottom-right
+/// as `(w − right, h − bottom)`, so moving the window adjusts the parallel pair
+/// by equal-and-opposite amounts: moving right grows `left` and shrinks `right`,
+/// moving left the reverse, etc.
+fn move_crop_box(
+    crop: edit_manifest::CropMargins,
     direction: edit_manifest::CropDirection,
     delta_px: i32,
     width: u32,
@@ -5690,124 +5654,87 @@ fn apply_crop_amount(
 ) -> edit_manifest::CropMargins {
     use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
 
-    let (ar, sum_limit_vertical, sum_limit_horizontal) = crop_limits(width, height);
-    let (t, r, b, l) = (current.top, current.right, current.bottom, current.left);
-
-    let clamped = match direction {
-        Top => (clamp_axis(t, b, delta_px, sum_limit_vertical), r, b, l),
-        Bottom => (t, r, clamp_axis(b, t, delta_px, sum_limit_vertical), l),
-        Left => (t, r, b, clamp_axis(l, r, delta_px, sum_limit_horizontal)),
-        Right => (t, clamp_axis(r, l, delta_px, sum_limit_horizontal), b, l),
-    };
-
-    recenter_perpendicular(
-        edit_manifest::CropMargins {
-            top: clamped.0,
-            right: clamped.1,
-            bottom: clamped.2,
-            left: clamped.3,
-        },
-        direction,
-        ar,
-    )
-}
-
-/// Sets one edge's margin to an absolute non-negative source-pixel value
-/// (clamped so the frame never inverts), then re-derives the perpendicular
-/// pair to preserve aspect — the same aspect-lock rule the keyboard crop uses.
-/// Backs the manual crop-margin fields: typing a value for one edge re-centers
-/// the other axis to keep the natural ratio.
-#[allow(clippy::cast_possible_truncation)]
-fn set_crop_edge(
-    current: edit_manifest::CropMargins,
-    direction: edit_manifest::CropDirection,
-    abs_px: u32,
-    width: u32,
-    height: u32,
-) -> edit_manifest::CropMargins {
-    use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
-
-    let (ar, sum_limit_vertical, sum_limit_horizontal) = crop_limits(width, height);
-    let (t, r, b, l) = (current.top, current.right, current.bottom, current.left);
-
-    // Clamp the edited edge to `[0, sum_limit − opposite]` so the parallel edge
-    // never sums past the frame, exactly like `clamp_axis` does for a delta.
-    let clamped = match direction {
-        Top => (abs_px.min(sum_limit_vertical.saturating_sub(b)), r, b, l),
-        Bottom => (t, r, abs_px.min(sum_limit_vertical.saturating_sub(t)), l),
-        Left => (t, r, b, abs_px.min(sum_limit_horizontal.saturating_sub(r))),
-        Right => (t, abs_px.min(sum_limit_horizontal.saturating_sub(l)), b, l),
-    };
-
-    recenter_perpendicular(
-        edit_manifest::CropMargins {
-            top: clamped.0,
-            right: clamped.1,
-            bottom: clamped.2,
-            left: clamped.3,
-        },
-        direction,
-        ar,
-    )
-}
-
-/// The aspect ratio (`width/height`) and, per axis, the largest total of the
-/// two parallel margins that leaves ≥ `MIN_LEFT` pixels of frame on both axes
-/// after the perpendicular pair re-centers. Kept as source-pixel integers so
-/// the aspect stays exactly expressible when the frame is comfortably large.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn crop_limits(width: u32, height: u32) -> (f64, u32, u32) {
-    // Keep at least a couple of pixels of frame on both axes so integer
-    // rounding of the perpendicular pair never collides with the edge.
-    const MIN_LEFT: u32 = 2;
-    let ar = f64::from(width) / f64::from(height.max(1));
-    let sum_limit_vertical = ((((f64::from(width) - f64::from(MIN_LEFT)) / ar)
-        .floor()
-        .min(f64::from(height) - f64::from(MIN_LEFT)))
-    .max(0.0)) as u32;
-    let sum_limit_horizontal = (((f64::from(height) - f64::from(MIN_LEFT)) * ar)
-        .floor()
-        .min(f64::from(width) - f64::from(MIN_LEFT))
-        .max(0.0)) as u32;
-    (ar, sum_limit_vertical, sum_limit_horizontal)
-}
-
-/// Re-centers the perpendicular pair to preserve aspect: only the axis being
-/// explicitly trimmed can carry asymmetric margins; the other axis is equal +
-/// centered. The perpendicular TOTAL is rounded once, then split so the two
-/// halves always sum back to that total.
-fn recenter_perpendicular(
-    crop: edit_manifest::CropMargins,
-    direction: edit_manifest::CropDirection,
-    ar: f64,
-) -> edit_manifest::CropMargins {
-    use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (t, r, b, l) = match direction {
-        Top | Bottom => {
-            let total = ((ar * f64::from(crop.top + crop.bottom)).round().max(0.0)) as u32;
-            (crop.top, total / 2, crop.bottom, total - total / 2)
-        }
-        Left | Right => {
-            let total = ((f64::from(crop.left + crop.right) / ar).round().max(0.0)) as u32;
-            (total / 2, crop.right, total - total / 2, crop.left)
-        }
+    let cw = crop.cropped_width(width);
+    let ch = crop.cropped_height(height);
+    let (left, top) = match direction {
+        Left => (
+            clamp_window_origin(crop.left, delta_px, false, width.saturating_sub(cw)),
+            crop.top,
+        ),
+        Right => (
+            clamp_window_origin(crop.left, delta_px, true, width.saturating_sub(cw)),
+            crop.top,
+        ),
+        Top => (
+            crop.left,
+            clamp_window_origin(crop.top, delta_px, false, height.saturating_sub(ch)),
+        ),
+        Bottom => (
+            crop.left,
+            clamp_window_origin(crop.top, delta_px, true, height.saturating_sub(ch)),
+        ),
     };
     edit_manifest::CropMargins {
-        top: t,
-        right: r,
-        bottom: b,
-        left: l,
+        top,
+        right: width.saturating_sub(left).saturating_sub(cw),
+        bottom: height.saturating_sub(top).saturating_sub(ch),
+        left,
     }
 }
 
-/// Clamps a single edge margin after applying `delta_px`, keeping the edge in
-/// `[0, sum_limit − opposite]` so a parallel-axis trim never overshoots the
-/// frame (the two parallel edges sum to at most `sum_limit`).
-fn clamp_axis(edge: u32, opposite: u32, delta_px: i32, sum_limit: u32) -> u32 {
-    let max = sum_limit.saturating_sub(opposite);
-    let raw = i64::from(edge) + i64::from(delta_px);
-    raw.clamp(0, i64::from(max)).try_into().unwrap_or(u32::MAX)
+/// Clamps the window origin coordinate after a `delta` move in the given
+/// direction (`grow` = the coordinate increases), into `[0, max_origin]`.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation
+)]
+fn clamp_window_origin(origin: u32, delta: i32, grow: bool, max_origin: u32) -> u32 {
+    let moved = if grow {
+        i64::from(origin) + i64::from(delta)
+    } else {
+        i64::from(origin) - i64::from(delta)
+    };
+    moved.clamp(0, i64::from(max_origin)) as u32
+}
+
+/// Resizes the crop window about its center by `delta_px`: a positive `delta`
+/// grows the window (the long edge changes by `delta_px`, both axes scaled
+/// proportionally so the aspect is preserved exactly), a negative one shrinks
+/// it. The result is clamped so the long edge stays in
+/// `[MIN_CROP_WINDOW, source long edge]` — a resize never collapses the crop
+/// or exceeds the source.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn resize_crop_box(
+    crop: edit_manifest::CropMargins,
+    delta_px: i32,
+    width: u32,
+    height: u32,
+) -> edit_manifest::CropMargins {
+    let cw = crop.cropped_width(width).max(1);
+    let ch = crop.cropped_height(height).max(1);
+    let long = u32::max(cw, ch);
+    let frame_long = u32::max(width, height);
+    // Scale factor so the long edge changes by `delta_px`; both axes scale
+    // together, preserving the aspect exactly.
+    let delta_f = f64::from(delta_px) / f64::from(long);
+    let scale = (1.0 + delta_f).clamp(
+        f64::from(MIN_CROP_WINDOW) / f64::from(long),
+        f64::from(frame_long) / f64::from(long),
+    );
+    let nw = (f64::from(cw) * scale).round().clamp(1.0, f64::from(width)) as u32;
+    let nh = (f64::from(ch) * scale).round().clamp(1.0, f64::from(height)) as u32;
+    // Keep the window's center fixed; recompute margins from it.
+    let cx = f64::from(crop.left) + f64::from(cw) / 2.0;
+    let cy = f64::from(crop.top) + f64::from(ch) / 2.0;
+    let left = (cx - f64::from(nw) / 2.0).round().clamp(0.0, f64::from(width - nw)) as u32;
+    let top = (cy - f64::from(nh) / 2.0).round().clamp(0.0, f64::from(height - nh)) as u32;
+    edit_manifest::CropMargins {
+        top,
+        right: width.saturating_sub(left).saturating_sub(nw),
+        bottom: height.saturating_sub(top).saturating_sub(nh),
+        left,
+    }
 }
 
 /// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
@@ -5817,17 +5744,19 @@ fn clamp_axis(edge: u32, opposite: u32, delta_px: i32, sum_limit: u32) -> u32 {
 /// the editing panel's control order (Exposure → Contrast → Rolloff → Shadows):
 /// `-`/`=` exposure, `[`/`]` contrast, `;`/`'` rolloff, `,`/`.` shadows. A bare
 /// key uses the coarse step; holding `Shift` selects the fine nudge step. The
-/// crop edges map to movement keys `h`/`j`/`k`/`l` (Left/Bottom/Top/Right): a
-/// bare edge key trims more (+`CROP_STEP_PX`), `Alt`+edge trims less
-/// (−, clamped ≥ 0), and `Shift`(+`Alt`)+edge nudges by ±1px. `r` rotates the
-/// display one quarter-turn counter-clockwise (cumulative; modifiers ignored).
+/// crop window moves with the VIM movement keys `h`/`j`/`k`/`l`
+/// (Left/Down/Up/Right): a bare key moves `CROP_STEP_PX`, `Shift` nudges
+/// `CROP_NUDGE_PX` (`Alt` is unused for the crop window — direction comes from
+/// the key). `-`/`=` stay the exposure pair here; the crop-mode handler
+/// reinterprets them as the window resize. `r` rotates the display one
+/// quarter-turn counter-clockwise (cumulative; modifiers ignored).
 /// The `key` payload
 /// is deliberately layout-stable: iced's `keyboard::listen` delivers the
 /// unmodified character (`key_without_modifiers`), and the iced fork never
 /// reports the `Shift`-produced symbols from the base keys used here, so nudge
 /// is driven by the event's modifier state rather than by matching
 /// `_`/`+`/`{`/`}`/`:`/`"`/`<`/`>`.
-fn edit_adjust_for(key: &str, alt: bool, shift: bool) -> Option<EditAdjust> {
+fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
     use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
     let ev = if shift { EDIT_NUDGE_EV } else { EDIT_STEP_EV };
     let curve = if shift {
@@ -5835,10 +5764,9 @@ fn edit_adjust_for(key: &str, alt: bool, shift: bool) -> Option<EditAdjust> {
     } else {
         EDIT_STEP_CURVE
     };
-    let crop = |direction| {
-        let step = if shift { CROP_NUDGE_PX } else { CROP_STEP_PX };
-        let delta = if alt { -step } else { step };
-        EditAdjust::Crop { direction, delta }
+    let crop_move = |direction| {
+        let delta = if shift { CROP_NUDGE_PX } else { CROP_STEP_PX };
+        EditAdjust::CropMove { direction, delta }
     };
     match key {
         "-" => Some(EditAdjust::Exposure(-ev)),
@@ -5849,10 +5777,10 @@ fn edit_adjust_for(key: &str, alt: bool, shift: bool) -> Option<EditAdjust> {
         "'" => Some(EditAdjust::Rolloff(curve)),
         "," => Some(EditAdjust::Shadows(-curve)),
         "." => Some(EditAdjust::Shadows(curve)),
-        "h" => Some(crop(Left)),
-        "j" => Some(crop(Bottom)),
-        "k" => Some(crop(Top)),
-        "l" => Some(crop(Right)),
+        "h" => Some(crop_move(Left)),
+        "j" => Some(crop_move(Bottom)),
+        "k" => Some(crop_move(Top)),
+        "l" => Some(crop_move(Right)),
         // Rotate the display one quarter-turn counter-clockwise. A bare `r`
         // fires on press and the edit-key release commits the persist + re-bake
         // (the release arm matches through this same function, so `r` is
@@ -6179,12 +6107,26 @@ async fn export_one(
     });
 
     match options.format {
-        ExportFormat::Jpeg => {
-            export_jpeg(mono, width, height, crop, rotation, &dest, tiff.as_deref(), options)
-        }
-        ExportFormat::Png => {
-            export_png(mono, width, height, crop, rotation, &dest, tiff.as_deref(), options)
-        }
+        ExportFormat::Jpeg => export_jpeg(
+            mono,
+            width,
+            height,
+            crop,
+            rotation,
+            &dest,
+            tiff.as_deref(),
+            options,
+        ),
+        ExportFormat::Png => export_png(
+            mono,
+            width,
+            height,
+            crop,
+            rotation,
+            &dest,
+            tiff.as_deref(),
+            options,
+        ),
     }
 }
 
@@ -7442,6 +7384,7 @@ pub enum MenuAction {
     PresetBase,
     About,
     Details,
+    ToggleCropMode,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -7461,6 +7404,7 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::PresetBase => Message::UsePresetBase,
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
             MenuAction::Details => Message::ToggleContext,
+            MenuAction::ToggleCropMode => Message::ToggleCropMode,
         }
     }
 }
@@ -7495,7 +7439,10 @@ mod tests {
     fn load_roll_prefers_the_manifest_label_over_the_directory_leaf() {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("exposure-app-roll-name-{}-{seq}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "exposure-app-roll-name-{}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = edit_manifest::RollManifest::default();
         manifest.set_name(Some("Rollerskates".to_owned()));
@@ -7672,11 +7619,19 @@ mod tests {
         let terms = parse_search_query("may 2026", &aliases);
         assert!(matches!(
             &terms[0],
-            SearchTerm::Date { month: Some(5), year: None, .. }
+            SearchTerm::Date {
+                month: Some(5),
+                year: None,
+                ..
+            }
         ));
         assert!(matches!(
             &terms[1],
-            SearchTerm::Date { month: None, year: Some(2026), .. }
+            SearchTerm::Date {
+                month: None,
+                year: Some(2026),
+                ..
+            }
         ));
 
         // Shorter numbers stay text (a name can contain "400", "2880", etc.).
@@ -8852,55 +8807,56 @@ mod tests {
             edit_adjust_for(".", false, true),
             Some(EditAdjust::Shadows(EDIT_NUDGE_CURVE))
         );
-        // Crop edges: `h`/`j`/`k`/`l` = Left/Bottom/Top/Right. A bare key trims
-        // more (+step); Alt trims less (−step); Shift(+Alt) nudges by 1px.
+        // Crop window moves: `h`/`j`/`k`/`l` = Left/Down/Up/Right. A bare key moves
+        // CROP_STEP_PX; Shift nudges CROP_NUDGE_PX. Alt is unused for the window.
         assert_eq!(
             edit_adjust_for("h", false, false),
-            Some(EditAdjust::Crop {
+            Some(EditAdjust::CropMove {
                 direction: Left,
                 delta: CROP_STEP_PX
             })
         );
         assert_eq!(
             edit_adjust_for("j", false, false),
-            Some(EditAdjust::Crop {
+            Some(EditAdjust::CropMove {
                 direction: Bottom,
                 delta: CROP_STEP_PX
             })
         );
         assert_eq!(
             edit_adjust_for("k", false, false),
-            Some(EditAdjust::Crop {
+            Some(EditAdjust::CropMove {
                 direction: Top,
                 delta: CROP_STEP_PX
             })
         );
         assert_eq!(
             edit_adjust_for("l", false, false),
-            Some(EditAdjust::Crop {
+            Some(EditAdjust::CropMove {
                 direction: Right,
                 delta: CROP_STEP_PX
             })
         );
-        assert_eq!(
-            edit_adjust_for("h", true, false),
-            Some(EditAdjust::Crop {
-                direction: Left,
-                delta: -CROP_STEP_PX
-            })
-        );
+        // Shift nudges; Alt is ignored (same magnitude as a bare key).
         assert_eq!(
             edit_adjust_for("h", false, true),
-            Some(EditAdjust::Crop {
+            Some(EditAdjust::CropMove {
                 direction: Left,
                 delta: CROP_NUDGE_PX
             })
         );
         assert_eq!(
-            edit_adjust_for("h", true, true),
-            Some(EditAdjust::Crop {
+            edit_adjust_for("h", true, false),
+            Some(EditAdjust::CropMove {
                 direction: Left,
-                delta: -CROP_NUDGE_PX
+                delta: CROP_STEP_PX
+            })
+        );
+        assert_eq!(
+            edit_adjust_for("h", true, true),
+            Some(EditAdjust::CropMove {
+                direction: Left,
+                delta: CROP_NUDGE_PX
             })
         );
     }
@@ -8991,65 +8947,94 @@ mod tests {
     }
 
     #[test]
-    fn crop_bottom_anchors_top_and_preserves_aspect() {
-        let m = crop_margins(Dir::Bottom, 100, 400, 300);
-        assert_eq!(m.top, 0, "bottom trim anchors the top edge");
-        assert_eq!(m.bottom, 100);
-        // Horizontal total must equal ar·R = (400/300)·100 ≈ 133.
-        assert_eq!(m.left + m.right, 133);
-        assert_aspects(m, 400, 300);
+    fn move_crop_translates_the_window_and_keeps_size() {
+        // A 200×100 crop window in a 400×300 frame, sitting at (40, 30).
+        let crop = Marg {
+            top: 30,
+            right: 160,
+            bottom: 170,
+            left: 40,
+        };
+        // Move right by 10: left grows, right shrinks, size unchanged.
+        let right = move_crop_box(crop, Dir::Right, 10, 400, 300);
+        assert_eq!(right.left, 50);
+        assert_eq!(right.right, 150);
+        assert_eq!(right.cropped_width(400), 200);
+        assert_eq!(right.cropped_height(300), 100);
+        // Move left back by 10 restores the original margins exactly.
+        assert_eq!(move_crop_box(right, Dir::Left, 10, 400, 300), crop);
+        // Move up: top shrinks, bottom grows; size unchanged.
+        let up = move_crop_box(crop, Dir::Top, 10, 400, 300);
+        assert_eq!(up.top, 20);
+        assert_eq!(up.bottom, 180);
+        assert_eq!(up.cropped_width(400), 200);
+        assert_eq!(up.cropped_height(300), 100);
+        // Move down returns to the original.
+        assert_eq!(move_crop_box(up, Dir::Bottom, 10, 400, 300), crop);
     }
 
     #[test]
-    fn crop_top_anchors_bottom_and_preserves_aspect() {
-        let m = crop_margins(Dir::Top, 100, 400, 300);
-        assert_eq!(m.bottom, 0, "top trim anchors the bottom edge");
-        assert_eq!(m.top, 100);
-        assert_eq!(m.left + m.right, 133);
-        assert_aspects(m, 400, 300);
+    fn move_crop_clamps_the_window_inside_the_frame() {
+        // Window flush to the left edge: moving further left clamps at 0.
+        let crop = Marg {
+            top: 30,
+            right: 160,
+            bottom: 170,
+            left: 0,
+        };
+        assert_eq!(move_crop_box(crop, Dir::Left, 50, 400, 300).left, 0);
+        // Full-frame window cannot move at all (max_origin is 0).
+        let full = Marg::default();
+        assert_eq!(move_crop_box(full, Dir::Right, 10, 400, 300), full);
+        assert_eq!(move_crop_box(full, Dir::Bottom, 10, 400, 300), full);
+        // Moving far right pins the window against the right edge: the 240-wide
+        // window's left origin clamps to 160 (right becomes 0).
+        let far = move_crop_box(crop, Dir::Right, 10_000, 400, 300);
+        assert_eq!(far.left, 160);
+        assert_eq!(far.right, 0);
     }
 
     #[test]
-    fn crop_left_and_right_anchor_opposite_edge() {
-        let m = crop_margins(Dir::Left, 100, 400, 300);
-        assert_eq!(m.right, 0, "left trim anchors the right edge");
-        assert_eq!(m.left, 100);
-        assert_eq!(m.top + m.bottom, 75); // (100)/ar = 100·300/400 = 75
-        assert_aspects(m, 400, 300);
-
-        let m = crop_margins(Dir::Right, 100, 400, 300);
-        assert_eq!(m.left, 0, "right trim anchors the left edge");
-        assert_eq!(m.right, 100);
-        assert_aspects(m, 400, 300);
+    fn resize_crop_grows_and_shrinks_about_center_preserving_aspect() {
+        // A source-aspect crop window in a 400×300 frame: 200×150 (aspect 4:3),
+        // centered with left=right=100 and top=bottom=75.
+        let crop = Marg {
+            top: 75,
+            right: 100,
+            bottom: 75,
+            left: 100,
+        };
+        // Grow by 10 (long edge 200 → 210, both axes scaled by 1.05).
+        let grown = resize_crop_box(crop, 10, 400, 300);
+        assert_eq!(grown.cropped_width(400), 210);
+        assert_eq!(grown.cropped_height(300), 158);
+        assert_aspects(grown, 400, 300);
+        // Center preserved: left margin is half the leftover width.
+        assert_eq!(grown.left, 95);
+        assert_eq!(grown.top, 71);
+        // Shrink by 10 returns (round-trip) toward the start.
+        let shrunk = resize_crop_box(grown, -10, 400, 300);
+        assert_aspects(shrunk, 400, 300);
+        assert_eq!(shrunk.cropped_width(400), 200);
+        assert_eq!(shrunk.cropped_height(300), 150);
     }
 
     #[test]
-    fn crop_zero_amount_is_identity() {
-        for dir in [Dir::Top, Dir::Bottom, Dir::Left, Dir::Right] {
-            assert_eq!(crop_margins(dir, 0, 400, 300), Marg::default());
-        }
-    }
-
-    #[test]
-    fn crop_amount_clamps_to_valid_extent() {
-        // A bottom trim far larger than the frame must clamp: never invert, and
-        // never collapse to a zero-area (or overrun) region.
-        let m = crop_margins(Dir::Bottom, 10_000, 400, 300);
-        assert!(m.cropped_height(300) > 0, "must not collapse the frame");
-        assert!(m.cropped_width(400) > 0, "must not overrun the frame");
-        assert_eq!(m.top, 0, "bottom trim anchors the top");
-        assert!(m.bottom < 300);
-        assert!(m.left + m.right < 400);
-    }
-
-    #[test]
-    fn crop_tiny_sources_do_not_collapse() {
-        for dir in [Dir::Top, Dir::Bottom, Dir::Left, Dir::Right] {
-            let m = crop_margins(dir, 50, 8, 8);
-            assert!(m.cropped_width(8) > 0);
-            assert!(m.cropped_height(8) > 0);
-            assert_aspects(m, 8, 8);
-        }
+    fn resize_crop_clamps_at_minimum_and_full_frame() {
+        let crop = Marg {
+            top: 75,
+            right: 100,
+            bottom: 75,
+            left: 100,
+        };
+        // Growing beyond the frame clamps to full-frame margins.
+        let full = resize_crop_box(crop, 10_000, 400, 300);
+        assert_eq!(full, Marg::default());
+        // Shrinking past the minimum clamps the long edge at MIN_CROP_WINDOW
+        // (the width, since 4:3 makes width the long edge).
+        let tiny = resize_crop_box(crop, -10_000, 400, 300);
+        assert_eq!(tiny.cropped_width(400), MIN_CROP_WINDOW);
+        assert_aspects(tiny, 400, 300);
     }
 
     #[test]
@@ -9065,112 +9050,6 @@ mod tests {
         // Oversized margins clamp to zero rather than wrapping.
         assert_eq!(m.cropped_width(4), 0);
         assert_eq!(m.cropped_height(4), 0);
-    }
-
-    #[test]
-    fn crop_amount_accumulates_per_edge_and_recenters_perpendicular() {
-        // Trim bottom by 100 twice → bottom grows, top stays anchored, left+right
-        // re-derive from the total vertical trim to keep aspect.
-        let one = apply_crop_amount(Marg::default(), Dir::Bottom, 100, 400, 300);
-        assert_eq!(one.top, 0);
-        assert_eq!(one.bottom, 100);
-        assert_eq!(one.left + one.right, 133);
-        assert_aspects(one, 400, 300);
-
-        let two = apply_crop_amount(one, Dir::Bottom, 100, 400, 300);
-        assert_eq!(two.top, 0, "bottom trim keeps the top anchored");
-        assert_eq!(two.bottom, 200);
-        assert!(two.left + two.right >= one.left + one.right);
-        assert_aspects(two, 400, 300);
-    }
-
-    #[test]
-    fn crop_grow_recedes_the_chosen_edge_and_never_goes_negative() {
-        let base = apply_crop_amount(Marg::default(), Dir::Bottom, 100, 400, 300);
-        // Grow (negative delta) back toward no-crop.
-        let grown = apply_crop_amount(base, Dir::Bottom, -100, 400, 300);
-        assert_eq!(grown.bottom, 0);
-        assert_eq!(grown, Marg::default());
-        // Overshooting growth clamps to zero margins.
-        let flat = apply_crop_amount(base, Dir::Bottom, -10_000, 400, 300);
-        assert_eq!(flat, Marg::default());
-    }
-
-    #[test]
-    fn crop_switching_axes_recenters_perpendicular_and_keeps_aspect() {
-        // Trim bottom then left. The most recent (horizontal) trim becomes the
-        // authoritative axis: left is explicit, and the vertical pair re-derives
-        // (equal + centered) from left+right — the bottom value set earlier is
-        // superseded. Aspect stays locked throughout.
-        let bottom = apply_crop_amount(Marg::default(), Dir::Bottom, 100, 400, 300);
-        assert_eq!(bottom.top, 0);
-        assert_aspects(bottom, 400, 300);
-
-        let switched = apply_crop_amount(bottom, Dir::Left, 80, 400, 300);
-        // left was 67 from the bottom trim's perpendicular pair, now +80.
-        assert_eq!(switched.left, 147);
-        // The vertical pair re-derives from (left + right):
-        // round((147 + 66) / (400/300)) = round(159.75) = 160, split 80/80.
-        assert_eq!(switched.top, switched.bottom);
-        assert_eq!(switched.top + switched.bottom, 160);
-        assert_aspects(switched, 400, 300);
-        assert!(switched.left > 0);
-    }
-
-    #[test]
-    fn set_crop_edge_sets_the_edge_and_recenters_perpendicular() {
-        // Setting bottom to 100 absolutely is the typed-field equivalent of the
-        // keyboard trim: the top stays anchored and left+right re-derive.
-        let m = set_crop_edge(Marg::default(), Dir::Bottom, 100, 400, 300);
-        assert_eq!(m.top, 0);
-        assert_eq!(m.bottom, 100);
-        assert_eq!(m.left + m.right, 133);
-        assert_aspects(m, 400, 300);
-    }
-
-    #[test]
-    fn set_crop_edge_left_recenters_the_vertical_pair() {
-        let m = set_crop_edge(Marg::default(), Dir::Left, 80, 400, 300);
-        assert_eq!(m.right, 0, "left trim anchors the right edge");
-        assert_eq!(m.left, 80);
-        assert_eq!(m.top + m.bottom, 60); // 80/ar = 80·300/400
-        assert_aspects(m, 400, 300);
-    }
-
-    #[test]
-    fn set_crop_edge_recenters_when_applied_to_a_cropped_frame() {
-        // A frame already trimmed on the vertical axis: setting the left edge
-        // absolutely makes horizontal the authoritative axis, and the vertical
-        // pair re-derives equal + centered from it.
-        let base = apply_crop_amount(Marg::default(), Dir::Bottom, 100, 400, 300);
-        let m = set_crop_edge(base, Dir::Left, 80, 400, 300);
-        assert_eq!(m.left, 80);
-        assert_eq!(m.top, m.bottom, "perpendicular pair re-centers");
-        assert_aspects(m, 400, 300);
-    }
-
-    #[test]
-    fn set_crop_edge_clamps_to_valid_extent() {
-        // An oversized absolute margin must clamp: never invert or collapse.
-        // (Like `crop_amount_clamps_to_valid_extent`, a near-max vertical trim
-        // makes the exact aspect inexpressible, so only non-degeneracy is
-        // asserted here.)
-        let m = set_crop_edge(Marg::default(), Dir::Bottom, 10_000, 400, 300);
-        assert!(m.cropped_height(300) > 0, "must not collapse the frame");
-        assert!(m.cropped_width(400) > 0, "must not overrun the frame");
-        assert_eq!(m.top, 0, "bottom trim anchors the top");
-        assert!(m.bottom < 300);
-        assert!(m.left + m.right < 400);
-    }
-
-    #[test]
-    fn set_crop_edge_zeroes_to_identity() {
-        for dir in [Dir::Top, Dir::Bottom, Dir::Left, Dir::Right] {
-            assert_eq!(
-                set_crop_edge(Marg::default(), dir, 0, 400, 300),
-                Marg::default()
-            );
-        }
     }
 
     #[test]
@@ -9449,7 +9328,10 @@ mod tests {
         // Deterministic, exact width, lowercase hex regardless of path content.
         assert_eq!(ha, ha2);
         assert_eq!(ha.len(), 6);
-        assert!(ha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(
+            ha.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
         // Different rolls must (almost always) differ.
         assert_ne!(ha, hb);
     }
