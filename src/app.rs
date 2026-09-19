@@ -832,13 +832,6 @@ pub enum EditAdjust {
     Contrast(f32),
     Rolloff(f32),
     Shadows(f32),
-    /// Translate the crop window by `delta` source pixels in `direction` (the
-    /// window's position moves; its size and aspect are untouched). Clamped so
-    /// the window stays inside the source frame.
-    CropMove {
-        direction: edit_manifest::CropDirection,
-        delta: i32,
-    },
     /// Rotate the display one quarter-turn counter-clockwise (a discrete step,
     /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
     /// magnitude, but the edit-key machinery still commits on release).
@@ -1603,6 +1596,14 @@ impl cosmic::Application for AppModel {
                 } if !modifiers.control() && !repeat && character == "c" => {
                     Some(Message::ToggleCropMode)
                 }
+                // VIM-style navigation: bare `h`/`j`/`k`/`l` mirror the arrow keys via the
+                // same `Nav` message — navigating outside crop mode, moving the
+                // crop window inside it (Shift handled by `Nav`; repeats like
+                // arrows).
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
                 // step. Mapped unconditionally — the `AdjustEdit` handler gates
@@ -1775,34 +1776,22 @@ impl cosmic::Application for AppModel {
                     } else {
                         CROP_RESIZE_STEP_PX
                     };
-                    match adjust {
-                        EditAdjust::CropMove { direction, delta } => {
-                            self.editing_key_held = true;
-                            self.apply_crop_move(direction, delta);
-                        }
-                        // `-`/`=` arrive as `Exposure(∓ev)`; the sign picks the
-                        // resize direction (negative shrinks, positive grows)
-                        // and the step/nudge is taken from the Shift state.
-                        EditAdjust::Exposure(delta) => {
-                            self.editing_key_held = true;
-                            let delta = if delta < 0.0 { -step } else { step };
-                            self.apply_crop_resize(delta);
-                        }
-                        _ => {}
+                    // `-`/`=` arrive as `Exposure(∓ev)`; the sign picks the
+                    // resize direction (negative shrinks, positive grows) and
+                    // the step/nudge comes from the Shift state. (Crop-window
+                    // MOVE is not an edit adjust — `h`/`j`/`k`/`l` route to
+                    // `Message::Nav`, like the arrows.)
+                    if let EditAdjust::Exposure(delta) = adjust {
+                        self.editing_key_held = true;
+                        let delta = if delta < 0.0 { -step } else { step };
+                        self.apply_crop_resize(delta);
                     }
                     return Task::none();
                 }
-                // Outside crop mode the crop-window keys stay unbound (reserved
-                // for the planned VIM-style navigation); every other adjust acts
-                // as usual.
-                match adjust {
-                    EditAdjust::CropMove { .. } => Task::none(),
-                    adjust => {
-                        self.editing_key_held = true;
-                        self.apply_edit_adjust(adjust);
-                        Task::none()
-                    }
-                }
+                // Every other adjust acts as usual.
+                self.editing_key_held = true;
+                self.apply_edit_adjust(adjust);
+                Task::none()
             }
 
             Message::EditKeyReleased => {
@@ -3709,10 +3698,6 @@ impl AppModel {
                 let shadows = clamp_curve_power(self.curve_shadows + delta);
                 self.set_curve(self.curve_contrast, self.curve_rolloff, shadows);
             }
-            // Crop-window moves never reach here: they are applied
-            // directly by the crop-mode `AdjustEdit` / `Nav` branches (and stay
-            // blocked outside crop mode), so this arm is unreachable.
-            EditAdjust::CropMove { .. } => {}
             // A display rotation steps one quarter-turn counter-clockwise
             // (authoring the composite of the crop + the EXIF-upright frame;
             // the crop margins themselves are untouched). Live-only until the
@@ -5743,13 +5728,13 @@ fn resize_crop_box(
 /// The four control pairs are laid out on a US keyboard left-to-right to match
 /// the editing panel's control order (Exposure → Contrast → Rolloff → Shadows):
 /// `-`/`=` exposure, `[`/`]` contrast, `;`/`'` rolloff, `,`/`.` shadows. A bare
-/// key uses the coarse step; holding `Shift` selects the fine nudge step. The
-/// crop window moves with the VIM movement keys `h`/`j`/`k`/`l`
-/// (Left/Down/Up/Right): a bare key moves `CROP_STEP_PX`, `Shift` nudges
-/// `CROP_NUDGE_PX` (`Alt` is unused for the crop window — direction comes from
-/// the key). `-`/`=` stay the exposure pair here; the crop-mode handler
-/// reinterprets them as the window resize. `r` rotates the display one
-/// quarter-turn counter-clockwise (cumulative; modifiers ignored).
+/// key uses the coarse step; holding `Shift` selects the fine nudge step.
+/// `-`/`=` stay the exposure pair here; the crop-mode handler reinterprets them
+/// as the window resize. `r` rotates the display one quarter-turn
+/// counter-clockwise (cumulative; modifiers ignored). The VIM movement keys
+/// `h`/`j`/`k`/`l` are NOT mapped here — they route to `Message::Nav` in the
+/// subscription, mirroring the arrow keys for navigation (and, in crop mode,
+/// the crop-window move).
 /// The `key` payload
 /// is deliberately layout-stable: iced's `keyboard::listen` delivers the
 /// unmodified character (`key_without_modifiers`), and the iced fork never
@@ -5757,16 +5742,11 @@ fn resize_crop_box(
 /// is driven by the event's modifier state rather than by matching
 /// `_`/`+`/`{`/`}`/`:`/`"`/`<`/`>`.
 fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
-    use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
     let ev = if shift { EDIT_NUDGE_EV } else { EDIT_STEP_EV };
     let curve = if shift {
         EDIT_NUDGE_CURVE
     } else {
         EDIT_STEP_CURVE
-    };
-    let crop_move = |direction| {
-        let delta = if shift { CROP_NUDGE_PX } else { CROP_STEP_PX };
-        EditAdjust::CropMove { direction, delta }
     };
     match key {
         "-" => Some(EditAdjust::Exposure(-ev)),
@@ -5777,10 +5757,6 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
         "'" => Some(EditAdjust::Rolloff(curve)),
         "," => Some(EditAdjust::Shadows(-curve)),
         "." => Some(EditAdjust::Shadows(curve)),
-        "h" => Some(crop_move(Left)),
-        "j" => Some(crop_move(Bottom)),
-        "k" => Some(crop_move(Top)),
-        "l" => Some(crop_move(Right)),
         // Rotate the display one quarter-turn counter-clockwise. A bare `r`
         // fires on press and the edit-key release commits the persist + re-bake
         // (the release arm matches through this same function, so `r` is
@@ -8738,7 +8714,6 @@ mod tests {
 
     #[test]
     fn edit_adjust_maps_bare_and_shifted_keys() {
-        use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
         // Exposure pair: `-`/`=` coarse, Shift nudge.
         assert_eq!(
             edit_adjust_for("-", false, false),
@@ -8807,58 +8782,15 @@ mod tests {
             edit_adjust_for(".", false, true),
             Some(EditAdjust::Shadows(EDIT_NUDGE_CURVE))
         );
-        // Crop window moves: `h`/`j`/`k`/`l` = Left/Down/Up/Right. A bare key moves
-        // CROP_STEP_PX; Shift nudges CROP_NUDGE_PX. Alt is unused for the window.
-        assert_eq!(
-            edit_adjust_for("h", false, false),
-            Some(EditAdjust::CropMove {
-                direction: Left,
-                delta: CROP_STEP_PX
-            })
-        );
-        assert_eq!(
-            edit_adjust_for("j", false, false),
-            Some(EditAdjust::CropMove {
-                direction: Bottom,
-                delta: CROP_STEP_PX
-            })
-        );
-        assert_eq!(
-            edit_adjust_for("k", false, false),
-            Some(EditAdjust::CropMove {
-                direction: Top,
-                delta: CROP_STEP_PX
-            })
-        );
-        assert_eq!(
-            edit_adjust_for("l", false, false),
-            Some(EditAdjust::CropMove {
-                direction: Right,
-                delta: CROP_STEP_PX
-            })
-        );
-        // Shift nudges; Alt is ignored (same magnitude as a bare key).
-        assert_eq!(
-            edit_adjust_for("h", false, true),
-            Some(EditAdjust::CropMove {
-                direction: Left,
-                delta: CROP_NUDGE_PX
-            })
-        );
-        assert_eq!(
-            edit_adjust_for("h", true, false),
-            Some(EditAdjust::CropMove {
-                direction: Left,
-                delta: CROP_STEP_PX
-            })
-        );
-        assert_eq!(
-            edit_adjust_for("h", true, true),
-            Some(EditAdjust::CropMove {
-                direction: Left,
-                delta: CROP_NUDGE_PX
-            })
-        );
+        // The VIM movement keys are NOT edit adjusts — `h`/`j`/`k`/`l` route to
+        // `Message::Nav` in the subscription (mirroring the arrows), so they map
+        // to `None` here.
+        assert_eq!(edit_adjust_for("h", false, false), None);
+        assert_eq!(edit_adjust_for("j", false, false), None);
+        assert_eq!(edit_adjust_for("k", false, false), None);
+        assert_eq!(edit_adjust_for("l", false, false), None);
+        // Shift/Alt leave them unbound too.
+        assert_eq!(edit_adjust_for("h", true, true), None);
     }
 
     #[test]
