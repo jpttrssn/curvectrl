@@ -5,7 +5,8 @@ use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
 use crate::exif_writer;
 use crate::film::{
-    ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
+    ACTIVE_STOCK, BaseConfig, FILM_STOCKS, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray,
+    measure_base,
 };
 use crate::fl;
 use crate::i18n::fl_dyn;
@@ -1235,6 +1236,7 @@ impl cosmic::Application for AppModel {
     }
 
     /// Elements to pack at the start of the header bar.
+    #[allow(clippy::too_many_lines)] // the menu bar legitimately builds every item inline
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
         // Remove roll is only actionable on the rolls view when a roll is
         // selected; inside a roll (or with the add tile / nothing selected) it
@@ -1534,6 +1536,7 @@ impl cosmic::Application for AppModel {
     /// emit messages to the application through a channel. They can be dynamically
     /// stopped and started conditionally based on application state, or persist
     /// indefinitely.
+    #[allow(clippy::too_many_lines)] // each subscription arm is a compact match guard
     fn subscription(&self) -> Subscription<Self::Message> {
         // Add subscriptions which are always active.
         let mut subscriptions = vec![
@@ -4128,6 +4131,7 @@ impl AppModel {
 
     /// Handle the completion of a hi-res detail decode, applying the result
     /// only if it matches the current selection and re-pumping if superseded.
+    #[allow(clippy::too_many_lines)] // progressive-level landing branches are verbose but linear
     fn handle_detail_ready(
         &mut self,
         name: &str,
@@ -4330,10 +4334,10 @@ async fn load_roll(dir: PathBuf) -> Roll {
 
 /// Persists a roll's film preset to its edit manifest, the on-disk source of
 /// truth for decodes after a restart. Only a non-default preset is written:
-/// any of [`FilmPreset::Hp5Plus`], `AutoPerFrame`, or `AutoSelectedFrame`
-/// records its choice key, while the `None` default is implicit in the key's
-/// absence — so a default raw scan keeps a clean manifest, and a write failure
-/// degrades to a stderr report instead of blocking the UI.
+/// any stock preset or auto base strategy records its choice key, while the
+/// `None` default is implicit in the key's absence — so a default raw scan
+/// keeps a clean manifest, and a write failure degrades to a stderr report
+/// instead of blocking the UI.
 fn record_roll_preset(dir: &Path, preset: FilmPreset) {
     if preset == FilmPreset::default() {
         return;
@@ -4763,17 +4767,24 @@ fn library_cell_index(
 
 /// The add-roll dialog's "film preset" choice: whether the chosen folder holds
 /// already-positive scans (regular RAWs, the non-inverted default), an auto
-/// base strategy, or HP5+ negatives. Mirrors the roll-info drawer's preset
-/// dropdown ordering (None → Auto per frame → Auto selected frame → stocks).
-/// The response returns the selected key, which the picker resolves back into a
-/// [`FilmPreset`].
+/// base strategy, or a specific film stock. Mirrors the roll-info drawer's
+/// preset dropdown ordering (None → Auto per frame → Auto selected frame →
+/// [`FILM_STOCKS`]). The response returns the selected key, which the picker
+/// resolves back into a [`FilmPreset`].
 #[must_use]
 fn roll_preset_choice() -> cosmic::dialog::file_chooser::Choice {
-    cosmic::dialog::file_chooser::Choice::new("preset", &fl!("preset-label"), "none")
-        .insert("none", &fl!("preset-none"))
-        .insert("auto-per-frame", &fl!("preset-auto-per-frame"))
-        .insert("auto-selected-frame", &fl!("preset-auto-selected-frame"))
-        .insert("hp5", ACTIVE_STOCK.name)
+    let mut choice =
+        cosmic::dialog::file_chooser::Choice::new("preset", &fl!("preset-label"), "none")
+            .insert("none", &fl!("preset-none"))
+            .insert("auto-per-frame", &fl!("preset-auto-per-frame"))
+            .insert("auto-selected-frame", &fl!("preset-auto-selected-frame"));
+    for preset in FILM_STOCKS {
+        let Some(stock) = preset.stock() else {
+            continue;
+        };
+        choice = choice.insert(preset.choice_key(), stock.name);
+    }
+    choice
 }
 
 /// Opens the system folder picker, and on success emits [`Message::RollAdded`]
@@ -5581,16 +5592,21 @@ fn roll_info_panel<'a>(
     .width(Length::Fill);
 
     // The film preset selector: the base strategies first (none, auto per
-    // frame, auto selected frame), then the film stocks. Index order MUST
-    // match `FilmPreset::index()`.
+    // frame, auto selected frame), then the film stocks in `FILM_STOCKS` order.
+    // Index order MUST match `FilmPreset::index()`.
+    let mut preset_options = vec![
+        fl!("preset-none"),
+        fl!("preset-auto-per-frame"),
+        fl!("preset-auto-selected-frame"),
+    ];
+    for preset in FILM_STOCKS {
+        if let Some(stock) = preset.stock() {
+            preset_options.push(stock.name.to_owned());
+        }
+    }
     let roll_dir = roll.dir.clone();
     let preset = widget::dropdown::dropdown(
-        vec![
-            fl!("preset-none"),
-            fl!("preset-auto-per-frame"),
-            fl!("preset-auto-selected-frame"),
-            ACTIVE_STOCK.name.to_owned(),
-        ],
+        preset_options,
         Some(roll.preset.index()),
         move |index| Message::RollPresetChanged(roll_dir.clone(), FilmPreset::from_index(index)),
     )

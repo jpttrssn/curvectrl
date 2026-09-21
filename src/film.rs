@@ -5,9 +5,7 @@
 /// A developed monochrome film stock's scan-response profile.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MonoStock {
-    /// Display name of the stock.
-    // Unused until a stock picker exists.
-    #[allow(dead_code)]
+    /// Display name of the stock (shown in the film-preset pickers).
     pub name: &'static str,
     /// Scanner-linear transmission of unexposed film base + fog; the positive's
     /// black point (the clearest film areas). A preset fallback: a roll may
@@ -34,6 +32,81 @@ pub const ACTIVE_STOCK: MonoStock = MonoStock {
     gamma: 0.7,
 };
 
+/// Kodak Tri-X 400: the iconic rival to HP5+ — punchy, grainy, blocky shadows.
+/// `base` from its heavier base fog; `d_max`/`gamma` from published curves
+/// pending visual tuning.
+pub const TRI_X: MonoStock = MonoStock {
+    name: "Kodak Tri-X 400",
+    base: 0.56,
+    d_max: 2.6,
+    gamma: 0.8,
+};
+
+/// Ilford FP4 Plus (125): a fine-grain slow film with smooth, gentle tonality.
+pub const FP4_PLUS: MonoStock = MonoStock {
+    name: "Ilford FP4 Plus",
+    base: 0.74,
+    d_max: 2.2,
+    gamma: 0.7,
+};
+
+/// Kodak T-Max 400: T-grain, sharp with a steep, high microcontrast curve.
+pub const TMAX_400: MonoStock = MonoStock {
+    name: "Kodak T-Max 400",
+    base: 0.63,
+    d_max: 2.5,
+    gamma: 0.85,
+};
+
+/// Fomapan 100: budget stock with heavy base fog and a soft, pronounced
+/// shoulder (low `gamma` keeps shadows milky).
+pub const FOMAPAN_100: MonoStock = MonoStock {
+    name: "Fomapan 100",
+    base: 0.56,
+    d_max: 2.0,
+    gamma: 0.6,
+};
+
+/// Ilford Delta 400: modern T-grain, smooth like HP5+ but finer.
+pub const DELTA_400: MonoStock = MonoStock {
+    name: "Ilford Delta 400",
+    base: 0.66,
+    d_max: 2.3,
+    gamma: 0.72,
+};
+
+/// Fomapan 400: the foggiest budget stock here; wide-latitude, soft contrast.
+pub const FOMAPAN_400: MonoStock = MonoStock {
+    name: "Fomapan 400",
+    base: 0.50,
+    d_max: 2.1,
+    gamma: 0.62,
+};
+
+/// Kentmere 400: Ilford's budget 400, close to HP5+ but a touch cleaner.
+pub const KENTMERE_400: MonoStock = MonoStock {
+    name: "Kentmere 400",
+    base: 0.76,
+    d_max: 2.3,
+    gamma: 0.7,
+};
+
+/// Every real film-stock preset, in dropdown order (the base strategies —
+/// `None`, `AutoPerFrame`, `AutoSelectedFrame` — precede the stocks and are not
+/// part of this list). The stocks are ordered alphabetically by display name,
+/// and the list is the single source of truth the film-preset pickers consume,
+/// so the roll-info drawer and the add-roll dialog can never drift.
+pub const FILM_STOCKS: [FilmPreset; 8] = [
+    FilmPreset::Fomapan100,
+    FilmPreset::Fomapan400,
+    FilmPreset::Delta400,
+    FilmPreset::Fp4Plus,
+    FilmPreset::Hp5Plus,
+    FilmPreset::Kentmere400,
+    FilmPreset::TMax400,
+    FilmPreset::TriX,
+];
+
 /// The film-inversion preset a roll's frames are rendered with: which
 /// [`MonoStock`] profile inverts the negatives and how the black point is
 /// resolved, or `None` for already-positive scans (regular RAWs) that must NOT
@@ -41,9 +114,9 @@ pub const ACTIVE_STOCK: MonoStock = MonoStock {
 ///
 /// The base-mode strategy is part of the preset choice, so the dropdown lists
 /// the base strategies first and the actual stocks after them: **None, Auto per
-/// frame, Auto selected frame, then the film stocks**. The default is
-/// [`FilmPreset::None`], so a roll with no recorded preset renders as a regular
-/// (non-inverted) scan.
+/// frame, Auto selected frame, then the film stocks** (see [`FILM_STOCKS`]).
+/// The default is [`FilmPreset::None`], so a roll with no recorded preset
+/// renders as a regular (non-inverted) scan.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum FilmPreset {
     /// No inversion: the scan is treated as an already-positive image (a
@@ -59,18 +132,40 @@ pub enum FilmPreset {
     /// the roll's first frame). See [`edit_manifest::RollManifest`]'s
     /// `calibration_frame`/`base` fields.
     AutoSelectedFrame,
-    /// Invert with the active stock profile, using its preset base.
+    /// Invert with the Ilford HP5+ profile, using its preset base.
     Hp5Plus,
+    /// Invert with the Kodak Tri-X 400 profile.
+    TriX,
+    /// Invert with the Ilford FP4 Plus profile.
+    Fp4Plus,
+    /// Invert with the Kodak T-Max 400 profile.
+    TMax400,
+    /// Invert with the Fomapan 100 profile.
+    Fomapan100,
+    /// Invert with the Ilford Delta 400 profile.
+    Delta400,
+    /// Invert with the Fomapan 400 profile.
+    Fomapan400,
+    /// Invert with the Kentmere 400 profile.
+    Kentmere400,
 }
 
 impl FilmPreset {
     /// The inversion profile for a chosen preset: [`None`] (no inversion)
-    /// carries no profile; every other preset carries [`ACTIVE_STOCK`].
+    /// carries no profile; the auto base strategies carry the active stock,
+    /// and each stock preset carries its own profile.
     #[must_use]
     pub const fn stock(self) -> Option<MonoStock> {
         match self {
             Self::None => None,
             Self::AutoPerFrame | Self::AutoSelectedFrame | Self::Hp5Plus => Some(ACTIVE_STOCK),
+            Self::TriX => Some(TRI_X),
+            Self::Fp4Plus => Some(FP4_PLUS),
+            Self::TMax400 => Some(TMAX_400),
+            Self::Fomapan100 => Some(FOMAPAN_100),
+            Self::Delta400 => Some(DELTA_400),
+            Self::Fomapan400 => Some(FOMAPAN_400),
+            Self::Kentmere400 => Some(KENTMERE_400),
         }
     }
 
@@ -97,6 +192,13 @@ impl FilmPreset {
             Self::AutoPerFrame => "auto-per-frame",
             Self::AutoSelectedFrame => "auto-selected-frame",
             Self::Hp5Plus => "hp5",
+            Self::TriX => "tri-x",
+            Self::Fp4Plus => "fp4",
+            Self::TMax400 => "tmax400",
+            Self::Fomapan100 => "fomapan100",
+            Self::Delta400 => "delta400",
+            Self::Fomapan400 => "fomapan400",
+            Self::Kentmere400 => "kentmere400",
         }
     }
 
@@ -108,19 +210,33 @@ impl FilmPreset {
             "auto-per-frame" => Self::AutoPerFrame,
             "auto-selected-frame" => Self::AutoSelectedFrame,
             "hp5" => Self::Hp5Plus,
+            "tri-x" => Self::TriX,
+            "fp4" => Self::Fp4Plus,
+            "tmax400" => Self::TMax400,
+            "fomapan100" => Self::Fomapan100,
+            "delta400" => Self::Delta400,
+            "fomapan400" => Self::Fomapan400,
+            "kentmere400" => Self::Kentmere400,
             _ => Self::None,
         }
     }
 
     /// The dropdown index ordering (None first, matching the default, then the
-    /// base strategies, then the film stocks).
+    /// base strategies, then the film stocks in [`FILM_STOCKS`] order).
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::None => 0,
             Self::AutoPerFrame => 1,
             Self::AutoSelectedFrame => 2,
-            Self::Hp5Plus => 3,
+            Self::Fomapan100 => 3,
+            Self::Fomapan400 => 4,
+            Self::Delta400 => 5,
+            Self::Fp4Plus => 6,
+            Self::Hp5Plus => 7,
+            Self::Kentmere400 => 8,
+            Self::TMax400 => 9,
+            Self::TriX => 10,
         }
     }
 
@@ -131,7 +247,14 @@ impl FilmPreset {
         match index {
             1 => Self::AutoPerFrame,
             2 => Self::AutoSelectedFrame,
-            3 => Self::Hp5Plus,
+            3 => Self::Fomapan100,
+            4 => Self::Fomapan400,
+            5 => Self::Delta400,
+            6 => Self::Fp4Plus,
+            7 => Self::Hp5Plus,
+            8 => Self::Kentmere400,
+            9 => Self::TMax400,
+            10 => Self::TriX,
             _ => Self::None,
         }
     }
@@ -510,9 +633,18 @@ mod tests {
     #[test]
     fn film_preset_stock_mapping() {
         assert_eq!(FilmPreset::None.stock(), None);
+        // The auto base strategies carry the active stock.
         assert_eq!(FilmPreset::AutoPerFrame.stock(), Some(ACTIVE_STOCK));
         assert_eq!(FilmPreset::AutoSelectedFrame.stock(), Some(ACTIVE_STOCK));
+        // Each stock preset carries its own profile.
         assert_eq!(FilmPreset::Hp5Plus.stock(), Some(ACTIVE_STOCK));
+        assert_eq!(FilmPreset::TriX.stock(), Some(TRI_X));
+        assert_eq!(FilmPreset::Fp4Plus.stock(), Some(FP4_PLUS));
+        assert_eq!(FilmPreset::TMax400.stock(), Some(TMAX_400));
+        assert_eq!(FilmPreset::Fomapan100.stock(), Some(FOMAPAN_100));
+        assert_eq!(FilmPreset::Delta400.stock(), Some(DELTA_400));
+        assert_eq!(FilmPreset::Fomapan400.stock(), Some(FOMAPAN_400));
+        assert_eq!(FilmPreset::Kentmere400.stock(), Some(KENTMERE_400));
     }
 
     #[test]
@@ -520,17 +652,20 @@ mod tests {
         assert!(!FilmPreset::None.is_inverted());
         assert!(FilmPreset::AutoPerFrame.is_inverted());
         assert!(FilmPreset::AutoSelectedFrame.is_inverted());
-        assert!(FilmPreset::Hp5Plus.is_inverted());
+        for preset in FILM_STOCKS {
+            assert!(preset.is_inverted());
+        }
     }
 
     #[test]
     fn film_preset_choice_key_round_trip() {
-        for preset in [
+        let mut presets = vec![
             FilmPreset::None,
             FilmPreset::AutoPerFrame,
             FilmPreset::AutoSelectedFrame,
-            FilmPreset::Hp5Plus,
-        ] {
+        ];
+        presets.extend(FILM_STOCKS);
+        for preset in presets {
             assert_eq!(FilmPreset::from_key(preset.choice_key()), preset);
         }
         // Unknown keys resolve to the default (None), like a missing entry.
@@ -540,12 +675,13 @@ mod tests {
 
     #[test]
     fn film_preset_index_round_trip() {
-        for preset in [
+        let mut presets = vec![
             FilmPreset::None,
             FilmPreset::AutoPerFrame,
             FilmPreset::AutoSelectedFrame,
-            FilmPreset::Hp5Plus,
-        ] {
+        ];
+        presets.extend(FILM_STOCKS);
+        for preset in presets {
             assert_eq!(FilmPreset::from_index(preset.index()), preset);
         }
         assert_eq!(FilmPreset::from_index(99), FilmPreset::None);
@@ -553,14 +689,14 @@ mod tests {
 
     #[test]
     fn film_preset_dropdown_order() {
-        // The dropdown lists None, the base strategies, then the stocks — the
-        // exact ordering the index mapping must match.
-        let ordered = [
+        // The dropdown lists None, the base strategies, then the stocks in
+        // `FILM_STOCKS` order — the exact ordering the index mapping must match.
+        let mut ordered = vec![
             FilmPreset::None,
             FilmPreset::AutoPerFrame,
             FilmPreset::AutoSelectedFrame,
-            FilmPreset::Hp5Plus,
         ];
+        ordered.extend(FILM_STOCKS);
         for (index, preset) in ordered.into_iter().enumerate() {
             assert_eq!(preset.index(), index);
             assert_eq!(FilmPreset::from_index(index), preset);

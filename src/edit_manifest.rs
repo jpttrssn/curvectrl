@@ -393,20 +393,17 @@ impl RollManifest {
     }
 
     /// Records the film-inversion preset for the roll. Only a non-default
-    /// preset is written: any of [`FilmPreset::Hp5Plus`], `AutoPerFrame`, or
-    /// `AutoSelectedFrame` stores its choice key, [`FilmPreset::None`] clears
-    /// it back to the implicit default (the key disappears on the next save,
-    /// which keeps the default manifest clean for raw scans).
+    /// preset is written: any stock preset (`Hp5Plus`, `TriX`, …) or auto
+    /// base strategy (`AutoPerFrame`, `AutoSelectedFrame`) stores its choice
+    /// key, [`FilmPreset::None`] clears it back to the implicit default (the
+    /// key disappears on the next save, which keeps the default manifest clean
+    /// for raw scans).
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_preset(&mut self, preset: FilmPreset) {
         match preset {
-            FilmPreset::Hp5Plus
-            | FilmPreset::AutoPerFrame
-            | FilmPreset::AutoSelectedFrame => {
-                self.preset = Some(preset.choice_key().to_owned());
-            }
             FilmPreset::None => self.preset = None,
+            _ => self.preset = Some(preset.choice_key().to_owned()),
         }
     }
 
@@ -484,20 +481,22 @@ impl RollManifest {
     /// roll's calibration mode. The strategy is part of the film preset: the
     /// per-frame auto preset opts into per-frame measurement, the
     /// auto-selected-frame preset pins the whole roll to its measured
-    /// calibration, and the stock presets resolve preset-first.
+    /// calibration, and every stock preset (and `None`) resolves preset-first.
     #[must_use]
     pub fn base_config(&self) -> crate::film::BaseConfig {
         match self.preset() {
-            FilmPreset::None | FilmPreset::Hp5Plus => crate::film::BaseConfig {
-                calibrated: None,
-                auto: false,
-            },
             FilmPreset::AutoPerFrame => crate::film::BaseConfig {
                 calibrated: None,
                 auto: true,
             },
             FilmPreset::AutoSelectedFrame => crate::film::BaseConfig {
                 calibrated: self.calibrated_base(),
+                auto: false,
+            },
+            FilmPreset::None | FilmPreset::Hp5Plus | FilmPreset::TriX | FilmPreset::Fp4Plus
+            | FilmPreset::TMax400 | FilmPreset::Fomapan100 | FilmPreset::Delta400
+            | FilmPreset::Fomapan400 | FilmPreset::Kentmere400 => crate::film::BaseConfig {
+                calibrated: None,
                 auto: false,
             },
         }
