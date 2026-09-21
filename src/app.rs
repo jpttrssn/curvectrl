@@ -1354,12 +1354,7 @@ impl cosmic::Application for AppModel {
                     details,
                     menu::Item::Divider,
                     // Crop mode only means something over a detail view.
-                    menu::Item::CheckBox(
-                        fl!("menu-crop-mode"),
-                        None,
-                        self.crop_mode,
-                        MenuAction::ToggleCropMode,
-                    ),
+                    menu::Item::CheckBox(fl!("menu-crop-mode"), None, self.crop_mode, MenuAction::ToggleCropMode),
                 ],
             ),
         );
@@ -1634,26 +1629,10 @@ impl cosmic::Application for AppModel {
                 // same `Nav` message — navigating outside crop mode, moving the
                 // crop window inside it (Shift handled by `Nav`; repeats like
                 // arrows).
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
+                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
                 // step. Mapped unconditionally — the `AdjustEdit` handler gates
@@ -2295,12 +2274,11 @@ impl cosmic::Application for AppModel {
                 // on. Outside crop mode the arrows page the detail view or move
                 // the grid highlight as usual.
                 if self.crop_mode {
-                    let direction = match dir {
-                        MoveDir::Left => edit_manifest::CropDirection::Left,
-                        MoveDir::Right => edit_manifest::CropDirection::Right,
-                        MoveDir::Up => edit_manifest::CropDirection::Top,
-                        MoveDir::Down => edit_manifest::CropDirection::Bottom,
-                    };
+                    // The move direction is expressed visually: pressing ← moves
+                    // the crop window left on screen even when the frame is
+                    // rotated (`crop_move_direction` compensates for the CCW
+                    // display rotation).
+                    let direction = crop_move_direction(dir, self.rotation);
                     let delta = if self.modifiers.shift() {
                         CROP_NUDGE_PX
                     } else {
@@ -4079,11 +4057,7 @@ impl AppModel {
                         // the current crop-mode state so the dim overlay
                         // survives the level-up re-install.
                         shader.set_show_mask(self.crop_mode);
-                        shader.set_pad(if self.crop_mode {
-                            CROP_MODE_PADDING
-                        } else {
-                            0.0
-                        });
+                        shader.set_pad(if self.crop_mode { CROP_MODE_PADDING } else { 0.0 });
                     }
                     // The native texture widens the 1:1 cap; re-derive it.
                     self.reclamp_detail_zoom();
@@ -5879,6 +5853,32 @@ fn clamp_curve_power(power: f32) -> f32 {
 /// as `(w − right, h − bottom)`, so moving the window adjusts the parallel pair
 /// by equal-and-opposite amounts: moving right grows `left` and shrinks `right`,
 /// moving left the reverse, etc.
+/// Maps a screen-space crop move (arrow or `h`/`j`/`k`/`l`) to the EXIF-upright
+/// crop-window direction that produces the same VISUAL movement, given the
+/// display's cumulative counter-clockwise `rotation` quarter-turns.
+///
+/// The crop window is authored in the EXIF-upright source frame, while the
+/// display applies a CCW `rot` on top (the shader's `rotate_uv`). Screen
+/// directions cycle Left → Up → Right → Down; each CCW display turn shifts
+/// which EXIF-upright edge is "up", so the texture direction is the screen
+/// direction rotated by `rotation` steps in that cycle.
+#[must_use]
+fn crop_move_direction(dir: MoveDir, rotation: u8) -> edit_manifest::CropDirection {
+    use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
+    let screen = match dir {
+        MoveDir::Left => 0,
+        MoveDir::Up => 1,
+        MoveDir::Right => 2,
+        MoveDir::Down => 3,
+    };
+    match (screen + u32::from(rotation & 3)) % 4 {
+        0 => Left,
+        1 => Top,
+        2 => Right,
+        _ => Bottom,
+    }
+}
+
 fn move_crop_box(
     crop: edit_manifest::CropMargins,
     direction: edit_manifest::CropDirection,
@@ -9179,6 +9179,34 @@ mod tests {
         let far = move_crop_box(crop, Dir::Right, 10_000, 400, 300);
         assert_eq!(far.left, 160);
         assert_eq!(far.right, 0);
+    }
+
+    #[test]
+    fn crop_move_direction_rotates_with_the_display() {
+        // Rotation 0 is the identity: screen == EXIF-upright directions.
+        assert_eq!(crop_move_direction(MoveDir::Left, 0), Dir::Left);
+        assert_eq!(crop_move_direction(MoveDir::Right, 0), Dir::Right);
+        assert_eq!(crop_move_direction(MoveDir::Up, 0), Dir::Top);
+        assert_eq!(crop_move_direction(MoveDir::Down, 0), Dir::Bottom);
+        // One CCW turn puts the texture's top on the display's left, so a
+        // visual Left moves the crop toward the texture top, etc.
+        assert_eq!(crop_move_direction(MoveDir::Left, 1), Dir::Top);
+        assert_eq!(crop_move_direction(MoveDir::Right, 1), Dir::Bottom);
+        assert_eq!(crop_move_direction(MoveDir::Up, 1), Dir::Right);
+        assert_eq!(crop_move_direction(MoveDir::Down, 1), Dir::Left);
+        // 180° flips both axes.
+        assert_eq!(crop_move_direction(MoveDir::Left, 2), Dir::Right);
+        assert_eq!(crop_move_direction(MoveDir::Right, 2), Dir::Left);
+        assert_eq!(crop_move_direction(MoveDir::Up, 2), Dir::Bottom);
+        assert_eq!(crop_move_direction(MoveDir::Down, 2), Dir::Top);
+        // Three CCW turns (one CW): the texture bottom lands on the display
+        // left.
+        assert_eq!(crop_move_direction(MoveDir::Left, 3), Dir::Bottom);
+        assert_eq!(crop_move_direction(MoveDir::Right, 3), Dir::Top);
+        assert_eq!(crop_move_direction(MoveDir::Up, 3), Dir::Left);
+        assert_eq!(crop_move_direction(MoveDir::Down, 3), Dir::Right);
+        // Rotation is mod 4: 4 == 0 (identity again).
+        assert_eq!(crop_move_direction(MoveDir::Left, 4), Dir::Left);
     }
 
     #[test]
