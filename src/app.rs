@@ -1292,8 +1292,8 @@ impl cosmic::Application for AppModel {
         // roll's auto-calibration frame — only meaningful under the
         // Auto-selected-frame preset of an open roll. The handler no-ops
         // without an eligible frame, so the menu only gates on the preset.
-        let calibrate_enabled = self.active.is_some()
-            && self.roll.preset() == FilmPreset::AutoSelectedFrame;
+        let calibrate_enabled =
+            self.active.is_some() && self.roll.preset() == FilmPreset::AutoSelectedFrame;
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -1343,6 +1343,12 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-details"), None, MenuAction::Details)
         };
 
+        let crop_mode = if self.selected.is_some() {
+            menu::Item::Button(fl!("menu-crop-mode"), None, MenuAction::ToggleCropMode)
+        } else {
+            menu::Item::ButtonDisabled(fl!("menu-crop-mode"), None, MenuAction::ToggleCropMode)
+        };
+
         let view_menu = menu::Tree::with_children(
             menu::root(fl!("menu-view")).apply(Element::from),
             menu::items(
@@ -1351,8 +1357,7 @@ impl cosmic::Application for AppModel {
                     menu::Item::Button(fl!("about"), None, MenuAction::About),
                     details,
                     menu::Item::Divider,
-                    // Crop mode only means something over a detail view.
-                    menu::Item::CheckBox(fl!("menu-crop-mode"), None, self.crop_mode, MenuAction::ToggleCropMode),
+                    crop_mode,
                 ],
             ),
         );
@@ -1627,10 +1632,26 @@ impl cosmic::Application for AppModel {
                 // same `Nav` message — navigating outside crop mode, moving the
                 // crop window inside it (Shift handled by `Nav`; repeats like
                 // arrows).
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
                 // step. Mapped unconditionally — the `AdjustEdit` handler gates
@@ -2202,9 +2223,7 @@ impl cosmic::Application for AppModel {
                         let mut manifest = edit_manifest::load_roll_manifest(&dir);
                         if manifest.calibration_frame().is_none() {
                             manifest.set_calibration_frame(&first);
-                            if let Err(err) =
-                                edit_manifest::save_roll_manifest(&dir, &manifest)
-                            {
+                            if let Err(err) = edit_manifest::save_roll_manifest(&dir, &manifest) {
                                 eprintln!(
                                     "failed to write roll manifest {}: {err}",
                                     edit_manifest::manifest_path(&dir).display()
@@ -2223,7 +2242,8 @@ impl cosmic::Application for AppModel {
                     // calibration reference: the strategy is part of the preset
                     // choice, so a stale frame/base must not linger.
                     let mut manifest = edit_manifest::load_roll_manifest(&dir);
-                    if manifest.calibration_frame().is_some() || manifest.calibrated_base().is_some()
+                    if manifest.calibration_frame().is_some()
+                        || manifest.calibrated_base().is_some()
                     {
                         manifest.clear_calibration();
                         if let Err(err) = edit_manifest::save_roll_manifest(&dir, &manifest) {
@@ -2485,7 +2505,10 @@ impl cosmic::Application for AppModel {
                     if let Some(first) = first {
                         self.roll.set_calibration_frame(&first);
                         self.persist_roll();
-                        tasks.push(Self::measure_calibration_frame(dir.clone(), self.roll.preset()));
+                        tasks.push(Self::measure_calibration_frame(
+                            dir.clone(),
+                            self.roll.preset(),
+                        ));
                     }
                 }
                 tasks.extend([
@@ -3279,7 +3302,11 @@ impl AppModel {
         let Some(dir) = self.active.clone() else {
             return Task::none();
         };
-        let Some(name) = self.selected.clone().or_else(|| self.frame_selected.clone()) else {
+        let Some(name) = self
+            .selected
+            .clone()
+            .or_else(|| self.frame_selected.clone())
+        else {
             return Task::none();
         };
         let preset = self.roll.preset();
@@ -3308,21 +3335,21 @@ impl AppModel {
         self.reflow_base()
     }
 
-/// Spawns a one-shot measurement of the roll's designated auto-calibration
-/// frame, posting its measured clear-film transmission back as
-/// [`Message::CalibrationBaseMeasured`].
-fn measure_calibration_frame(
-    dir: PathBuf,
-    preset: FilmPreset,
-) -> Task<cosmic::Action<Message>> {
-    // The designated frame lives on disk (the drawer is library-only); the
-    // RAM manifest may be for another roll or stale, so read it fresh.
-    let manifest = edit_manifest::load_roll_manifest(&dir);
-    let Some(name) = manifest.calibration_frame().map(str::to_owned) else {
-        return Task::none();
-    };
-    cosmic::task::future(measure_frame_base(dir, name, preset))
-}
+    /// Spawns a one-shot measurement of the roll's designated auto-calibration
+    /// frame, posting its measured clear-film transmission back as
+    /// [`Message::CalibrationBaseMeasured`].
+    fn measure_calibration_frame(
+        dir: PathBuf,
+        preset: FilmPreset,
+    ) -> Task<cosmic::Action<Message>> {
+        // The designated frame lives on disk (the drawer is library-only); the
+        // RAM manifest may be for another roll or stale, so read it fresh.
+        let manifest = edit_manifest::load_roll_manifest(&dir);
+        let Some(name) = manifest.calibration_frame().map(str::to_owned) else {
+            return Task::none();
+        };
+        cosmic::task::future(measure_frame_base(dir, name, preset))
+    }
 
     /// Applies a landed calibration-frame measurement to the roll's manifest:
     /// records the designated frame (already set on the defaulting path) and
@@ -4193,7 +4220,11 @@ fn measure_calibration_frame(
                         // the current crop-mode state so the dim overlay
                         // survives the level-up re-install.
                         shader.set_show_mask(self.crop_mode);
-                        shader.set_pad(if self.crop_mode { CROP_MODE_PADDING } else { 0.0 });
+                        shader.set_pad(if self.crop_mode {
+                            CROP_MODE_PADDING
+                        } else {
+                            0.0
+                        });
                     }
                     // The native texture widens the 1:1 cap; re-derive it.
                     self.reclamp_detail_zoom();
@@ -5090,15 +5121,13 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
             .align_y(Vertical::Center)
             .into()
     } else {
-        let grid = Grid::with_children(
-            app.tiles.iter().map(|tile| {
-                tile_view(
-                    tile,
-                    app.selected_frames.contains(&tile.name),
-                    is_calibration_frame(app.roll.preset(), app.roll.calibration_frame(), &tile.name),
-                )
-            }),
-        )
+        let grid = Grid::with_children(app.tiles.iter().map(|tile| {
+            tile_view(
+                tile,
+                app.selected_frames.contains(&tile.name),
+                is_calibration_frame(app.roll.preset(), app.roll.calibration_frame(), &tile.name),
+            )
+        }))
         .fluid(THUMB_SIZE)
         .height(grid::Sizing::AspectRatio(TILE_ASPECT))
         .spacing(space_s);
@@ -7906,7 +7935,11 @@ mod tests {
             frame
         ));
         // Every other preset ignores the designated frame.
-        for preset in [FilmPreset::None, FilmPreset::AutoPerFrame, FilmPreset::Hp5Plus] {
+        for preset in [
+            FilmPreset::None,
+            FilmPreset::AutoPerFrame,
+            FilmPreset::Hp5Plus,
+        ] {
             assert!(!is_calibration_frame(preset, Some(frame), frame));
         }
     }
