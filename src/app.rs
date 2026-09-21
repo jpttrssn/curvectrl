@@ -77,14 +77,14 @@ const EDIT_STEP_CURVE: f32 = 0.20;
 const EDIT_NUDGE_CURVE: f32 = 0.05;
 /// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
 /// or an arrow) translates the crop window by this many source pixels.
-const CROP_STEP_PX: i32 = 2;
+const CROP_STEP_PX: i32 = 5;
 /// Keyboard shortcut nudge step for a crop move with the Shift modifier (a 1px
 /// fine adjustment).
 const CROP_NUDGE_PX: i32 = 1;
 /// Keyboard shortcut step for a crop-window resize: a bare `-`/`=` grows or
 /// shrinks the crop window (about its center, aspect-locked) so its long edge
 /// changes by this many source pixels. Shift switches to the 1px `CROP_NUDGE_PX`.
-const CROP_RESIZE_STEP_PX: i32 = 4;
+const CROP_RESIZE_STEP_PX: i32 = 10;
 /// The smallest crop-window long edge (source pixels) a resize is allowed to
 /// shrink to, so a resize can never collapse the crop to a degenerate sliver.
 const MIN_CROP_WINDOW: u32 = 4;
@@ -1354,7 +1354,12 @@ impl cosmic::Application for AppModel {
                     details,
                     menu::Item::Divider,
                     // Crop mode only means something over a detail view.
-                    menu::Item::CheckBox(fl!("menu-crop-mode"), None, self.crop_mode, MenuAction::ToggleCropMode),
+                    menu::Item::CheckBox(
+                        fl!("menu-crop-mode"),
+                        None,
+                        self.crop_mode,
+                        MenuAction::ToggleCropMode,
+                    ),
                 ],
             ),
         );
@@ -1629,10 +1634,26 @@ impl cosmic::Application for AppModel {
                 // same `Nav` message — navigating outside crop mode, moving the
                 // crop window inside it (Shift handled by `Nav`; repeats like
                 // arrows).
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
-                keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    ..
+                } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
                 // step. Mapped unconditionally — the `AdjustEdit` handler gates
@@ -4058,7 +4079,11 @@ impl AppModel {
                         // the current crop-mode state so the dim overlay
                         // survives the level-up re-install.
                         shader.set_show_mask(self.crop_mode);
-                        shader.set_pad(if self.crop_mode { CROP_MODE_PADDING } else { 0.0 });
+                        shader.set_pad(if self.crop_mode {
+                            CROP_MODE_PADDING
+                        } else {
+                            0.0
+                        });
                     }
                     // The native texture widens the 1:1 cap; re-derive it.
                     self.reclamp_detail_zoom();
