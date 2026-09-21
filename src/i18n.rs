@@ -48,3 +48,12 @@ macro_rules! fl {
         i18n_embed_fl::fl!($crate::i18n::LANGUAGE_LOADER, $message_id, $($args), *)
     }};
 }
+
+/// Request a localized string by a runtime-computed message ID. The `fl!` macro
+/// requires a literal, so dynamic IDs (e.g. the section/row keys of the help
+/// overlay) go through the loader's runtime lookup instead. Falls back to the
+/// ID itself if the loader has no such message.
+#[must_use]
+pub fn fl_dyn(message_id: &str) -> String {
+    LANGUAGE_LOADER.get(message_id)
+}

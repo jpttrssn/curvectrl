@@ -8,6 +8,7 @@ use crate::film::{
     ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
 };
 use crate::fl;
+use crate::i18n::fl_dyn;
 use crate::shader;
 use cosmic::Application;
 use cosmic::app::context_drawer;
@@ -289,6 +290,11 @@ pub struct AppModel {
     /// "view dimmed crop area" overlay), frame paging is disabled, and the
     /// keyboard accepts only the h/j/k/l crop trims. Never persisted.
     crop_mode: bool,
+    /// Whether the global keyboard-help overlay is shown (toggled by `?`).
+    /// While on, the overlay covers the body and the rest of `update()` is
+    /// gated so navigation/editing keys do not act on the covered UI. Never
+    /// persisted.
+    help_visible: bool,
     /// Edit values as they were when the detail panel was opened — the stored
     /// manifest values for the selected file. `ResetAll` restores these, not
     /// the identity, so reset reverts the panel to its opened state.
@@ -762,6 +768,9 @@ pub enum Message {
     /// dims everything outside the crop, frame paging is disabled, and only
     /// the h/j/k/l crop trims act. A no-op outside a detail view.
     ToggleCropMode,
+    /// Toggle the global keyboard-help overlay (bare `?`). While on, the rest
+    /// of `update()` is gated so the covered UI ignores navigation/editing.
+    ToggleHelp,
     /// Flush the in-memory roll edits to the manifest file on disk.
     EditSave,
     /// Copy the focused frame's full edit (exposure + tone curve) to the
@@ -1165,6 +1174,7 @@ impl cosmic::Application for AppModel {
             roll_name_draft: String::new(),
             rotation: 0,
             crop_mode: false,
+            help_visible: false,
             reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             reset_curve_contrast: 1.0,
             reset_curve_rolloff: 1.0,
@@ -1202,12 +1212,14 @@ impl cosmic::Application for AppModel {
     }
 
     /// Escape pressed outside any widget that captured it (routed here by
-    /// libcosmic's `keyboard_nav` subscription). While a detail view is in crop
-    /// mode it exits the mode first — a VIM-like "leave the focused mode" — and
-    /// a second Escape then closes the roll / detail view (also clearing an
-    /// active library search) via the shared `DetailClosed` path.
+    /// libcosmic's `keyboard_nav` subscription). Dismisses the help overlay
+    /// first (VIM-like "leave the modal"), then exits crop mode, then closes
+    /// the roll / detail view (also clearing an active library search) via the
+    /// shared `DetailClosed` path.
     fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
-        if self.crop_mode {
+        if self.help_visible {
+            cosmic::task::message(Message::ToggleHelp)
+        } else if self.crop_mode {
             cosmic::task::message(Message::ToggleCropMode)
         } else {
             cosmic::task::message(Message::DetailClosed)
@@ -1503,8 +1515,14 @@ impl cosmic::Application for AppModel {
             .width(Length::Fill)
             .into();
 
-        // Overlay the toaster (completion toasts) on top of the whole window.
-        toaster::toaster(&self.toasts, content)
+        // Overlay the toaster (completion toasts) on top of the whole window,
+        // then the global help overlay above everything when it is open.
+        let content = toaster::toaster(&self.toasts, content);
+        if self.help_visible {
+            Stack::with_children([content, help_overlay(self)]).into()
+        } else {
+            content
+        }
     }
 
     /// Register subscriptions for this application.
@@ -1596,6 +1614,17 @@ impl cosmic::Application for AppModel {
                 } if !modifiers.control() && !repeat && character == "c" => {
                     Some(Message::ToggleCropMode)
                 }
+                // `?` toggles the global keyboard-help overlay. This iced fork
+                // delivers `key_without_modifiers`, so Shift+`/` arrives as `/`
+                // with Shift set. Gated on `!repeat` so a held `?` toggles once.
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character),
+                    modifiers,
+                    repeat,
+                    ..
+                } if !modifiers.control() && !repeat && modifiers.shift() && character == "/" => {
+                    Some(Message::ToggleHelp)
+                }
                 // VIM-style navigation: bare `h`/`j`/`k`/`l` mirror the arrow keys via the
                 // same `Nav` message — navigating outside crop mode, moving the
                 // crop window inside it (Shift handled by `Nav`; repeats like
@@ -1675,6 +1704,40 @@ impl cosmic::Application for AppModel {
         // dispatch so every path — navigation, Space, direct selection — is
         // covered by one guard.
         self.sync_roll_date_drafts();
+
+        // While the global help overlay is shown, it is modal: only `?`/Escape
+        // (ToggleHelp), the plumbing that must keep flowing underneath
+        // (modifier/viewport/resize tracking, decode + frame-info + cover
+        // landings, the fade tick, toasts, config, export progress), and the
+        // inert `Ignore` are dispatched; every other input (navigation, open,
+        // Space, editing, crop, export) is swallowed so it cannot act on the
+        // covered UI.
+        if self.help_visible
+            && !matches!(
+                message,
+                Message::ToggleHelp
+                    | Message::Ignore
+                    | Message::ModifiersChanged(_)
+                    | Message::GridViewport(_)
+                    | Message::DetailAreaResized(_)
+                    | Message::ThumbReady(_, _)
+                    | Message::RollOpened(_, _)
+                    | Message::CoverReady(_, _)
+                    | Message::DetailReady(_, _, _)
+                    | Message::DetailPreloaded(_, _, _, _)
+                    | Message::FrameInfoReady(_, _)
+                    | Message::RollInfoLoaded(_)
+                    | Message::RollsLoaded(_)
+                    | Message::DetailFadeTick
+                    | Message::ToastClose(_)
+                    | Message::UpdateConfig(_)
+                    | Message::ExportProgress { .. }
+                    | Message::ExportDone { .. }
+            )
+        {
+            return Task::none();
+        }
+
         match message {
             Message::DetailClosed => {
                 self.persist_roll();
@@ -2043,6 +2106,11 @@ impl cosmic::Application for AppModel {
                 } else {
                     self.commit_edit()
                 }
+            }
+
+            Message::ToggleHelp => {
+                self.help_visible = !self.help_visible;
+                Task::none()
             }
 
             Message::RollsLoaded(rolls) => {
@@ -3979,7 +4047,11 @@ impl AppModel {
                     // was in flight (the program starts at contain fit).
                     if let Some(shader) = &mut self.detail_shader {
                         shader.set_view(self.detail_zoom, self.detail_pan);
-                        shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
+                        shader.set_curve(
+                            self.curve_contrast,
+                            self.curve_rolloff,
+                            self.curve_shadows,
+                        );
                         shader.set_crop(self.crop);
                         shader.set_rotation(self.rotation);
                         // A fresh program starts with the mask off; re-assert
@@ -5020,6 +5092,158 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .into()
 }
 
+/// The fixed width (logical points) reserved for every help row's key chip, so
+/// the chip and its description align in a column like a table. Wide enough for
+/// the longest key (`Ctrl+C / Ctrl+V`).
+const HELP_KEY_WIDTH: f32 = 140.0;
+
+/// The help-overlay shortcut list: one entry per section, each a list of
+/// `(key, fluent-label)` rows. Section and label IDs are looked up at render
+/// time via [`crate::i18n::fl_dyn`] (the `fl!` macro needs literals).
+const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "help-section-general",
+        &[
+            ("?", "help-key-help"),
+            ("Esc", "help-key-escape"),
+            ("Space", "help-key-space"),
+            ("c", "help-key-crop-mode"),
+            ("e", "help-key-export"),
+            ("Ctrl+A", "help-key-select-all"),
+            ("Ctrl+C / Ctrl+V", "help-key-copy-paste"),
+        ],
+    ),
+    (
+        "help-section-navigation",
+        &[
+            ("h / j / k / l", "help-nav-move"),
+            ("← ↑ ↓ →", "help-nav-move"),
+            ("Enter", "help-nav-open"),
+            ("Ctrl+F", "help-nav-search"),
+        ],
+    ),
+    (
+        "help-section-editing",
+        &[
+            ("- / =", "help-edit-exposure"),
+            ("[ / ]", "help-edit-contrast"),
+            ("; / '", "help-edit-highlights"),
+            (", / .", "help-edit-shadows"),
+            ("r", "help-edit-rotate"),
+        ],
+    ),
+    (
+        "help-section-crop-mode",
+        &[
+            ("h / j / k / l", "help-crop-move"),
+            ("← ↑ ↓ →", "help-crop-move"),
+            ("- / =", "help-crop-resize"),
+            ("Shift", "help-crop-nudge"),
+            ("c / Esc", "help-crop-exit"),
+        ],
+    ),
+];
+
+/// One help row: an accent key chip + its description. The chip sits in a
+/// fixed-width column (`HELP_KEY_WIDTH`) left-aligned, so every row's key
+/// values and descriptions line up vertically like a table.
+fn help_row<'a>(key: &'a str, label: &'a str, space_s: u16, space_m: u16) -> Element<'a, Message> {
+    widget::row::with_capacity(2)
+        .push(
+            widget::container(
+                widget::container(widget::text::body(key))
+                    .padding([2, space_s])
+                    .class(cosmic::theme::Container::custom(|theme| {
+                        cosmic::iced::widget::container::Style {
+                            text_color: Some(theme.cosmic().accent_text_color().into()),
+                            ..Default::default()
+                        }
+                    })),
+            )
+            .width(Length::Fixed(HELP_KEY_WIDTH))
+            .align_x(Horizontal::Left),
+        )
+        .push(widget::text::body(fl_dyn(label)))
+        .spacing(space_m)
+        .align_y(Vertical::Center)
+        .into()
+}
+
+/// One help section as a grid cell: its section title followed by its rows.
+fn help_section<'a>(
+    section: &'a str,
+    rows: &'a [(&'a str, &'a str)],
+    space_s: u16,
+    space_m: u16,
+) -> Element<'a, Message> {
+    widget::column::with_capacity(rows.len() + 1)
+        .push(widget::text::title2(fl_dyn(section)))
+        .extend(
+            rows.iter()
+                .map(|(key, label)| help_row(key, label, space_s, space_m)),
+        )
+        .spacing(space_s)
+        .into()
+}
+
+/// The global keyboard-help overlay (toggled by `?`): a full-window scrim that
+/// swallows all pointer input (`Message::Ignore`, like the detail surface) with
+/// a card that fills the window (minus a scrim margin) listing every keyboard
+/// shortcut. Sections are laid out as grid cells that flow into as many columns
+/// as the width allows (`Grid::fluid`) and stretch to fill the card's height
+/// (`EvenlyDistribute`), so the content fills the available space instead of
+/// scrolling. While it is shown, `update()` gates every other message so the
+/// covered UI stays inert.
+fn help_overlay(_app: &AppModel) -> Element<'_, Message> {
+    let space_m = cosmic::theme::spacing().space_m;
+    let space_s = cosmic::theme::spacing().space_s;
+
+    let grid = Grid::with_children(
+        HELP_SECTIONS
+            .iter()
+            .map(|(section, rows)| help_section(section, rows, space_s, space_m)),
+    )
+    .fluid(280.0)
+    .height(grid::Sizing::EvenlyDistribute(Length::Fill))
+    .spacing(space_m);
+
+    let card = widget::container(
+        widget::column::with_capacity(HELP_SECTIONS.len() + 2)
+            .push(widget::text::title1(fl!("help-title")))
+            .push(widget::text::caption(fl!("help-dismiss")))
+            .push(grid)
+            .spacing(space_m),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(space_m)
+    .class(cosmic::theme::Container::Primary);
+
+    widget::container(
+        MouseArea::new(card)
+            .on_press(Message::Ignore)
+            .on_double_click(Message::Ignore)
+            .on_double_press(Message::Ignore)
+            .on_right_press(Message::Ignore)
+            .on_right_release(Message::Ignore)
+            .on_middle_press(Message::Ignore)
+            .on_middle_release(Message::Ignore)
+            .on_scroll(|_| Message::Ignore),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(space_m)
+    .class(cosmic::theme::Container::custom(|theme| {
+        cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                cosmic::iced::Color::from(theme.cosmic().background(false).base).scale_alpha(0.6),
+            )),
+            ..Default::default()
+        }
+    }))
+    .into()
+}
+
 /// Parses the basic EXIF readout (dimensions, camera, ISO, shutter, aperture,
 /// focal length, lens, capture date) from a RAW file. Runs on the blocking
 /// pool when the frame-info drawer opens and is cached on the tile; `Err` for
@@ -5708,12 +5932,18 @@ fn resize_crop_box(
         f64::from(frame_long) / f64::from(long),
     );
     let nw = (f64::from(cw) * scale).round().clamp(1.0, f64::from(width)) as u32;
-    let nh = (f64::from(ch) * scale).round().clamp(1.0, f64::from(height)) as u32;
+    let nh = (f64::from(ch) * scale)
+        .round()
+        .clamp(1.0, f64::from(height)) as u32;
     // Keep the window's center fixed; recompute margins from it.
     let cx = f64::from(crop.left) + f64::from(cw) / 2.0;
     let cy = f64::from(crop.top) + f64::from(ch) / 2.0;
-    let left = (cx - f64::from(nw) / 2.0).round().clamp(0.0, f64::from(width - nw)) as u32;
-    let top = (cy - f64::from(nh) / 2.0).round().clamp(0.0, f64::from(height - nh)) as u32;
+    let left = (cx - f64::from(nw) / 2.0)
+        .round()
+        .clamp(0.0, f64::from(width - nw)) as u32;
+    let top = (cy - f64::from(nh) / 2.0)
+        .round()
+        .clamp(0.0, f64::from(height - nh)) as u32;
     edit_manifest::CropMargins {
         top,
         right: width.saturating_sub(left).saturating_sub(nw),
