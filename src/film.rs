@@ -35,11 +35,15 @@ pub const ACTIVE_STOCK: MonoStock = MonoStock {
 };
 
 /// The film-inversion preset a roll's frames are rendered with: which
-/// [`MonoStock`] profile inverts the negatives, or `None` for already-positive
-/// scans (regular RAWs) that must NOT be inverted.
+/// [`MonoStock`] profile inverts the negatives and how the black point is
+/// resolved, or `None` for already-positive scans (regular RAWs) that must NOT
+/// be inverted.
 ///
-/// The default is [`FilmPreset::None`], so a roll with no recorded preset
-/// renders as a regular (non-inverted) scan.
+/// The base-mode strategy is part of the preset choice, so the dropdown lists
+/// the base strategies first and the actual stocks after them: **None, Auto per
+/// frame, Auto selected frame, then the film stocks**. The default is
+/// [`FilmPreset::None`], so a roll with no recorded preset renders as a regular
+/// (non-inverted) scan.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum FilmPreset {
     /// No inversion: the scan is treated as an already-positive image (a
@@ -47,18 +51,26 @@ pub enum FilmPreset {
     /// negative.
     #[default]
     None,
-    /// Invert with the active stock profile.
+    /// Invert every frame with the active stock profile, measuring each frame's
+    /// own clear-film plateau as its black point.
+    AutoPerFrame,
+    /// Invert every frame with the active stock profile against a single
+    /// designated calibration frame's measured clear-film plateau (defaults to
+    /// the roll's first frame). See [`edit_manifest::RollManifest`]'s
+    /// `calibration_frame`/`base` fields.
+    AutoSelectedFrame,
+    /// Invert with the active stock profile, using its preset base.
     Hp5Plus,
 }
 
 impl FilmPreset {
     /// The inversion profile for a chosen preset: [`None`] (no inversion)
-    /// carries no profile; the negative preset carries [`ACTIVE_STOCK`].
+    /// carries no profile; every other preset carries [`ACTIVE_STOCK`].
     #[must_use]
     pub const fn stock(self) -> Option<MonoStock> {
         match self {
             Self::None => None,
-            Self::Hp5Plus => Some(ACTIVE_STOCK),
+            Self::AutoPerFrame | Self::AutoSelectedFrame | Self::Hp5Plus => Some(ACTIVE_STOCK),
         }
     }
 
@@ -70,6 +82,7 @@ impl FilmPreset {
     /// sign at that point, so the user-facing controls (+EV = brighter) stay
     /// identical across presets.
     #[must_use]
+    #[allow(dead_code)] // kept as the semantic inverse of `stock()`; used in tests
     pub const fn is_inverted(self) -> bool {
         self.stock().is_some()
     }
@@ -81,6 +94,8 @@ impl FilmPreset {
     pub const fn choice_key(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::AutoPerFrame => "auto-per-frame",
+            Self::AutoSelectedFrame => "auto-selected-frame",
             Self::Hp5Plus => "hp5",
         }
     }
@@ -90,17 +105,22 @@ impl FilmPreset {
     #[must_use]
     pub fn from_key(key: &str) -> Self {
         match key {
+            "auto-per-frame" => Self::AutoPerFrame,
+            "auto-selected-frame" => Self::AutoSelectedFrame,
             "hp5" => Self::Hp5Plus,
             _ => Self::None,
         }
     }
 
-    /// The dropdown index ordering (None first, matching the default).
+    /// The dropdown index ordering (None first, matching the default, then the
+    /// base strategies, then the film stocks).
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::None => 0,
-            Self::Hp5Plus => 1,
+            Self::AutoPerFrame => 1,
+            Self::AutoSelectedFrame => 2,
+            Self::Hp5Plus => 3,
         }
     }
 
@@ -109,7 +129,9 @@ impl FilmPreset {
     #[must_use]
     pub const fn from_index(index: usize) -> Self {
         match index {
-            1 => Self::Hp5Plus,
+            1 => Self::AutoPerFrame,
+            2 => Self::AutoSelectedFrame,
+            3 => Self::Hp5Plus,
             _ => Self::None,
         }
     }
@@ -488,18 +510,27 @@ mod tests {
     #[test]
     fn film_preset_stock_mapping() {
         assert_eq!(FilmPreset::None.stock(), None);
+        assert_eq!(FilmPreset::AutoPerFrame.stock(), Some(ACTIVE_STOCK));
+        assert_eq!(FilmPreset::AutoSelectedFrame.stock(), Some(ACTIVE_STOCK));
         assert_eq!(FilmPreset::Hp5Plus.stock(), Some(ACTIVE_STOCK));
     }
 
     #[test]
     fn film_preset_inverted_marking() {
         assert!(!FilmPreset::None.is_inverted());
+        assert!(FilmPreset::AutoPerFrame.is_inverted());
+        assert!(FilmPreset::AutoSelectedFrame.is_inverted());
         assert!(FilmPreset::Hp5Plus.is_inverted());
     }
 
     #[test]
     fn film_preset_choice_key_round_trip() {
-        for preset in [FilmPreset::None, FilmPreset::Hp5Plus] {
+        for preset in [
+            FilmPreset::None,
+            FilmPreset::AutoPerFrame,
+            FilmPreset::AutoSelectedFrame,
+            FilmPreset::Hp5Plus,
+        ] {
             assert_eq!(FilmPreset::from_key(preset.choice_key()), preset);
         }
         // Unknown keys resolve to the default (None), like a missing entry.
@@ -509,9 +540,30 @@ mod tests {
 
     #[test]
     fn film_preset_index_round_trip() {
-        for preset in [FilmPreset::None, FilmPreset::Hp5Plus] {
+        for preset in [
+            FilmPreset::None,
+            FilmPreset::AutoPerFrame,
+            FilmPreset::AutoSelectedFrame,
+            FilmPreset::Hp5Plus,
+        ] {
             assert_eq!(FilmPreset::from_index(preset.index()), preset);
         }
         assert_eq!(FilmPreset::from_index(99), FilmPreset::None);
+    }
+
+    #[test]
+    fn film_preset_dropdown_order() {
+        // The dropdown lists None, the base strategies, then the stocks — the
+        // exact ordering the index mapping must match.
+        let ordered = [
+            FilmPreset::None,
+            FilmPreset::AutoPerFrame,
+            FilmPreset::AutoSelectedFrame,
+            FilmPreset::Hp5Plus,
+        ];
+        for (index, preset) in ordered.into_iter().enumerate() {
+            assert_eq!(preset.index(), index);
+            assert_eq!(FilmPreset::from_index(index), preset);
+        }
     }
 }

@@ -34,6 +34,8 @@ month-11 = Nov
 month-12 = Dec
 preset-label = Film preset
 preset-none = None
+preset-auto-per-frame = Auto per frame
+preset-auto-selected-frame = Auto selected frame
 roll-frames = {$count ->
     [one] {$count} frame
    *[other] {$count} frames
@@ -57,9 +59,7 @@ menu-quit = Quit
 menu-select-all = Select all
 menu-copy-edits = Copy edits
 menu-paste-edits = Paste edits
-menu-calibrate-base = Calibrate base from this frame
-menu-auto-base = Auto base per frame
-menu-preset-base = Use preset base
+menu-calibrate-base = Calibrate from this frame
 menu-details = Details…
 menu-crop-mode = Crop mode
 menu-export = Export…
