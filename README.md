@@ -1,10 +1,13 @@
 # CurveCtrl
+A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls.
 
-A keyboard-centric photo library and RAW editor focused on digital camera scans of film rolls.
-
-The goal of this application is to keep editing quick and simple, so you can get on with taking more photos.
-
-Add your roll of RAW photos, choose a stock (for the initial inversion), edit the photos, export, done.
+- Manage your film rolls
+- Film inversion presets
+- Auto inversion per frame or choosen frame
+- Basic tone curve adjustments
+- Crop mode tuned for removing edges
+- Set and export original roll date with chronological frame order
+- Search by roll name or date
 
 ## Installation
 

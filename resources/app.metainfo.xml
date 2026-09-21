@@ -3,8 +3,23 @@
   <id>io.github.jpttrssn.curvectrl</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
+  <developer_name>Jonatan Pettersson</developer_name>
+  <url type="homepage">https://github.com/jpttrssn/curvectrl</url>
+  <url type="bugtracker">https://github.com/jpttrssn/curvectrl</url>
   <name>CurveCtrl</name>
-  <summary>A film negative scanning and RAW image editor</summary>
+  <summary>A keyboard-centric film negative RAW image editor</summary>
+  <description>
+    <p>A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls.</p>
+    <ul>
+      <li>Manage your film rolls</li>
+      <li>Film inversion presets</li>
+      <li>Auto inversion per frame or choosen frame</li>
+      <li>Basic tone curve adjustments</li>
+      <li>Crop mode tuned for removing edges</li>
+      <li>Set and export original roll date with chronological frame order</li>
+      <li>Search by roll name or date</li>
+    </ul>
+  </description>
   <icon type="remote" width="64" height="64" scale="1">
     https://github.com/jpttrssn/curvectrl/raw/main/resources/icons/hicolor/scalable/apps/io.github.jpttrssn.curvectrl.svg
   </icon>
