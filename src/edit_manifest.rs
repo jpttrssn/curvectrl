@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::film::FilmPreset;
+use crate::film::{BaseMode, FilmPreset};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -184,20 +184,26 @@ pub struct RollManifest {
     pub edits: HashMap<String, EditData>,
     /// The roll's film-inversion preset, stored as its choice key. Absent means
     /// the default [`FilmPreset::None`] (a non-negative/regular-RAW roll). The
-    /// base-mode strategy (per-frame auto, a designated calibration frame, or
-    /// the stock's preset base) lives in the preset choice itself.
+    /// base strategy (preset base / auto per frame / auto selected frame) is a
+    /// separate roll-level choice, [`Self::base_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// How the roll's black point is resolved, stored as its choice key. Absent
+    /// means the default [`BaseMode::Preset`] (the chosen film's preset base).
+    /// `AutoPerFrame` measures each frame, `AutoSelectedFrame` pins the whole
+    /// roll to the measured [`Self::base`] of [`Self::calibration_frame`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_mode: Option<String>,
     /// The roll's resolved black point: the measured clear-film transmission of
-    /// [`Self::calibration_frame`]. Meaningful only while the roll's preset is
-    /// [`FilmPreset::AutoSelectedFrame`]; every frame inverts against this same
-    /// base. Absent falls back to the stock's preset base (preset-first).
+    /// [`Self::calibration_frame`]. Meaningful only while the roll's base mode
+    /// is [`BaseMode::AutoSelectedFrame`]; every frame inverts against this
+    /// same base. Absent falls back to the film's preset base (preset-first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<f32>,
     /// The frame name whose measured clear-film plateau is the roll's black
-    /// point under [`FilmPreset::AutoSelectedFrame`]. Defaults to the roll's
-    /// first sorted frame when that preset is chosen; `None` under any other
-    /// preset (and never a decode input — only the dot indicator and the
+    /// point under [`BaseMode::AutoSelectedFrame`]. Defaults to the roll's
+    /// first sorted frame when that base mode is chosen; `None` under any other
+    /// base mode (and never a decode input — only the dot indicator and the
     /// calibration flow read it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration_frame: Option<String>,
@@ -214,10 +220,11 @@ pub struct RollManifest {
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 8,
+            version: 9,
             name: None,
             edits: HashMap::new(),
             preset: None,
+            base_mode: None,
             base: None,
             calibration_frame: None,
             start_date: None,
@@ -393,17 +400,40 @@ impl RollManifest {
     }
 
     /// Records the film-inversion preset for the roll. Only a non-default
-    /// preset is written: any stock preset (`Hp5Plus`, `TriX`, …) or auto
-    /// base strategy (`AutoPerFrame`, `AutoSelectedFrame`) stores its choice
-    /// key, [`FilmPreset::None`] clears it back to the implicit default (the
-    /// key disappears on the next save, which keeps the default manifest clean
-    /// for raw scans).
+    /// preset is written: `Generic` or any stock preset stores its choice key,
+    /// [`FilmPreset::None`] clears it back to the implicit default (the key
+    /// disappears on the next save, which keeps the default manifest clean for
+    /// raw scans).
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_preset(&mut self, preset: FilmPreset) {
         match preset {
             FilmPreset::None => self.preset = None,
             _ => self.preset = Some(preset.choice_key().to_owned()),
+        }
+    }
+
+    /// How the roll's black point is resolved. The absent/unknown key falls
+    /// back to the default [`BaseMode::Preset`].
+    #[must_use]
+    pub fn base_mode(&self) -> BaseMode {
+        self.base_mode
+            .as_deref()
+            .map_or_else(BaseMode::default, BaseMode::from_key)
+    }
+
+    /// Records the roll's base strategy. Only a non-default mode is written:
+    /// [`BaseMode::AutoPerFrame`]/[`BaseMode::AutoSelectedFrame`] store their
+    /// choice key, [`BaseMode::Preset`] clears it back to the implicit default
+    /// (the key disappears on the next save).
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_base_mode(&mut self, mode: BaseMode) {
+        match mode {
+            BaseMode::Preset => self.base_mode = None,
+            BaseMode::AutoPerFrame | BaseMode::AutoSelectedFrame => {
+                self.base_mode = Some(mode.choice_key().to_owned());
+            }
         }
     }
 
@@ -439,8 +469,8 @@ impl RollManifest {
     }
 
     /// The frame name designated as the roll's auto-calibration reference
-    /// (the black-point source under the [`FilmPreset::AutoSelectedFrame`]
-    /// preset), if any. `None` under any other preset or before a frame is
+    /// (the black-point source under the [`BaseMode::AutoSelectedFrame`] base
+    /// mode), if any. `None` under any other base mode or before a frame is
     /// designated.
     #[must_use]
     pub fn calibration_frame(&self) -> Option<&str> {
@@ -448,7 +478,7 @@ impl RollManifest {
     }
 
     /// Designates `name` as the roll's auto-calibration frame: under the
-    /// [`FilmPreset::AutoSelectedFrame`] preset its measured clear-film
+    /// [`BaseMode::AutoSelectedFrame`] base mode its measured clear-film
     /// plateau is the roll's black point. The numeric base itself is recorded
     /// separately via [`Self::set_calibrated_base`].
     ///
@@ -467,8 +497,8 @@ impl RollManifest {
 
     /// Clears the auto-selected calibration reference: both the designated
     /// frame and its measured base. Used when the roll leaves the
-    /// [`FilmPreset::AutoSelectedFrame`] preset (the strategy is part of the
-    /// preset choice, so a stale reference must not linger for other modes).
+    /// [`BaseMode::AutoSelectedFrame`] base mode (a stale reference must not
+    /// linger for other modes).
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn clear_calibration(&mut self) {
@@ -478,25 +508,28 @@ impl RollManifest {
 
     /// The roll's base-resolution state as a single [`film::BaseConfig`], the
     /// unit threaded into every decode and bake so a rendering reflects the
-    /// roll's calibration mode. The strategy is part of the film preset: the
-    /// per-frame auto preset opts into per-frame measurement, the
-    /// auto-selected-frame preset pins the whole roll to its measured
-    /// calibration, and every stock preset (and `None`) resolves preset-first.
+    /// roll's base mode. The film preset supplies the stock (and falls back to
+    /// its preset base); a non-inverted roll (`None`) resolves the default (the
+    /// base is irrelevant with no inversion). The base mode then decides where
+    /// the black point comes from: `AutoPerFrame` opts into per-frame
+    /// measurement, `AutoSelectedFrame` pins the whole roll to its measured
+    /// calibration, and `Preset` uses the film's preset base.
     #[must_use]
     pub fn base_config(&self) -> crate::film::BaseConfig {
-        match self.preset() {
-            FilmPreset::AutoPerFrame => crate::film::BaseConfig {
+        if self.preset().stock().is_none() {
+            return crate::film::BaseConfig::default();
+        }
+        match self.base_mode() {
+            BaseMode::Preset => crate::film::BaseConfig {
+                calibrated: None,
+                auto: false,
+            },
+            BaseMode::AutoPerFrame => crate::film::BaseConfig {
                 calibrated: None,
                 auto: true,
             },
-            FilmPreset::AutoSelectedFrame => crate::film::BaseConfig {
+            BaseMode::AutoSelectedFrame => crate::film::BaseConfig {
                 calibrated: self.calibrated_base(),
-                auto: false,
-            },
-            FilmPreset::None | FilmPreset::Hp5Plus | FilmPreset::TriX | FilmPreset::Fp4Plus
-            | FilmPreset::TMax400 | FilmPreset::Fomapan100 | FilmPreset::Delta400
-            | FilmPreset::Fomapan400 | FilmPreset::Kentmere400 => crate::film::BaseConfig {
-                calibrated: None,
                 auto: false,
             },
         }
@@ -515,12 +548,12 @@ pub fn manifest_path(dir: &Path) -> PathBuf {
 /// manifest likewise falls back to a default roll and is reported to stderr,
 /// so a broken file never blocks scanning the library.
 ///
-/// Legacy manifests are migrated on load: a v7 (or older) roll that explicitly
-/// opted into per-frame automatic base measurement (`base_auto = true`) has
-/// that toggle folded into the film-preset choice as
-/// [`FilmPreset::AutoPerFrame`], the strategy now living in the preset. The
-/// older numeric `base` calibration is preserved verbatim (it becomes the
-/// `AutoSelectedFrame` black point if that preset is ever chosen).
+/// Legacy manifests are migrated on load: the pre-v9 base strategy (a v7
+/// `base_auto = true` toggle or a v8 `auto-per-frame`/`auto-selected-frame`
+/// preset key) becomes the `hp5` film plus the matching [`BaseMode`], the base
+/// strategy now a separate roll-level choice. The older numeric `base`
+/// calibration is preserved verbatim (it remains the `AutoSelectedFrame` black
+/// point).
 #[must_use]
 pub fn load_roll_manifest(dir: &Path) -> RollManifest {
     let path = manifest_path(dir);
@@ -549,16 +582,32 @@ pub fn load_roll_manifest(dir: &Path) -> RollManifest {
     }
 }
 
-/// Folds a pre-v8 per-frame auto opt-in into the film-preset choice.
+/// Migrates pre-v9 manifests to the two-axis model: the film preset and the
+/// base strategy are now separate choices.
 ///
-/// Before v8 the `base_auto` toggle lived beside the preset; the v8 schema
-/// removed it, making the base strategy part of the preset itself. A manifest
-/// carrying `base_auto = true` therefore loads as the `AutoPerFrame` preset so
-/// the existing behavior survives a version bump.
+/// Before v8 the `base_auto` toggle lived beside the preset; v8 folded it into
+/// the preset choice as `auto-per-frame`/`auto-selected-frame` keys; v9 splits
+/// the base strategy back out into its own `base_mode` field, so the auto keys
+/// migrate to the HP5+ film (the stock the auto modes always implied) plus the
+/// matching base mode. The older numeric `base` calibration is preserved
+/// verbatim (it remains the `AutoSelectedFrame` black point).
 fn migrate_legacy_base_auto(manifest: &mut RollManifest, text: &str) {
-    if manifest.version >= 8 {
+    if manifest.version >= 9 {
         return;
     }
+    // v8 auto presets → the HP5+ film + the matching base mode.
+    match manifest.preset.as_deref() {
+        Some("auto-per-frame") => {
+            manifest.preset = Some(FilmPreset::Hp5Plus.choice_key().to_owned());
+            manifest.base_mode = Some(BaseMode::AutoPerFrame.choice_key().to_owned());
+        }
+        Some("auto-selected-frame") => {
+            manifest.preset = Some(FilmPreset::Hp5Plus.choice_key().to_owned());
+            manifest.base_mode = Some(BaseMode::AutoSelectedFrame.choice_key().to_owned());
+        }
+        _ => {}
+    }
+    // v7 (or older) `base_auto` opt-in → the auto-per-frame base mode.
     let legacy_auto = match toml::from_str::<toml::Value>(text) {
         Ok(value) => value
             .get("base_auto")
@@ -567,7 +616,11 @@ fn migrate_legacy_base_auto(manifest: &mut RollManifest, text: &str) {
         Err(_) => false,
     };
     if legacy_auto {
-        manifest.preset = Some(FilmPreset::AutoPerFrame.choice_key().to_owned());
+        manifest.base_mode = Some(BaseMode::AutoPerFrame.choice_key().to_owned());
+        // Ensure a film is chosen to carry the inversion (HP5+, as before).
+        if manifest.preset().stock().is_none() {
+            manifest.preset = Some(FilmPreset::Hp5Plus.choice_key().to_owned());
+        }
     }
 }
 
@@ -648,7 +701,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, 9);
     }
 
     #[test]
@@ -1201,7 +1254,8 @@ mod tests {
         let dir = temp_dir("calib-frame");
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
-        manifest.set_preset(FilmPreset::AutoSelectedFrame);
+        manifest.set_preset(FilmPreset::Hp5Plus);
+        manifest.set_base_mode(BaseMode::AutoSelectedFrame);
         manifest.set_calibration_frame("IMG_0007.DNG");
         manifest.set_calibrated_base(0.63);
 
@@ -1209,7 +1263,8 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.preset(), FilmPreset::AutoSelectedFrame);
+        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(loaded.base_mode(), BaseMode::AutoSelectedFrame);
         assert_eq!(loaded.calibration_frame(), Some("IMG_0007.DNG"));
         assert_eq!(loaded.calibrated_base(), Some(0.63));
     }
@@ -1241,11 +1296,12 @@ mod tests {
         assert_eq!(loaded.version, 5, "older schema versions load verbatim");
         assert_eq!(loaded.calibrated_base(), None);
         assert_eq!(loaded.calibration_frame(), None);
+        assert_eq!(loaded.base_mode(), BaseMode::Preset);
         assert_eq!(loaded.tone("a.DNG").exposure_ev, 0.75);
     }
 
     #[test]
-    fn legacy_base_auto_migrates_to_the_auto_per_frame_preset() {
+    fn legacy_base_auto_migrates_to_the_auto_per_frame_base_mode() {
         let dir = temp_dir("legacy-auto");
         std::fs::create_dir_all(&dir).unwrap();
         // A v7 manifest with the pre-v8 per-frame auto opt-in.
@@ -1258,8 +1314,8 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.preset(), FilmPreset::AutoPerFrame);
-        assert_eq!(loaded.preset.as_deref(), Some("auto-per-frame"));
+        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(loaded.base_mode(), BaseMode::AutoPerFrame);
     }
 
     #[test]
@@ -1276,29 +1332,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(loaded.base_mode(), BaseMode::Preset);
         assert_eq!(loaded.calibrated_base(), Some(0.71));
     }
 
     #[test]
-    fn auto_preset_keys_round_trip() {
-        let dir = temp_dir("auto-keys");
+    fn v8_auto_presets_migrate_to_film_plus_base_mode() {
+        // v8 folded the base strategy into the preset choice as auto keys; v9
+        // splits them back out, so the auto keys become the HP5+ film (the stock
+        // they always implied) plus the matching base mode.
+        for (auto_key, film, mode) in [
+            ("auto-per-frame", FilmPreset::Hp5Plus, BaseMode::AutoPerFrame),
+            (
+                "auto-selected-frame",
+                FilmPreset::Hp5Plus,
+                BaseMode::AutoSelectedFrame,
+            ),
+        ] {
+            let dir = temp_dir("v8-auto");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                manifest_path(&dir),
+                format!("version = 8\npreset = \"{auto_key}\"\n"),
+            )
+            .unwrap();
+
+            let loaded = load_roll_manifest(&dir);
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            assert_eq!(loaded.preset(), film, "key {auto_key} migrates the film");
+            assert_eq!(loaded.base_mode(), mode, "key {auto_key} migrates the base mode");
+        }
+    }
+
+    #[test]
+    fn base_mode_keys_round_trip() {
+        let dir = temp_dir("base-mode-keys");
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
-        manifest.set_preset(FilmPreset::AutoPerFrame);
+        manifest.set_preset(FilmPreset::Hp5Plus);
+        manifest.set_base_mode(BaseMode::AutoPerFrame);
 
         save_roll_manifest(&dir, &manifest).unwrap();
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.preset(), FilmPreset::AutoPerFrame);
-        assert_eq!(loaded.preset.as_deref(), Some("auto-per-frame"));
+        assert_eq!(loaded.base_mode(), BaseMode::AutoPerFrame);
+        assert_eq!(loaded.base_mode.as_deref(), Some("auto-per-frame"));
+
+        // The default (Preset) clears the key so a save omits it.
+        let mut defaulted = manifest;
+        defaulted.set_base_mode(BaseMode::Preset);
+        assert_eq!(defaulted.base_mode(), BaseMode::Preset);
+        assert_eq!(defaulted.base_mode, None);
     }
 
     #[test]
-    fn base_config_maps_the_preset_strategy() {
-        // The base strategy is part of the preset choice: stock presets resolve
-        // preset-first, per-frame auto measures every frame, and the
-        // auto-selected-frame preset pins the roll to its measured base.
+    fn base_config_maps_the_preset_and_base_mode() {
+        // The film preset supplies the stock; the base mode decides where the
+        // black point comes from. A non-inverted roll ignores the base mode.
         let mut manifest = RollManifest::default();
         assert_eq!(
             manifest.base_config(),
@@ -1308,7 +1400,8 @@ mod tests {
             }
         );
 
-        manifest.set_preset(FilmPreset::AutoPerFrame);
+        manifest.set_preset(FilmPreset::Generic);
+        manifest.set_base_mode(BaseMode::AutoPerFrame);
         assert_eq!(
             manifest.base_config(),
             crate::film::BaseConfig {
@@ -1317,7 +1410,7 @@ mod tests {
             }
         );
 
-        manifest.set_preset(FilmPreset::AutoSelectedFrame);
+        manifest.set_base_mode(BaseMode::AutoSelectedFrame);
         manifest.set_calibrated_base(0.63);
         assert_eq!(
             manifest.base_config(),
@@ -1327,7 +1420,18 @@ mod tests {
             }
         );
 
-        manifest.set_preset(FilmPreset::Hp5Plus);
+        manifest.set_base_mode(BaseMode::Preset);
+        assert_eq!(
+            manifest.base_config(),
+            crate::film::BaseConfig {
+                calibrated: None,
+                auto: false
+            }
+        );
+
+        // A non-inverted roll resolves the default regardless of base mode.
+        manifest.set_preset(FilmPreset::None);
+        manifest.set_base_mode(BaseMode::AutoPerFrame);
         assert_eq!(
             manifest.base_config(),
             crate::film::BaseConfig {
@@ -1342,7 +1446,8 @@ mod tests {
         let dir = temp_dir("base-coexist");
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
-        manifest.set_preset(FilmPreset::AutoSelectedFrame);
+        manifest.set_preset(FilmPreset::Hp5Plus);
+        manifest.set_base_mode(BaseMode::AutoSelectedFrame);
         manifest.set_calibrated_base(0.7);
         manifest.set_exposure("IMG_0001.DNG", 0.42);
 
@@ -1350,7 +1455,8 @@ mod tests {
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.preset(), FilmPreset::AutoSelectedFrame);
+        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
+        assert_eq!(loaded.base_mode(), BaseMode::AutoSelectedFrame);
         assert_eq!(loaded.calibrated_base(), Some(0.7));
         assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
     }

@@ -91,12 +91,24 @@ pub const KENTMERE_400: MonoStock = MonoStock {
     gamma: 0.7,
 };
 
-/// Every real film-stock preset, in dropdown order (the base strategies —
-/// `None`, `AutoPerFrame`, `AutoSelectedFrame` — precede the stocks and are not
-/// part of this list). The stocks are ordered alphabetically by display name,
-/// and the list is the single source of truth the film-preset pickers consume,
-/// so the roll-info drawer and the add-roll dialog can never drift.
-pub const FILM_STOCKS: [FilmPreset; 8] = [
+/// The generic B&W film profile: a sane neutral fallback for rolls whose stock
+/// is unknown or not in the preset list. Its values mirror an average B&W film
+/// (HP5+); the auto-base strategies rescue the black point per roll anyway, so
+/// the exact `base` matters less than `d_max`/`gamma` character.
+pub const GENERIC_STOCK: MonoStock = MonoStock {
+    name: "Generic",
+    base: 0.80,
+    d_max: 2.4,
+    gamma: 0.7,
+};
+
+/// Every film-preset choice, in dropdown order: `None` (no inversion), the
+/// generic B&W profile, then the named stocks alphabetically. The single source
+/// of truth the film-preset pickers consume, so the roll-info drawer and the
+/// add-roll dialog can never drift. Order MUST match [`FilmPreset::index`].
+pub const FILM_CHOICES: [FilmPreset; 10] = [
+    FilmPreset::None,
+    FilmPreset::Generic,
     FilmPreset::Fomapan100,
     FilmPreset::Fomapan400,
     FilmPreset::Delta400,
@@ -108,15 +120,14 @@ pub const FILM_STOCKS: [FilmPreset; 8] = [
 ];
 
 /// The film-inversion preset a roll's frames are rendered with: which
-/// [`MonoStock`] profile inverts the negatives and how the black point is
-/// resolved, or `None` for already-positive scans (regular RAWs) that must NOT
-/// be inverted.
+/// [`MonoStock`] profile inverts the negatives, or `None` for already-positive
+/// scans (regular RAWs) that must NOT be inverted.
 ///
-/// The base-mode strategy is part of the preset choice, so the dropdown lists
-/// the base strategies first and the actual stocks after them: **None, Auto per
-/// frame, Auto selected frame, then the film stocks** (see [`FILM_STOCKS`]).
-/// The default is [`FilmPreset::None`], so a roll with no recorded preset
-/// renders as a regular (non-inverted) scan.
+/// The base strategy (preset base / auto per frame / auto selected frame) is a
+/// separate roll-level choice ([`BaseMode`]), not part of the film picker. The
+/// dropdown lists **None, Generic, then the named stocks alphabetically** (see
+/// [`FILM_CHOICES`]). The default is [`FilmPreset::None`], so a roll with no
+/// recorded preset renders as a regular (non-inverted) scan.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum FilmPreset {
     /// No inversion: the scan is treated as an already-positive image (a
@@ -124,48 +135,43 @@ pub enum FilmPreset {
     /// negative.
     #[default]
     None,
-    /// Invert every frame with the active stock profile, measuring each frame's
-    /// own clear-film plateau as its black point.
-    AutoPerFrame,
-    /// Invert every frame with the active stock profile against a single
-    /// designated calibration frame's measured clear-film plateau (defaults to
-    /// the roll's first frame). See [`edit_manifest::RollManifest`]'s
-    /// `calibration_frame`/`base` fields.
-    AutoSelectedFrame,
-    /// Invert with the Ilford HP5+ profile, using its preset base.
-    Hp5Plus,
-    /// Invert with the Kodak Tri-X 400 profile.
-    TriX,
-    /// Invert with the Ilford FP4 Plus profile.
-    Fp4Plus,
-    /// Invert with the Kodak T-Max 400 profile.
-    TMax400,
+    /// Invert with the generic B&W profile — the fallback for films not in the
+    /// preset list.
+    Generic,
     /// Invert with the Fomapan 100 profile.
     Fomapan100,
-    /// Invert with the Ilford Delta 400 profile.
-    Delta400,
     /// Invert with the Fomapan 400 profile.
     Fomapan400,
+    /// Invert with the Ilford Delta 400 profile.
+    Delta400,
+    /// Invert with the Ilford FP4 Plus profile.
+    Fp4Plus,
+    /// Invert with the Ilford HP5+ profile, using its preset base.
+    Hp5Plus,
     /// Invert with the Kentmere 400 profile.
     Kentmere400,
+    /// Invert with the Kodak T-Max 400 profile.
+    TMax400,
+    /// Invert with the Kodak Tri-X 400 profile.
+    TriX,
 }
 
 impl FilmPreset {
     /// The inversion profile for a chosen preset: [`None`] (no inversion)
-    /// carries no profile; the auto base strategies carry the active stock,
-    /// and each stock preset carries its own profile.
+    /// carries no profile; `Generic` and each stock preset carry their own.
     #[must_use]
     pub const fn stock(self) -> Option<MonoStock> {
         match self {
             Self::None => None,
-            Self::AutoPerFrame | Self::AutoSelectedFrame | Self::Hp5Plus => Some(ACTIVE_STOCK),
-            Self::TriX => Some(TRI_X),
-            Self::Fp4Plus => Some(FP4_PLUS),
-            Self::TMax400 => Some(TMAX_400),
+            Self::Generic => Some(GENERIC_STOCK),
             Self::Fomapan100 => Some(FOMAPAN_100),
-            Self::Delta400 => Some(DELTA_400),
             Self::Fomapan400 => Some(FOMAPAN_400),
+            Self::Delta400 => Some(DELTA_400),
+            Self::Fp4Plus => Some(FP4_PLUS),
+            Self::Hp5Plus => Some(ACTIVE_STOCK),
             Self::Kentmere400 => Some(KENTMERE_400),
+            Self::TMax400 => Some(TMAX_400),
+            Self::TriX => Some(TRI_X),
         }
     }
 
@@ -189,16 +195,15 @@ impl FilmPreset {
     pub const fn choice_key(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::AutoPerFrame => "auto-per-frame",
-            Self::AutoSelectedFrame => "auto-selected-frame",
-            Self::Hp5Plus => "hp5",
-            Self::TriX => "tri-x",
-            Self::Fp4Plus => "fp4",
-            Self::TMax400 => "tmax400",
+            Self::Generic => "generic",
             Self::Fomapan100 => "fomapan100",
-            Self::Delta400 => "delta400",
             Self::Fomapan400 => "fomapan400",
+            Self::Delta400 => "delta400",
+            Self::Fp4Plus => "fp4",
+            Self::Hp5Plus => "hp5",
             Self::Kentmere400 => "kentmere400",
+            Self::TMax400 => "tmax400",
+            Self::TriX => "tri-x",
         }
     }
 
@@ -207,36 +212,34 @@ impl FilmPreset {
     #[must_use]
     pub fn from_key(key: &str) -> Self {
         match key {
-            "auto-per-frame" => Self::AutoPerFrame,
-            "auto-selected-frame" => Self::AutoSelectedFrame,
-            "hp5" => Self::Hp5Plus,
-            "tri-x" => Self::TriX,
-            "fp4" => Self::Fp4Plus,
-            "tmax400" => Self::TMax400,
+            "generic" => Self::Generic,
             "fomapan100" => Self::Fomapan100,
-            "delta400" => Self::Delta400,
             "fomapan400" => Self::Fomapan400,
+            "delta400" => Self::Delta400,
+            "fp4" => Self::Fp4Plus,
+            "hp5" => Self::Hp5Plus,
             "kentmere400" => Self::Kentmere400,
+            "tmax400" => Self::TMax400,
+            "tri-x" => Self::TriX,
             _ => Self::None,
         }
     }
 
-    /// The dropdown index ordering (None first, matching the default, then the
-    /// base strategies, then the film stocks in [`FILM_STOCKS`] order).
+    /// The dropdown index ordering (None first, matching the default, then
+    /// Generic, then the stocks alphabetically in [`FILM_CHOICES`] order).
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::None => 0,
-            Self::AutoPerFrame => 1,
-            Self::AutoSelectedFrame => 2,
-            Self::Fomapan100 => 3,
-            Self::Fomapan400 => 4,
-            Self::Delta400 => 5,
-            Self::Fp4Plus => 6,
-            Self::Hp5Plus => 7,
-            Self::Kentmere400 => 8,
-            Self::TMax400 => 9,
-            Self::TriX => 10,
+            Self::Generic => 1,
+            Self::Fomapan100 => 2,
+            Self::Fomapan400 => 3,
+            Self::Delta400 => 4,
+            Self::Fp4Plus => 5,
+            Self::Hp5Plus => 6,
+            Self::Kentmere400 => 7,
+            Self::TMax400 => 8,
+            Self::TriX => 9,
         }
     }
 
@@ -245,18 +248,89 @@ impl FilmPreset {
     #[must_use]
     pub const fn from_index(index: usize) -> Self {
         match index {
-            1 => Self::AutoPerFrame,
-            2 => Self::AutoSelectedFrame,
-            3 => Self::Fomapan100,
-            4 => Self::Fomapan400,
-            5 => Self::Delta400,
-            6 => Self::Fp4Plus,
-            7 => Self::Hp5Plus,
-            8 => Self::Kentmere400,
-            9 => Self::TMax400,
-            10 => Self::TriX,
+            1 => Self::Generic,
+            2 => Self::Fomapan100,
+            3 => Self::Fomapan400,
+            4 => Self::Delta400,
+            5 => Self::Fp4Plus,
+            6 => Self::Hp5Plus,
+            7 => Self::Kentmere400,
+            8 => Self::TMax400,
+            9 => Self::TriX,
             _ => Self::None,
         }
+    }
+}
+
+/// How a roll's black point (the film's `base`) is resolved. Orthogonal to the
+/// [`FilmPreset`] film choice: the film supplies `d_max`/`gamma` (character),
+/// this decides where the black point comes from.
+///
+/// The default is [`BaseMode::Preset`]: the film's own preset base, until the
+/// user opts into measurement.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+pub enum BaseMode {
+    /// Use the chosen film's preset base (nothing measured).
+    #[default]
+    Preset,
+    /// Measure each frame's own clear-film plateau as its base.
+    AutoPerFrame,
+    /// Measure one designated calibration frame's base and use it for the whole
+    /// roll (defaults to the roll's first frame). See
+    /// [`edit_manifest::RollManifest`]'s `calibration_frame`/`base` fields.
+    AutoSelectedFrame,
+}
+
+impl BaseMode {
+    /// The stable dialog and manifest storage key for this mode. `Preset` is
+    /// the zero-value default, represented by the key's absence.
+    #[must_use]
+    pub const fn choice_key(self) -> &'static str {
+        match self {
+            Self::Preset => "preset",
+            Self::AutoPerFrame => "auto-per-frame",
+            Self::AutoSelectedFrame => "auto-selected-frame",
+        }
+    }
+
+    /// Resolves a stored choice key into a mode; the missing/absent key and
+    /// unknown values fall back to the default [`BaseMode::Preset`].
+    #[must_use]
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "auto-per-frame" => Self::AutoPerFrame,
+            "auto-selected-frame" => Self::AutoSelectedFrame,
+            _ => Self::Preset,
+        }
+    }
+
+    /// The dropdown index ordering (Preset first, matching the default).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Preset => 0,
+            Self::AutoPerFrame => 1,
+            Self::AutoSelectedFrame => 2,
+        }
+    }
+
+    /// Resolves a dropdown index (see [`Self::index`]) back into a mode; any
+    /// out-of-range index falls back to the default [`BaseMode::Preset`].
+    #[must_use]
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::AutoPerFrame,
+            2 => Self::AutoSelectedFrame,
+            _ => Self::Preset,
+        }
+    }
+
+    /// Whether this mode measures the base at all (either per frame or from the
+    /// designated calibration frame).
+    #[must_use]
+    #[allow(dead_code)] // kept as a semantic predicate; used in tests
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::AutoPerFrame | Self::AutoSelectedFrame)
     }
 }
 
@@ -633,41 +707,34 @@ mod tests {
     #[test]
     fn film_preset_stock_mapping() {
         assert_eq!(FilmPreset::None.stock(), None);
-        // The auto base strategies carry the active stock.
-        assert_eq!(FilmPreset::AutoPerFrame.stock(), Some(ACTIVE_STOCK));
-        assert_eq!(FilmPreset::AutoSelectedFrame.stock(), Some(ACTIVE_STOCK));
-        // Each stock preset carries its own profile.
-        assert_eq!(FilmPreset::Hp5Plus.stock(), Some(ACTIVE_STOCK));
-        assert_eq!(FilmPreset::TriX.stock(), Some(TRI_X));
-        assert_eq!(FilmPreset::Fp4Plus.stock(), Some(FP4_PLUS));
-        assert_eq!(FilmPreset::TMax400.stock(), Some(TMAX_400));
+        // Generic carries the neutral fallback profile; each stock its own.
+        assert_eq!(FilmPreset::Generic.stock(), Some(GENERIC_STOCK));
         assert_eq!(FilmPreset::Fomapan100.stock(), Some(FOMAPAN_100));
-        assert_eq!(FilmPreset::Delta400.stock(), Some(DELTA_400));
         assert_eq!(FilmPreset::Fomapan400.stock(), Some(FOMAPAN_400));
+        assert_eq!(FilmPreset::Delta400.stock(), Some(DELTA_400));
+        assert_eq!(FilmPreset::Fp4Plus.stock(), Some(FP4_PLUS));
+        assert_eq!(FilmPreset::Hp5Plus.stock(), Some(ACTIVE_STOCK));
         assert_eq!(FilmPreset::Kentmere400.stock(), Some(KENTMERE_400));
+        assert_eq!(FilmPreset::TMax400.stock(), Some(TMAX_400));
+        assert_eq!(FilmPreset::TriX.stock(), Some(TRI_X));
     }
 
     #[test]
     fn film_preset_inverted_marking() {
         assert!(!FilmPreset::None.is_inverted());
-        assert!(FilmPreset::AutoPerFrame.is_inverted());
-        assert!(FilmPreset::AutoSelectedFrame.is_inverted());
-        for preset in FILM_STOCKS {
-            assert!(preset.is_inverted());
+        for preset in FILM_CHOICES {
+            assert_eq!(preset.is_inverted(), preset != FilmPreset::None);
         }
     }
 
     #[test]
     fn film_preset_choice_key_round_trip() {
-        let mut presets = vec![
-            FilmPreset::None,
-            FilmPreset::AutoPerFrame,
-            FilmPreset::AutoSelectedFrame,
-        ];
-        presets.extend(FILM_STOCKS);
-        for preset in presets {
+        for preset in FILM_CHOICES {
             assert_eq!(FilmPreset::from_key(preset.choice_key()), preset);
         }
+        // The retired auto keys are no longer presets.
+        assert_eq!(FilmPreset::from_key("auto-per-frame"), FilmPreset::None);
+        assert_eq!(FilmPreset::from_key("auto-selected-frame"), FilmPreset::None);
         // Unknown keys resolve to the default (None), like a missing entry.
         assert_eq!(FilmPreset::from_key(""), FilmPreset::None);
         assert_eq!(FilmPreset::from_key("delta"), FilmPreset::None);
@@ -675,13 +742,7 @@ mod tests {
 
     #[test]
     fn film_preset_index_round_trip() {
-        let mut presets = vec![
-            FilmPreset::None,
-            FilmPreset::AutoPerFrame,
-            FilmPreset::AutoSelectedFrame,
-        ];
-        presets.extend(FILM_STOCKS);
-        for preset in presets {
+        for preset in FILM_CHOICES {
             assert_eq!(FilmPreset::from_index(preset.index()), preset);
         }
         assert_eq!(FilmPreset::from_index(99), FilmPreset::None);
@@ -689,17 +750,43 @@ mod tests {
 
     #[test]
     fn film_preset_dropdown_order() {
-        // The dropdown lists None, the base strategies, then the stocks in
-        // `FILM_STOCKS` order — the exact ordering the index mapping must match.
-        let mut ordered = vec![
-            FilmPreset::None,
-            FilmPreset::AutoPerFrame,
-            FilmPreset::AutoSelectedFrame,
-        ];
-        ordered.extend(FILM_STOCKS);
-        for (index, preset) in ordered.into_iter().enumerate() {
+        // The dropdown lists None, Generic, then the stocks alphabetically in
+        // `FILM_CHOICES` order — the exact ordering the index mapping must
+        // match.
+        for (index, preset) in FILM_CHOICES.into_iter().enumerate() {
             assert_eq!(preset.index(), index);
             assert_eq!(FilmPreset::from_index(index), preset);
         }
+    }
+
+    #[test]
+    fn base_mode_default_is_preset() {
+        assert_eq!(BaseMode::default(), BaseMode::Preset);
+        assert!(!BaseMode::Preset.is_auto());
+    }
+
+    #[test]
+    fn base_mode_choice_key_round_trip() {
+        for mode in [BaseMode::Preset, BaseMode::AutoPerFrame, BaseMode::AutoSelectedFrame] {
+            assert_eq!(BaseMode::from_key(mode.choice_key()), mode);
+        }
+        // Unknown keys resolve to the default (Preset), like a missing entry.
+        assert_eq!(BaseMode::from_key(""), BaseMode::Preset);
+        assert_eq!(BaseMode::from_key("delta"), BaseMode::Preset);
+    }
+
+    #[test]
+    fn base_mode_index_round_trip() {
+        for mode in [BaseMode::Preset, BaseMode::AutoPerFrame, BaseMode::AutoSelectedFrame] {
+            assert_eq!(BaseMode::from_index(mode.index()), mode);
+        }
+        assert_eq!(BaseMode::from_index(99), BaseMode::Preset);
+    }
+
+    #[test]
+    fn base_mode_auto_marking() {
+        assert!(!BaseMode::Preset.is_auto());
+        assert!(BaseMode::AutoPerFrame.is_auto());
+        assert!(BaseMode::AutoSelectedFrame.is_auto());
     }
 }

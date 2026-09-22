@@ -34,8 +34,11 @@ month-11 = Nov
 month-12 = Dec
 preset-label = Film preset
 preset-none = None
-preset-auto-per-frame = Auto per frame
-preset-auto-selected-frame = Auto selected frame
+preset-generic = Generic
+base-label = Base
+base-preset = Preset base
+base-auto-per-frame = Auto per frame
+base-auto-selected-frame = Auto selected frame
 roll-frames = {$count ->
     [one] {$count} frame
    *[other] {$count} frames

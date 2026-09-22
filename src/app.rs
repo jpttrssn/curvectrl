@@ -5,8 +5,8 @@ use crate::detail_area::DetailArea;
 use crate::edit_manifest::{self, RollManifest};
 use crate::exif_writer;
 use crate::film::{
-    ACTIVE_STOCK, BaseConfig, FILM_STOCKS, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray,
-    measure_base,
+    ACTIVE_STOCK, BaseConfig, BaseMode, FILM_CHOICES, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock,
+    invert_gray, measure_base,
 };
 use crate::fl;
 use crate::i18n::fl_dyn;
@@ -422,6 +422,10 @@ pub struct Roll {
     /// in-memory source of truth for decodes; persisted to the roll's edit
     /// manifest (see [`edit_manifest::RollManifest::preset`]).
     pub preset: FilmPreset,
+    /// How this roll's black point is resolved (preset base / auto per frame /
+    /// auto selected frame). Orthogonal to the film choice; persisted to the
+    /// roll's edit manifest (see [`edit_manifest::RollManifest::base_mode`]).
+    pub base_mode: BaseMode,
     /// The roll's start date (ISO `YYYY-MM-DD`), if already set. Mirrors the
     /// edit manifest; display-only (no decode impact).
     pub start_date: Option<String>,
@@ -632,20 +636,26 @@ pub enum Message {
     /// A roll cover decode finished.
     CoverReady(PathBuf, Result<Handle, ()>),
     /// The folder picker returned a roll directory to add, along with the
-    /// film preset chosen for it in the dialog.
+    /// film preset chosen for it in the dialog. The base strategy is not part
+    /// of the dialog (the open dialog carries a single choice), so a new roll
+    /// starts on the preset base and the user sets auto in the roll-info drawer.
     RollAdded(PathBuf, FilmPreset),
-    /// The selected roll's film preset was changed from the roll-info drawer.
+    /// The selected roll's film preset (which film inverts it) was changed from
+    /// the roll-info drawer.
     RollPresetChanged(PathBuf, FilmPreset),
+    /// The selected roll's base strategy (preset base / auto per frame / auto
+    /// selected frame) was changed from the roll-info drawer.
+    RollBaseModeChanged(PathBuf, BaseMode),
     /// The user asked to make the currently viewed frame the roll's
     /// auto-calibration frame: its clear-film plateau is measured once and
     /// recorded in the roll manifest as the black point every frame inverts
-    /// against. Only meaningful while the roll's preset is
-    /// [`FilmPreset::AutoSelectedFrame`].
+    /// against. Only meaningful while the roll's base mode is
+    /// [`BaseMode::AutoSelectedFrame`].
     CalibrateBaseFromFrame,
     /// A background measurement of the roll's auto-calibration frame landed:
     /// `name` is the designated frame and `Option<f32>` its measured (and
     /// plausibility-filtered) clear-film transmission. Applied only while the
-    /// roll still uses the `AutoSelectedFrame` preset with that same frame.
+    /// roll still uses the `AutoSelectedFrame` base mode with that same frame.
     CalibrationBaseMeasured(PathBuf, String, Option<f32>),
     /// The user pressed the Add roll button.
     AddRoll,
@@ -1290,12 +1300,12 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-paste-edits"), None, MenuAction::PasteEdits)
         };
 
-        // "Calibrate from this frame" designates the current frame as the
+// "Calibrate from this frame" designates the current frame as the
         // roll's auto-calibration frame — only meaningful under the
-        // Auto-selected-frame preset of an open roll. The handler no-ops
-        // without an eligible frame, so the menu only gates on the preset.
-        let calibrate_enabled =
-            self.active.is_some() && self.roll.preset() == FilmPreset::AutoSelectedFrame;
+        // Auto-selected-frame base mode of an open roll. The handler no-ops
+        // without an eligible frame, so the menu only gates on the base mode.
+        let calibrate_enabled = self.active.is_some()
+            && self.roll.base_mode() == BaseMode::AutoSelectedFrame;
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -2189,7 +2199,9 @@ impl cosmic::Application for AppModel {
                 }
                 // Record the chosen preset. The manifest is the persistence
                 // layer and the in-memory roll (on a re-add) the decode source:
-                // writing first means the just-spawned scan reads it back.
+                // writing first means the just-spawned scan reads it back. The
+                // base strategy starts at the default (Preset), settable from
+                // the roll-info drawer.
                 record_roll_preset(&dir, preset);
                 if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
                     roll.preset = preset;
@@ -2216,12 +2228,31 @@ impl cosmic::Application for AppModel {
                     roll.thumb = Thumb::Loading;
                 }
                 let mut tasks = vec![self.decode_covers()];
-                if preset == FilmPreset::AutoSelectedFrame {
-                    // The auto-selected-frame preset designates ONE frame whose
-                    // clear-film plateau becomes the roll's black point. Default
-                    // it to the roll's first sorted frame (mirroring the cover
-                    // selection) and measure its base so the preset works out of
-                    // the box; `apply_calibration_measurement` stores the value.
+                // The drawer is library-only today, so the active branch is a
+                // defensive re-bake (kept so a film change can never render a
+                // stale inversion for an open roll). A film change leaves the
+                // base strategy (and any calibration) untouched.
+                if self.active.as_deref() == Some(dir.as_path()) {
+                    self.roll.set_preset(preset);
+                    tasks.extend(self.reflow_roll_after_change(&dir));
+                }
+                Task::batch(tasks)
+            }
+
+            Message::RollBaseModeChanged(dir, mode) => {
+                record_roll_base_mode(&dir, mode);
+                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                    roll.base_mode = mode;
+                    roll.thumb = Thumb::Loading;
+                }
+                let mut tasks = vec![self.decode_covers()];
+                if mode == BaseMode::AutoSelectedFrame {
+                    // The auto-selected-frame base mode designates ONE frame
+                    // whose clear-film plateau becomes the roll's black point.
+                    // Default it to the roll's first sorted frame (mirroring
+                    // the cover selection) and measure its base so the mode
+                    // works out of the box; `apply_calibration_measurement`
+                    // stores the value.
                     if let Some(first) = self.roll_first_frame(&dir) {
                         let mut manifest = edit_manifest::load_roll_manifest(&dir);
                         if manifest.calibration_frame().is_none() {
@@ -2238,12 +2269,12 @@ impl cosmic::Application for AppModel {
                         {
                             self.roll.set_calibration_frame(&first);
                         }
-                        tasks.push(Self::measure_calibration_frame(dir.clone(), preset));
+                        tasks.push(Self::measure_calibration_frame(dir.clone()));
                     }
                 } else {
-                    // Leaving the auto-selected-frame preset drops the
-                    // calibration reference: the strategy is part of the preset
-                    // choice, so a stale frame/base must not linger.
+                    // Leaving the auto-selected-frame base mode drops the
+                    // calibration reference: a stale frame/base must not
+                    // linger for the other modes.
                     let mut manifest = edit_manifest::load_roll_manifest(&dir);
                     if manifest.calibration_frame().is_some()
                         || manifest.calibrated_base().is_some()
@@ -2260,33 +2291,9 @@ impl cosmic::Application for AppModel {
                         self.roll.clear_calibration();
                     }
                 }
-                // The drawer is library-only today, so the active branch is a
-                // defensive re-bake (kept so a preset change can never render
-                // a stale inversion for an open roll).
                 if self.active.as_deref() == Some(dir.as_path()) {
-                    self.roll.set_preset(preset);
-                    for tile in &mut self.tiles {
-                        tile.thumb = Thumb::Loading;
-                    }
-                    self.thumb_inflight.clear();
-                    tasks.push(self.decode_next());
-                    // Drop every detail buffer decoded under the old profile:
-                    // the live shader, the roll's cache entries, and any
-                    // in-flight native level-up, then re-pump so the next
-                    // frames come up under the new preset. Exposure/curve/crop
-                    // edits survive (they are applied in-shader).
-                    self.detail_shader = None;
-                    self.detail_native_queued = false;
-                    self.detail_inflight = None;
-                    self.detail_preload_inflight.clear();
-                    self.detail_thumb = None;
-                    self.detail_last_frame = None;
-                    let _ = self
-                        .detail_cache
-                        .retain(|(cached_dir, _, _)| cached_dir != &dir);
-                    let current = self.selected.clone().unwrap_or_default();
-                    tasks.push(self.decode_detail_next());
-                    tasks.push(self.preload_detail_neighbors(&current));
+                    self.roll.set_base_mode(mode);
+                    tasks.extend(self.reflow_roll_after_change(&dir));
                 }
                 Task::batch(tasks)
             }
@@ -2496,22 +2503,19 @@ impl cosmic::Application for AppModel {
                 // frame is highlighted (the pre-select above), so re-apply it
                 // here — navigation never closes the drawer.
                 self.restore_drawer_for(DrawerView::Grid);
-                // A roll opened under the auto-selected-frame preset with no
-                // designated frame yet (e.g. a freshly added roll whose preset
-                // was picked in the Add Roll dialog) defaults it to the first
-                // frame and measures its base.
+                // A roll opened under the auto-selected-frame base mode with no
+                // designated frame yet (e.g. a freshly added roll whose base
+                // mode was picked in the Add Roll dialog) defaults it to the
+                // first frame and measures its base.
                 let mut tasks = vec![];
-                if self.roll.preset() == FilmPreset::AutoSelectedFrame
+                if self.roll.base_mode() == BaseMode::AutoSelectedFrame
                     && self.roll.calibration_frame().is_none()
                 {
                     let first = self.tiles.first().map(|tile| tile.name.clone());
                     if let Some(first) = first {
                         self.roll.set_calibration_frame(&first);
                         self.persist_roll();
-                        tasks.push(Self::measure_calibration_frame(
-                            dir.clone(),
-                            self.roll.preset(),
-                        ));
+                        tasks.push(Self::measure_calibration_frame(dir.clone()));
                     }
                 }
                 tasks.extend([
@@ -3313,9 +3317,9 @@ impl AppModel {
             return Task::none();
         };
         let preset = self.roll.preset();
-        // Only the auto-selected-frame preset designates a calibration frame;
-        // elsewhere the base strategy lives in the preset choice, not here.
-        if preset != FilmPreset::AutoSelectedFrame {
+        // Only the auto-selected-frame base mode designates a calibration
+        // frame; elsewhere the base strategy is not a per-frame designation.
+        if self.roll.base_mode() != BaseMode::AutoSelectedFrame {
             return Task::none();
         }
         // The viewed frame's overview is usually cached; measure straight from
@@ -3341,23 +3345,22 @@ impl AppModel {
     /// Spawns a one-shot measurement of the roll's designated auto-calibration
     /// frame, posting its measured clear-film transmission back as
     /// [`Message::CalibrationBaseMeasured`].
-    fn measure_calibration_frame(
-        dir: PathBuf,
-        preset: FilmPreset,
-    ) -> Task<cosmic::Action<Message>> {
-        // The designated frame lives on disk (the drawer is library-only); the
-        // RAM manifest may be for another roll or stale, so read it fresh.
+    fn measure_calibration_frame(dir: PathBuf) -> Task<cosmic::Action<Message>> {
+        // The designated frame (and the film preset the decode runs under) live
+        // on disk — the drawer is library-only and the RAM manifest may be for
+        // another roll or stale, so read both fresh.
         let manifest = edit_manifest::load_roll_manifest(&dir);
         let Some(name) = manifest.calibration_frame().map(str::to_owned) else {
             return Task::none();
         };
-        cosmic::task::future(measure_frame_base(dir, name, preset))
+        cosmic::task::future(measure_frame_base(dir, name, manifest.preset()))
     }
 
     /// Applies a landed calibration-frame measurement to the roll's manifest:
     /// records the designated frame (already set on the defaulting path) and
     /// its measured base, then re-renders every rendering under the new black
-    /// point. Guarded so a measurement racing a preset/frame change is dropped.
+    /// point. Guarded so a measurement racing a base-mode/frame change is
+    /// dropped.
     fn apply_calibration_measurement(
         &mut self,
         dir: &Path,
@@ -3365,7 +3368,7 @@ impl AppModel {
         base: Option<f32>,
     ) -> Task<cosmic::Action<Message>> {
         let mut manifest = edit_manifest::load_roll_manifest(dir);
-        let stale = manifest.preset() != FilmPreset::AutoSelectedFrame
+        let stale = manifest.base_mode() != BaseMode::AutoSelectedFrame
             || manifest.calibration_frame() != Some(name);
         if stale {
             return Task::none();
@@ -3412,6 +3415,33 @@ impl AppModel {
                 .find(|roll| roll.dir == dir)
                 .and_then(|roll| roll.cover.clone())
         }
+    }
+
+    /// Re-bakes every rendering of the OPEN roll after a film-preset or
+    /// base-mode change: re-bakes the grid tiles and drops every detail buffer
+    /// decoded under the old profile (the live shader, the roll's LRU entries,
+    /// and any in-flight native level-up), then re-pumps so the next frames
+    /// come up under the new profile. Exposure/curve/crop edits survive (they
+    /// are applied in-shader). The caller has already recorded the new choice
+    /// on `self.roll` and pushed `decode_covers` into its task batch.
+    fn reflow_roll_after_change(&mut self, dir: &Path) -> Vec<Task<cosmic::Action<Message>>> {
+        for tile in &mut self.tiles {
+            tile.thumb = Thumb::Loading;
+        }
+        self.thumb_inflight.clear();
+        self.detail_shader = None;
+        self.detail_native_queued = false;
+        self.detail_inflight = None;
+        self.detail_preload_inflight.clear();
+        self.detail_thumb = None;
+        self.detail_last_frame = None;
+        let _ = self.detail_cache.retain(|(cached_dir, _, _)| cached_dir != dir);
+        let current = self.selected.clone().unwrap_or_default();
+        vec![
+            self.decode_next(),
+            self.decode_detail_next(),
+            self.preload_detail_neighbors(&current),
+        ]
     }
 
     /// Rebuilds every rendering after a base-calibration change: the live
@@ -4326,6 +4356,7 @@ async fn load_roll(dir: PathBuf) -> Roll {
         cover,
         frame_count,
         preset: manifest.preset(),
+        base_mode: manifest.base_mode(),
         start_date,
         end_date,
         thumb: Thumb::Loading,
@@ -4334,16 +4365,34 @@ async fn load_roll(dir: PathBuf) -> Roll {
 
 /// Persists a roll's film preset to its edit manifest, the on-disk source of
 /// truth for decodes after a restart. Only a non-default preset is written:
-/// any stock preset or auto base strategy records its choice key, while the
-/// `None` default is implicit in the key's absence — so a default raw scan
-/// keeps a clean manifest, and a write failure degrades to a stderr report
-/// instead of blocking the UI.
+/// `Generic` or any stock preset records its choice key, while the `None`
+/// default is implicit in the key's absence — so a default raw scan keeps a
+/// clean manifest, and a write failure degrades to a stderr report instead of
+/// blocking the UI.
 fn record_roll_preset(dir: &Path, preset: FilmPreset) {
     if preset == FilmPreset::default() {
         return;
     }
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_preset(preset);
+    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
+        eprintln!(
+            "failed to write roll manifest {}: {err}",
+            edit_manifest::manifest_path(dir).display()
+        );
+    }
+}
+
+/// Persists a roll's base strategy to its edit manifest, the on-disk source of
+/// truth for decodes after a restart. Only a non-default mode is written: the
+/// `AutoPerFrame`/`AutoSelectedFrame` modes record their choice key, while the
+/// `Preset` default is implicit in the key's absence.
+fn record_roll_base_mode(dir: &Path, mode: BaseMode) {
+    if mode == BaseMode::default() {
+        return;
+    }
+    let mut manifest = edit_manifest::load_roll_manifest(dir);
+    manifest.set_base_mode(mode);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
         eprintln!(
             "failed to write roll manifest {}: {err}",
@@ -4766,23 +4815,24 @@ fn library_cell_index(
 }
 
 /// The add-roll dialog's "film preset" choice: whether the chosen folder holds
-/// already-positive scans (regular RAWs, the non-inverted default), an auto
-/// base strategy, or a specific film stock. Mirrors the roll-info drawer's
-/// preset dropdown ordering (None → Auto per frame → Auto selected frame →
-/// [`FILM_STOCKS`]). The response returns the selected key, which the picker
-/// resolves back into a [`FilmPreset`].
+/// already-positive scans (regular RAWs, the non-inverted default), the generic
+/// B&W profile, or a specific film stock. Mirrors the roll-info drawer's film
+/// dropdown ordering ([`FILM_CHOICES`]). The response returns the selected key,
+/// which the picker resolves back into a [`FilmPreset`]. (The base strategy is
+/// not part of the dialog — the cosmic open dialog carries a single choice — so
+/// a new roll starts on the preset base and the user sets auto in the roll-info
+/// drawer.)
 #[must_use]
 fn roll_preset_choice() -> cosmic::dialog::file_chooser::Choice {
     let mut choice =
-        cosmic::dialog::file_chooser::Choice::new("preset", &fl!("preset-label"), "none")
-            .insert("none", &fl!("preset-none"))
-            .insert("auto-per-frame", &fl!("preset-auto-per-frame"))
-            .insert("auto-selected-frame", &fl!("preset-auto-selected-frame"));
-    for preset in FILM_STOCKS {
-        let Some(stock) = preset.stock() else {
-            continue;
-        };
-        choice = choice.insert(preset.choice_key(), stock.name);
+        cosmic::dialog::file_chooser::Choice::new("preset", &fl!("preset-label"), "none");
+    for preset in FILM_CHOICES {
+        match preset.stock() {
+            // `None` (no inversion) uses its fluent label; stock profiles show
+            // their display name.
+            Some(stock) => choice = choice.insert(preset.choice_key(), stock.name),
+            None => choice = choice.insert(preset.choice_key(), &fl!("preset-none")),
+        }
     }
     choice
 }
@@ -5136,7 +5186,11 @@ fn frames_view(app: &AppModel) -> Element<'_, Message> {
             tile_view(
                 tile,
                 app.selected_frames.contains(&tile.name),
-                is_calibration_frame(app.roll.preset(), app.roll.calibration_frame(), &tile.name),
+                is_calibration_frame(
+                    app.roll.base_mode(),
+                    app.roll.calibration_frame(),
+                    &tile.name,
+                ),
             )
         }))
         .fluid(THUMB_SIZE)
@@ -5591,17 +5645,13 @@ fn roll_info_panel<'a>(
     )
     .width(Length::Fill);
 
-    // The film preset selector: the base strategies first (none, auto per
-    // frame, auto selected frame), then the film stocks in `FILM_STOCKS` order.
-    // Index order MUST match `FilmPreset::index()`.
-    let mut preset_options = vec![
-        fl!("preset-none"),
-        fl!("preset-auto-per-frame"),
-        fl!("preset-auto-selected-frame"),
-    ];
-    for preset in FILM_STOCKS {
-        if let Some(stock) = preset.stock() {
-            preset_options.push(stock.name.to_owned());
+    // The film preset selector: None (no inversion), Generic, then the named
+    // stocks in `FILM_CHOICES` order. Index order MUST match `FilmPreset::index()`.
+    let mut preset_options = Vec::with_capacity(FILM_CHOICES.len());
+    for preset in FILM_CHOICES {
+        match preset.stock() {
+            Some(stock) => preset_options.push(stock.name.to_owned()),
+            None => preset_options.push(fl!("preset-none")),
         }
     }
     let roll_dir = roll.dir.clone();
@@ -5611,6 +5661,26 @@ fn roll_info_panel<'a>(
         move |index| Message::RollPresetChanged(roll_dir.clone(), FilmPreset::from_index(index)),
     )
     .width(Length::Fill);
+
+    // The base strategy selector: how the roll's black point is resolved. Only
+    // meaningful while a film (inversion) is chosen, so the row is hidden for a
+    // non-inverted roll. Index order MUST match `BaseMode::index()`.
+    let base = if roll.preset.stock().is_some() {
+        let base_dir = roll.dir.clone();
+        let base = widget::dropdown::dropdown(
+            vec![
+                fl!("base-preset"),
+                fl!("base-auto-per-frame"),
+                fl!("base-auto-selected-frame"),
+            ],
+            Some(roll.base_mode.index()),
+            move |index| Message::RollBaseModeChanged(base_dir.clone(), BaseMode::from_index(index)),
+        )
+        .width(Length::Fill);
+        Some(base)
+    } else {
+        None
+    };
 
     widget::column::with_capacity(14)
         .push(name)
@@ -5642,6 +5712,15 @@ fn roll_info_panel<'a>(
         .push(widget::divider::horizontal::default())
         .push(widget::text(fl!("preset-label")))
         .push(preset)
+        .push_maybe(base.map(|base| {
+            let row: Element<'_, Message> = widget::column::with_capacity(2)
+                .push(widget::text(fl!("base-label")))
+                .push(base)
+                .spacing(space_xs)
+                .width(Length::Fill)
+                .into();
+            row
+        }))
         .push(widget::divider::horizontal::default())
         .push(remove)
         .spacing(space_xs)
@@ -5904,11 +5983,11 @@ fn tile_view(tile: &Tile, selected: bool, is_calibration_frame: bool) -> Element
 }
 
 /// Whether `name` carries the auto-calibration dot: it is the roll's designated
-/// calibration frame AND the roll's preset is [`FilmPreset::AutoSelectedFrame`]
+/// calibration frame AND the roll's base mode is [`BaseMode::AutoSelectedFrame`]
 /// (the only mode that reads a designated frame).
 #[must_use]
-fn is_calibration_frame(preset: FilmPreset, calibration_frame: Option<&str>, name: &str) -> bool {
-    preset == FilmPreset::AutoSelectedFrame && calibration_frame == Some(name)
+fn is_calibration_frame(base_mode: BaseMode, calibration_frame: Option<&str>, name: &str) -> bool {
+    base_mode == BaseMode::AutoSelectedFrame && calibration_frame == Some(name)
 }
 
 /// The auto-calibration indicator: a small theme-accent circle pinned to the
@@ -7913,6 +7992,7 @@ mod tests {
             cover: None,
             frame_count: 0,
             preset: FilmPreset::default(),
+            base_mode: BaseMode::default(),
             start_date: None,
             end_date: None,
             thumb: Thumb::Loading,
@@ -7929,34 +8009,30 @@ mod tests {
     }
 
     #[test]
-    fn is_calibration_frame_gates_on_the_preset_and_designated_name() {
+    fn is_calibration_frame_gates_on_the_base_mode_and_designated_name() {
         // The dot only appears for the designated frame under the
-        // AutoSelectedFrame preset.
+        // AutoSelectedFrame base mode.
         let frame = "IMG_0007.DNG";
         assert!(is_calibration_frame(
-            FilmPreset::AutoSelectedFrame,
+            BaseMode::AutoSelectedFrame,
             Some(frame),
             frame
         ));
-        // Same preset, wrong frame → no dot.
+        // Same base mode, wrong frame → no dot.
         assert!(!is_calibration_frame(
-            FilmPreset::AutoSelectedFrame,
+            BaseMode::AutoSelectedFrame,
             Some(frame),
             "IMG_0008.DNG"
         ));
         // No designated frame yet → no dot.
         assert!(!is_calibration_frame(
-            FilmPreset::AutoSelectedFrame,
+            BaseMode::AutoSelectedFrame,
             None,
             frame
         ));
-        // Every other preset ignores the designated frame.
-        for preset in [
-            FilmPreset::None,
-            FilmPreset::AutoPerFrame,
-            FilmPreset::Hp5Plus,
-        ] {
-            assert!(!is_calibration_frame(preset, Some(frame), frame));
+        // Every other base mode ignores the designated frame.
+        for mode in [BaseMode::Preset, BaseMode::AutoPerFrame] {
+            assert!(!is_calibration_frame(mode, Some(frame), frame));
         }
     }
 
