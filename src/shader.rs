@@ -867,7 +867,7 @@ impl Primitive for DetailPrimitive {
     // Sequential wgpu uploads (texture, tone LUT, then uniforms) that must run
     // in this exact order each frame; splitting them into helper methods would
     // only scatter the pipeline state they all touch.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     fn prepare(
         &self,
         pipeline: &mut Self::Pipeline,
@@ -885,6 +885,13 @@ impl Primitive for DetailPrimitive {
             !pipeline.initialized || pipeline.current_image_id != Some(self.image_id);
 
         if needs_new_texture {
+            // Pre-filter the linear mono into a full mip chain so minified
+            // views (zoom back out after the native level-up) sample averaged
+            // texels instead of aliasing the full-res grain into a moiré. The
+            // averaging runs in linear light on the TRUE sensor data, and the
+            // WGSL's per-fragment tone/inversion applies after sampling — the
+            // same flatten-before-average ordering the CPU thumbnail bake uses.
+            let mips = build_mip_chain(&self.mono, self.width, self.height);
             let tex = device.create_texture(&cosmic::iced::wgpu::TextureDescriptor {
                 label: Some("exposure mono"),
                 size: cosmic::iced::wgpu::Extent3d {
@@ -892,7 +899,7 @@ impl Primitive for DetailPrimitive {
                     height: self.height,
                     depth_or_array_layers: 1,
                 },
-                mip_level_count: 1,
+                mip_level_count: mips.len() as u32,
                 sample_count: 1,
                 dimension: cosmic::iced::wgpu::TextureDimension::D2,
                 format: cosmic::iced::wgpu::TextureFormat::R16Float,
@@ -901,25 +908,27 @@ impl Primitive for DetailPrimitive {
                 view_formats: &[],
             });
 
-            queue.write_texture(
-                cosmic::iced::wgpu::TexelCopyTextureInfo {
-                    texture: &tex,
-                    mip_level: 0,
-                    origin: cosmic::iced::wgpu::Origin3d::ZERO,
-                    aspect: cosmic::iced::wgpu::TextureAspect::All,
-                },
-                &mono_to_half_bytes(&self.mono),
-                cosmic::iced::wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.width * 2),
-                    rows_per_image: Some(self.height),
-                },
-                cosmic::iced::wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            for (level, mip) in mips.iter().enumerate() {
+                queue.write_texture(
+                    cosmic::iced::wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: level as u32,
+                        origin: cosmic::iced::wgpu::Origin3d::ZERO,
+                        aspect: cosmic::iced::wgpu::TextureAspect::All,
+                    },
+                    &mip.data,
+                    cosmic::iced::wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(mip.width * 2),
+                        rows_per_image: Some(mip.height),
+                    },
+                    cosmic::iced::wgpu::Extent3d {
+                        width: mip.width,
+                        height: mip.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
 
             let texture_view =
                 tex.create_view(&cosmic::iced::wgpu::TextureViewDescriptor::default());
@@ -1169,6 +1178,12 @@ impl Pipeline for DetailPipeline {
             address_mode_v: cosmic::iced::wgpu::AddressMode::ClampToEdge,
             mag_filter: cosmic::iced::wgpu::FilterMode::Linear,
             min_filter: cosmic::iced::wgpu::FilterMode::Linear,
+            // Trilinear minification: the detail texture carries a full mip
+            // chain (see [`build_mip_chain`]), so zooming back out past the
+            // native level-up minifies through pre-filtered levels instead of
+            // aliasing the full-res grain into a moiré pattern. A no-op for the
+            // single-level tone LUT, which shares this sampler.
+            mipmap_filter: cosmic::iced::wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -1487,6 +1502,84 @@ fn mono_to_half_bytes(mono: &[f32]) -> Vec<u8> {
     half
 }
 
+/// One level of the detail texture's mip chain, ready for `write_texture`.
+struct MipLevel {
+    /// Mip width (`max(1, floor(parent/2))`, or the texture width at level 0).
+    width: u32,
+    /// Mip height, halving like the width.
+    height: u32,
+    /// Tightly packed `R16Float` (half) bytes: `width × height × 2`.
+    data: Vec<u8>,
+}
+
+/// Build the full mip chain for a linear mono texture: level 0 is the raw
+/// half-float upload, each level below is a 2×2 area-average (box) downsample
+/// of the previous in LINEAR light, halving to `max(1, floor(dim/2))` and
+/// stopping at 1×1. Edge blocks average only their real contributing texels.
+///
+/// The averaging happens on the TRUE sensor data before any tone mapping, so
+/// the WGSL's per-fragment curve/inversion — which samples the minified texels
+/// and THEN applies the tone — sees correctly pre-filtered values (the same
+/// flatten-before-average ordering the CPU thumbnail bake uses). Without this
+/// chain the single-level texture aliases the high-frequency grain into a
+/// moiré whenever the view minifies (notably after the native level-up installs
+/// an up-to-8192 texture and the user zooms back out to contain fit).
+fn build_mip_chain(mono: &[f32], width: u32, height: u32) -> Vec<MipLevel> {
+    let mut levels = Vec::new();
+    levels.push(MipLevel {
+        width,
+        height,
+        data: mono_to_half_bytes(mono),
+    });
+
+    let mut src = mono.to_vec();
+    let (mut w, mut h) = (width, height);
+    while w > 1 || h > 1 {
+        let (next, nw, nh) = downsample_half(&src, w, h);
+        levels.push(MipLevel {
+            width: nw,
+            height: nh,
+            data: mono_to_half_bytes(&next),
+        });
+        src = next;
+        w = nw;
+        h = nh;
+    }
+    levels
+}
+
+/// 2×2 area-average downsample of a mono buffer: output pixel `(x, y)` is the
+/// mean of the source's `2x`..`2x+2` × `2y`..`2y+2` block, clamped to the
+/// source bounds so odd-dimension edges average their actual texels.
+#[allow(clippy::cast_precision_loss)]
+fn downsample_half(mono: &[f32], width: u32, height: u32) -> (Vec<f32>, u32, u32) {
+    let out_w = u32::max(width / 2, 1);
+    let out_h = u32::max(height / 2, 1);
+    let mut out = vec![0.0_f32; out_w as usize * out_h as usize];
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let mut sum = 0.0_f32;
+            let mut count = 0_u32;
+            for dy in 0..2_u32 {
+                let sy = y * 2 + dy;
+                if sy >= height {
+                    continue;
+                }
+                for dx in 0..2_u32 {
+                    let sx = x * 2 + dx;
+                    if sx >= width {
+                        continue;
+                    }
+                    sum += mono[sy as usize * width as usize + sx as usize];
+                    count += 1;
+                }
+            }
+            out[y as usize * out_w as usize + x as usize] = sum / count as f32;
+        }
+    }
+    (out, out_w, out_h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1778,6 +1871,84 @@ mod tests {
         // For 1.0 we expect two bytes: 0x00 0x3C (little-endian u16 0x3C00).
         let bytes = mono_to_half_bytes(&[1.0]);
         assert_eq!(bytes, [0x00, 0x3c]);
+    }
+
+    #[test]
+    fn build_mip_chain_halves_dimensions_down_to_one() {
+        // A 2000×1000 buffer: levels halve per axis (floor) and the chain stops
+        // at 1×1. `floor(log2(2000)) + 1 = 11` levels (2000→1000→…→3→1).
+        let mono: Vec<f32> = vec![0.0; 2000 * 1000];
+        let mips = build_mip_chain(&mono, 2000, 1000);
+        assert_eq!(mips.len(), 11);
+        assert_eq!((mips[0].width, mips[0].height), (2000, 1000));
+        assert_eq!((mips[1].width, mips[1].height), (1000, 500));
+        assert_eq!((mips[2].width, mips[2].height), (500, 250));
+        assert_eq!((mips[3].width, mips[3].height), (250, 125));
+        assert_eq!((mips[4].width, mips[4].height), (125, 62));
+        assert_eq!(
+            (mips[10].width, mips[10].height),
+            (1, 1),
+            "last level is 1×1"
+        );
+        for mip in &mips {
+            assert_eq!(
+                mip.data.len(),
+                mip.width as usize * mip.height as usize * 2,
+                "tightly packed half bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn build_mip_chain_level0_is_the_raw_half_data() {
+        let mono: Vec<f32> = (0..100).map(|v| v as f32 / 99.0).collect();
+        let mips = build_mip_chain(&mono, 10, 10);
+        assert_eq!(mips[0].width, 10);
+        assert_eq!(mips[0].height, 10);
+        assert_eq!(mips[0].data, mono_to_half_bytes(&mono));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_mip_chain_box_averages_source_blocks_in_linear_light() {
+        // A 4×4 ramp: mip 1's (0,0) texel must be the mean of the base's 2×2
+        // top-left block, and (1,1) the mean of the 2×2 bottom-right block.
+        let mono: Vec<f32> = (0..16).map(|v| v as f32 / 15.0).collect();
+        let mips = build_mip_chain(&mono, 4, 4);
+        assert_eq!((mips[1].width, mips[1].height), (2, 2));
+
+        let decode = |mip: &MipLevel, x: u32, y: u32| {
+            let offset = (y as usize * mip.width as usize + x as usize) * 2;
+            half_to_f32(u16::from_le_bytes([mip.data[offset], mip.data[offset + 1]]))
+        };
+        let mean = |coords: &[(usize, usize)]| {
+            let sum: f32 = coords.iter().map(|&(x, y)| mono[y * 4 + x]).sum();
+            sum / coords.len() as f32
+        };
+        assert!((decode(&mips[1], 0, 0) - mean(&[(0, 0), (1, 0), (0, 1), (1, 1)])).abs() < 1e-3);
+        assert!((decode(&mips[1], 1, 1) - mean(&[(2, 2), (3, 2), (2, 3), (3, 3)])).abs() < 1e-3);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_mip_chain_handles_odd_dimensions() {
+        // A 3×2 buffer (row-major: [0,0.1,0.2, 0.3,0.4,0.5]) has no exact 2×2
+        // tiling: strict halving drops the odd column/row tail, so the single
+        // 1×1 mip 1 averages the 2×2 top-left block — 0.0, 0.1, 0.3, 0.4.
+        let mono: Vec<f32> = vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5];
+        let mips = build_mip_chain(&mono, 3, 2);
+        assert_eq!(mips.len(), 2);
+        assert_eq!((mips[1].width, mips[1].height), (1, 1));
+        let expected = (0.0 + 0.1 + 0.3 + 0.4) / 4.0;
+        let decoded = half_to_f32(u16::from_le_bytes([mips[1].data[0], mips[1].data[1]]));
+        assert!((decoded - expected).abs() < 1e-3);
+    }
+
+    #[test]
+    fn build_mip_chain_single_pixel_is_a_single_level() {
+        let mips = build_mip_chain(&[0.42], 1, 1);
+        assert_eq!(mips.len(), 1);
+        assert_eq!((mips[0].width, mips[0].height), (1, 1));
     }
 
     #[test]
