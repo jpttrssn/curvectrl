@@ -3,7 +3,7 @@ A keyboard-centric film roll library and non-destructive RAW editor focused on d
 
 - Manage your film rolls
 - Film inversion presets
-- Auto inversion per frame or choosen frame
+- Auto base/black-point per frame or choosen frame
 - Basic tone curve adjustments
 - Crop mode tuned for removing edges
 - Set and export original roll date with chronological frame order
