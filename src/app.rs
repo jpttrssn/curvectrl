@@ -235,6 +235,10 @@ pub struct AppModel {
     /// unnecessary (sensor already ≤ the overview size); guards the zoom
     /// trigger against re-spawning a level-up on every wheel event.
     detail_native_queued: bool,
+    /// Name of the frame whose detail decode failure was already logged for
+    /// the current selection, so wheel-driven re-decode retries of the same
+    /// (doomed) frame log once instead of once per notch.
+    detail_logged_failure: Option<String>,
     /// Current opacity of the thumbnail layer during crossfade (1.0→0.0).
     detail_thumb_opacity: f32,
     /// Timestamp of the last animation frame for framerate-independent fading.
@@ -625,10 +629,10 @@ pub enum Message {
     /// sensor-linear mono buffer for the GPU shader. Carries the preset the
     /// decode ran under so the LRU is keyed consistently with the buffer
     /// contents.
-    DetailReady(String, FilmPreset, Result<DetailDecode, ()>),
+    DetailReady(String, FilmPreset, Result<DetailDecode, String>),
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
-    DetailPreloaded(PathBuf, String, FilmPreset, Result<DetailDecode, ()>),
+    DetailPreloaded(PathBuf, String, FilmPreset, Result<DetailDecode, String>),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
@@ -1165,6 +1169,7 @@ impl cosmic::Application for AppModel {
             detail_shader: None,
             detail_inflight: None,
             detail_native_queued: false,
+            detail_logged_failure: None,
             detail_thumb_opacity: 1.0,
             detail_last_frame: None,
             detail_thumb: None,
@@ -3431,6 +3436,7 @@ impl AppModel {
         self.thumb_inflight.clear();
         self.detail_shader = None;
         self.detail_native_queued = false;
+        self.detail_logged_failure = None;
         self.detail_inflight = None;
         self.detail_preload_inflight.clear();
         self.detail_thumb = None;
@@ -3456,6 +3462,7 @@ impl AppModel {
         // the LRU, and the in-flight bookkeeping.
         self.detail_shader = None;
         self.detail_native_queued = false;
+        self.detail_logged_failure = None;
         self.detail_inflight = None;
         self.detail_preload_inflight.clear();
         self.detail_thumb = None;
@@ -3630,7 +3637,7 @@ impl AppModel {
         dir: &PathBuf,
         name: &str,
         preset: FilmPreset,
-        result: Result<DetailDecode, ()>,
+        result: Result<DetailDecode, String>,
     ) -> Task<cosmic::Action<Message>> {
         self.detail_preload_inflight
             .retain(|(pending_dir, pending_name)| pending_dir != dir || pending_name != name);
@@ -3729,6 +3736,7 @@ impl AppModel {
         self.detail_zoom = 1.0;
         self.detail_area_size = None;
         self.detail_native_queued = false;
+        self.detail_logged_failure = None;
         self.detail_pan = (0.0, 0.0);
         self.detail_panning = false;
         self.detail_cursor = None;
@@ -4166,7 +4174,7 @@ impl AppModel {
         &mut self,
         name: &str,
         preset: FilmPreset,
-        result: Result<DetailDecode, ()>,
+        result: Result<DetailDecode, String>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
             self.selected.as_deref(),
@@ -4274,11 +4282,19 @@ impl AppModel {
                         self.detail_native_queued = true;
                     }
                 }
-                Err(()) => {
+                Err(err) => {
                     detail_trace(format_args!(
                         "arrived err: {name}, fresh={fresh_open}, zoom={:.3}",
                         self.detail_zoom
                     ));
+                    // Wheel-driven re-decodes of the same failing frame land
+                    // here repeatedly; log the reason once per selection so an
+                    // undecodable file shows one clear line instead of one per
+                    // notch.
+                    if self.detail_logged_failure.as_deref() != Some(name) {
+                        eprintln!("detail decode failed for {name}: {err}");
+                        self.detail_logged_failure = Some(name.to_string());
+                    }
                 }
             }
             if fresh_open {
@@ -6457,11 +6473,11 @@ async fn decode_raw_detail(
     max_edge: u32,
     preset: FilmPreset,
     base_config: BaseConfig,
-) -> Result<DetailDecode, ()> {
+) -> Result<DetailDecode, String> {
     let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
-        let image = rawloader::decode_file(&path).map_err(|_| ())?;
+        let image = rawloader::decode_file(&path).map_err(|err| err.to_string())?;
 
         let width = usize::max(image.width, 1);
         let height = usize::max(image.height, 1);
@@ -6477,7 +6493,7 @@ async fn decode_raw_detail(
 
         let (mono, width, height) = if image.cpp >= 3 {
             if samples.len() < width * height * 3 {
-                return Err(());
+                return Err("decode produced too few samples for the pixel count".to_string());
             }
 
             let mut rgb = Vec::with_capacity(width * height * 3);
@@ -6491,7 +6507,7 @@ async fn decode_raw_detail(
             (luma(&rgb), width, height)
         } else {
             if samples.len() < width * height {
-                return Err(());
+                return Err("decode produced too few samples for the pixel count".to_string());
             }
 
             let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
@@ -6531,7 +6547,7 @@ async fn decode_raw_detail(
         })
     })
     .await
-    .unwrap_or(Err(()))
+    .unwrap_or(Err("raw decode thread panicked".to_string()))
 }
 
 /// Exports every listed frame into `dest` per the given options, sequentially,
@@ -6648,7 +6664,10 @@ async fn export_one(
         preset,
         base_config,
     )
-    .await?;
+    .await
+    .map_err(|err| {
+        eprintln!("export decode failed for {name}: {err}");
+    })?;
 
     // The crop margins are authored in display-upright source pixels; scale
     // them onto the (possibly downscaled) print. When the decode was already
@@ -6870,9 +6889,14 @@ where
     let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
-        rawloader::decode_file(&path)
-            .map_err(|_| ())
-            .and_then(|image| convert(&image))
+        let image = match rawloader::decode_file(&path) {
+            Ok(image) => image,
+            Err(err) => {
+                eprintln!("failed to decode {}: {err}", path.display());
+                return Err(());
+            }
+        };
+        convert(&image)
     })
     .await
     .unwrap_or(Err(()))
