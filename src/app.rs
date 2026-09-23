@@ -101,9 +101,12 @@ const CROP_MODE_PADDING: f32 = 100.0;
 const MAX_DETAIL_ZOOM: f32 = 7.0;
 
 /// Detail-view zoom (log2 units) at which the native hi-res decode is
-/// triggered. 2.0 = 2× contain: safely past the 2048 overview's own 1:1 on
-/// typical widgets, before the view has upscaled 2048 pixels far enough to
-/// look soft.
+/// prefetched on a preview whose 1:1 cap sits above it. 2.0 = 2× contain:
+/// safely past the 2048 overview's own 1:1 on typical widgets, before the
+/// view has upscaled 2048 pixels far enough to look soft. On larger previews
+/// the 1:1 cap can sit BELOW this — see [`AppModel::native_level_up_zoom`],
+/// which fires the level-up at the earlier of this threshold and the cap so
+/// the trigger is always reachable.
 const NATIVE_ZOOM_THRESHOLD: f32 = 2.0;
 
 /// wgpu's typical `max_texture_dimension_2d` ceiling. The native level-up
@@ -1921,8 +1924,10 @@ impl cosmic::Application for AppModel {
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_view(new_zoom, new_pan);
                 }
-                // Level up to native once the view crosses the threshold.
-                if self.detail_zoom >= NATIVE_ZOOM_THRESHOLD && !self.detail_native_queued {
+                // Level up to native once the view crosses the trigger zoom;
+                // the trigger adapts to the preview size so it always stays
+                // reachable (see `native_level_up_zoom`).
+                if self.detail_zoom >= self.native_level_up_zoom() && !self.detail_native_queued {
                     return self.decode_detail_next();
                 }
                 Task::none()
@@ -3491,8 +3496,10 @@ impl AppModel {
     ///
     /// Two progressive levels share the single in-flight slot: the 2048
     /// overview while the shader is absent, then a native-resolution re-decode
-    /// once the zoom crosses [`NATIVE_ZOOM_THRESHOLD`] — the flag makes the
-    /// level-up one-shot, and the inflight slot makes extra wheels no-ops.
+    /// once the zoom reaches the level-up trigger ([`Self::native_level_up_zoom`],
+    /// the earlier of the current texture's 1:1 cap and the fixed
+    /// [`NATIVE_ZOOM_THRESHOLD`]) — the flag makes the level-up one-shot, and
+    /// the inflight slot makes extra wheels no-ops.
     fn decode_detail_next(&mut self) -> Task<cosmic::Action<Message>> {
         if self.detail_inflight.is_some() || self.selected.is_none() {
             if self.detail_inflight.is_some() {
@@ -3777,6 +3784,30 @@ impl AppModel {
         shader
             .zoom_100(size.width, size.height, sf)
             .min(MAX_DETAIL_ZOOM)
+    }
+
+    /// The zoom (log2 units) at which the native hi-res level-up should fire:
+    /// the earlier of the current texture's 1:1 ("100%") cap and the fixed
+    /// [`NATIVE_ZOOM_THRESHOLD`].
+    ///
+    /// The cap term is what makes the trigger reachable on every layout: the
+    /// wheel clamps at `max_detail_zoom()`, so on a wide full-screen preview
+    /// (context drawer closed) the overview's 1:1 point can sit below 2.0 and
+    /// the fixed threshold alone could never be crossed. Firing at the cap is
+    /// exactly right there — the overview is already at 100% and the native
+    /// texture is what unlocks any deeper zooming.
+    fn native_level_up_zoom(&self) -> f32 {
+        Self::native_level_up_zoom_for(self.max_detail_zoom())
+    }
+
+    /// Pure fallback for [`Self::native_level_up_zoom`], testable without an
+    /// [`AppModel`]: the level-up fires at the earlier of the current 1:1 cap
+    /// (`cap`) and the fixed prefetch threshold. `cap`'s fallback path (no
+    /// shader or size yet) surfaces as [`MAX_DETAIL_ZOOM`], so this degrades
+    /// to exactly the old fixed-threshold trigger before the preview installs.
+    #[must_use]
+    fn native_level_up_zoom_for(cap: f32) -> f32 {
+        cap.min(NATIVE_ZOOM_THRESHOLD)
     }
 
     /// Recompute the 1:1 zoom cap and pull the current zoom down to it if it
@@ -4305,16 +4336,19 @@ impl AppModel {
 
             // Landing-time re-pump: a wheel taken while a decode was running
             // fired the trigger into an occupied slot and it was swallowed.
-            // If the user is already past the threshold once a decode lands,
-            // start the next level onto the just-freed slot — so zooming
-            // during the overview load still reaches native. Gated on the
-            // landing having succeeded: an error must not spin the slot.
-            if landed && !self.detail_native_queued && self.detail_zoom >= NATIVE_ZOOM_THRESHOLD {
-                detail_trace(format_args!(
-                    "landing re-pump: zoom {:.3} >= {NATIVE_ZOOM_THRESHOLD}",
-                    self.detail_zoom
-                ));
-                return self.decode_detail_next();
+            // If the user is already at/past the level-up zoom once a decode
+            // lands, start the next level onto the just-freed slot — so
+            // zooming during the overview load still reaches native. Gated on
+            // the landing having succeeded: an error must not spin the slot.
+            if landed && !self.detail_native_queued {
+                let trigger = self.native_level_up_zoom();
+                if self.detail_zoom >= trigger {
+                    detail_trace(format_args!(
+                        "landing re-pump: zoom {:.3} >= native level-up zoom {:.3}",
+                        self.detail_zoom, trigger
+                    ));
+                    return self.decode_detail_next();
+                }
             }
         } else {
             detail_trace(format_args!("arrived superseded: {name}"));
@@ -9206,6 +9240,29 @@ mod tests {
             apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
         assert_eq!(zoom, 1.0);
         assert_eq!(pan, (0.0, 0.0));
+    }
+
+    #[test]
+    fn native_level_up_zoom_fires_at_the_earlier_of_cap_and_threshold() {
+        // A preview whose 1:1 cap sits above the fixed threshold keeps the
+        // prefetch trigger: level up at 2× contain before reaching the cap.
+        assert_eq!(AppModel::native_level_up_zoom_for(5.0), NATIVE_ZOOM_THRESHOLD);
+        // A large full-screen preview (drawer closed) can put the overview's
+        // own 1:1 below 2.0; the trigger must fall back to that cap, otherwise
+        // zooming (clamped at 1:1) could never reach the fixed threshold and
+        // the native level-up would never fire.
+        assert_eq!(AppModel::native_level_up_zoom_for(1.4), 1.4);
+        assert_eq!(AppModel::native_level_up_zoom_for(1.0), 1.0);
+        // The no-shader/no-size fallback cap (MAX_DETAIL_ZOOM) degrades to the
+        // fixed threshold, exactly the pre-install behavior.
+        assert_eq!(
+            AppModel::native_level_up_zoom_for(MAX_DETAIL_ZOOM),
+            NATIVE_ZOOM_THRESHOLD
+        );
+        assert!(
+            AppModel::native_level_up_zoom_for(1.4) < NATIVE_ZOOM_THRESHOLD,
+            "below-cap previews must fire strictly before the fixed threshold"
+        );
     }
 
     #[test]
