@@ -78,6 +78,7 @@ export-choice-label = Format
 export-choice-jpeg-90 = JPEG 90% full-res
 export-choice-jpeg-82 = JPEG 82% 2048
 export-choice-png-16 = 16-bit PNG full-res
+detail-loading = Loading high-resolution image
 frame-info-loading = Loading…
 frame-info-unavailable = No metadata available
 frame-dimensions = Dimensions: {$dimensions}

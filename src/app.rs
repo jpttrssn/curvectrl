@@ -1398,8 +1398,8 @@ impl cosmic::Application for AppModel {
         // The editing drawer is no longer toggled from a header button — it
         // opens automatically with the detail view (see `open_frame`) and is
         // hidden/revealed by the Space context-drawer toggle — so the header
-        // end packs only the search control and (while a batch runs) the
-        // export progress ring.
+        // end packs only the search control, the detail loading spinner, and
+        // (while a batch runs) the export progress ring.
 
         // Search is library-only: it filters roll names and dates on the
         // library page and is hidden entirely while a roll is open (the frame
@@ -1424,6 +1424,24 @@ impl cosmic::Application for AppModel {
                     .into()
             };
             end.push(search);
+        }
+
+        // The detail-view loading spinner sits at the far right of the header:
+        // an indeterminate circular throbber that turns on while any hi-res
+        // decode runs for the open detail view — the 2048 overview on open and
+        // the native level-up on zoom — and off the moment that decode lands
+        // or supersedes. Zero screen space when idle, matching the export ring
+        // beside it. `selected` also gates it: `detail_inflight` is NOT cleared
+        // when Escape closes the view (only roll-close does), so this keeps a
+        // decode still in flight from spinning forever on the grid below.
+        if self.selected.is_some() && self.detail_inflight.is_some() {
+            let spinner = cosmic::widget::indeterminate_circular().size(18.0);
+            let spinner = cosmic::widget::tooltip(
+                spinner,
+                widget::text(fl!("detail-loading")),
+                cosmic::widget::tooltip::Position::Bottom,
+            );
+            end.push(spinner.into());
         }
 
         // The COSMIC-Files-style export indicator sits at the far right of the
