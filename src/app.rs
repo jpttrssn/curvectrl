@@ -133,7 +133,20 @@ const SEARCH_DEBOUNCE_MS: u64 = 300;
 // Keep the handful of independent state flags as plain bools: they gate
 // mutually-unrelated behavior (multi-select, detail decode levels, crop mask,
 // export, async decode failures, overwrite dialog), so a shared bitmask or
-// nested structs would only obscure each flag's meaning.
+/// Detail-view zoom in `log2` units: `1.0` = contain fit (the whole frame),
+/// each `+1` doubles the rendered scale. Newtyped so a zoom (a `log2` of a
+/// scale factor) is never confused with a pixel or length value; `.0` is the
+/// raw `f32`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Zoom(pub(crate) f32);
+
+impl Zoom {
+    /// Contain fit: the whole frame visible.
+    const CONTAIN: Self = Self(1.0);
+}
+
+// The many feature flags on the model are mutually exclusive by message
+// routing; grouping them would only obscure each flag's meaning.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct AppModel {
     /// Application state which is managed by the COSMIC runtime.
@@ -260,12 +273,12 @@ pub(crate) struct AppModel {
     pub(crate) detail_thumb: Option<Handle>,
     /// Detail-view zoom in `log2` units: 1.0 = contain fit (whole frame),
     /// each +1 doubles the rendered scale.
-    detail_zoom: f32,
+    detail_zoom: Zoom,
     /// The detail preview's laid-out logical size, reported by `DetailArea`
     /// via `DetailAreaResized`; drives the 1:1 ("100%") zoom cap.
     detail_area_size: Option<Size>,
     /// Pan offset of the image center from the widget center (logical points).
-    detail_pan: (f32, f32),
+    pub(crate) detail_pan: Point,
     /// True while the user is pressing/dragging the detail preview (grab-pan).
     detail_panning: bool,
     /// Most recent cursor position over the detail preview, widget-relative
@@ -995,9 +1008,9 @@ impl cosmic::Application for AppModel {
             detail_thumb_opacity: 1.0,
             detail_last_frame: None,
             detail_thumb: None,
-            detail_zoom: 1.0,
+            detail_zoom: Zoom::CONTAIN,
             detail_area_size: None,
-            detail_pan: (0.0, 0.0),
+            detail_pan: Point::default(),
             detail_panning: false,
             detail_cursor: None,
             curve_contrast: 1.0,
@@ -1750,13 +1763,13 @@ impl cosmic::Application for AppModel {
 
             Message::DetailZoom(delta) => {
                 let (new_zoom, new_pan) = apply_detail_zoom(
-                    self.detail_zoom,
+                    self.detail_zoom.0,
                     self.detail_pan,
                     self.detail_cursor,
                     delta,
                     self.max_detail_zoom_for_wheel(),
                 );
-                self.detail_zoom = new_zoom;
+                self.detail_zoom = Zoom(new_zoom);
                 self.detail_pan = new_pan;
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_view(new_zoom, new_pan);
@@ -1768,7 +1781,7 @@ impl cosmic::Application for AppModel {
                 // (up to the projected native cap) from re-entering the busy
                 // slot — the landing re-pump covers a zoom taken mid-load.
                 if self.detail_inflight.is_none()
-                    && self.detail_zoom >= self.native_level_up_zoom()
+                    && self.detail_zoom.0 >= self.native_level_up_zoom()
                     && !self.detail_native_queued
                 {
                     return self.decode_detail_next();
@@ -1795,10 +1808,10 @@ impl cosmic::Application for AppModel {
                 {
                     // Grab-pan: the image follows the cursor 1:1 in logical
                     // points, independent of zoom.
-                    self.detail_pan.0 += pt.x - prev.x;
-                    self.detail_pan.1 += pt.y - prev.y;
+                    self.detail_pan.x += pt.x - prev.x;
+                    self.detail_pan.y += pt.y - prev.y;
                     if let Some(shader) = &mut self.detail_shader {
-                        shader.set_view(self.detail_zoom, self.detail_pan);
+                        shader.set_view(self.detail_zoom.0, self.detail_pan);
                     }
                 }
                 Task::none()
@@ -3349,7 +3362,7 @@ impl AppModel {
             if self.detail_inflight.is_some() {
                 detail_trace(format_args!(
                     "trigger swallowed: inflight slot busy (zoom={:.3})",
-                    self.detail_zoom
+                    self.detail_zoom.0
                 ));
             }
             return Task::none();
@@ -3371,7 +3384,7 @@ impl AppModel {
         } else {
             detail_trace(format_args!(
                 "trigger swallowed: native already queued (zoom={:.3})",
-                self.detail_zoom
+                self.detail_zoom.0
             ));
             return Task::none();
         };
@@ -3413,7 +3426,7 @@ impl AppModel {
         detail_trace(format_args!(
             "trigger fire: cap={cap}, shader={}, zoom={:.3}",
             self.detail_shader.is_some(),
-            self.detail_zoom
+            self.detail_zoom.0
         ));
 
         self.detail_inflight = Some(name.clone());
@@ -3454,7 +3467,7 @@ impl AppModel {
             inversion,
         ));
         if let Some(shader) = &mut self.detail_shader {
-            shader.set_view(self.detail_zoom, self.detail_pan);
+            shader.set_view(self.detail_zoom.0, self.detail_pan);
             shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
             shader.set_crop(self.crop);
             shader.set_rotation(self.rotation);
@@ -3583,11 +3596,11 @@ impl AppModel {
         self.detail_thumb_opacity = 1.0;
         self.detail_last_frame = None;
         self.detail_thumb = None;
-        self.detail_zoom = 1.0;
+        self.detail_zoom = Zoom::CONTAIN;
         self.detail_area_size = None;
         self.detail_native_queued = false;
         self.detail_logged_failure = None;
-        self.detail_pan = (0.0, 0.0);
+        self.detail_pan = Point::default();
         self.detail_panning = false;
         self.detail_cursor = None;
         // Any held editing key is dead once the detail view (and its edit
@@ -3692,10 +3705,10 @@ impl AppModel {
     /// to the shader so the render and state agree.
     fn reclamp_detail_zoom(&mut self) {
         let max = self.max_detail_zoom_for_wheel();
-        if self.detail_zoom > max {
-            self.detail_zoom = max;
+        if self.detail_zoom.0 > max {
+            self.detail_zoom = Zoom(max);
             if let Some(shader) = &mut self.detail_shader {
-                shader.set_view(self.detail_zoom, self.detail_pan);
+                shader.set_view(self.detail_zoom.0, self.detail_pan);
             }
         }
     }
@@ -4111,7 +4124,7 @@ impl AppModel {
                     landed = true;
                     detail_trace(format_args!(
                         "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
-                        width, height, self.detail_zoom
+                        width, height, self.detail_zoom.0
                     ));
                     // Stash a fresh overview decode into the LRU so returning
                     // to this frame is instant. Only the level-1 overview is
@@ -4164,7 +4177,7 @@ impl AppModel {
                     // Carry over any zoom/pan the user applied while the decode
                     // was in flight (the program starts at contain fit).
                     if let Some(shader) = &mut self.detail_shader {
-                        shader.set_view(self.detail_zoom, self.detail_pan);
+                        shader.set_view(self.detail_zoom.0, self.detail_pan);
                         shader.set_curve(
                             self.curve_contrast,
                             self.curve_rolloff,
@@ -4199,7 +4212,7 @@ impl AppModel {
                 Err(err) => {
                     detail_trace(format_args!(
                         "arrived err: {name}, fresh={fresh_open}, zoom={:.3}",
-                        self.detail_zoom
+                        self.detail_zoom.0
                     ));
                     // Wheel-driven re-decodes of the same failing frame land
                     // here repeatedly; log the reason once per selection so an
@@ -4225,10 +4238,10 @@ impl AppModel {
             // the landing having succeeded: an error must not spin the slot.
             if landed && !self.detail_native_queued {
                 let trigger = self.native_level_up_zoom();
-                if self.detail_zoom >= trigger {
+                if self.detail_zoom.0 >= trigger {
                     detail_trace(format_args!(
                         "landing re-pump: zoom {:.3} >= native level-up zoom {:.3}",
-                        self.detail_zoom, trigger
+                        self.detail_zoom.0, trigger
                     ));
                     return self.decode_detail_next();
                 }
@@ -4558,16 +4571,16 @@ pub(crate) fn detail_zoom_delta(delta: cosmic::iced::mouse::ScrollDelta) -> f32 
 /// the new `(zoom, pan)`.
 fn apply_detail_zoom(
     zoom: f32,
-    pan: (f32, f32),
+    pan: Point,
     cursor: Option<Point>,
     delta: f32,
     max_zoom: f32,
-) -> (f32, (f32, f32)) {
+) -> (f32, Point) {
     let new_zoom = (zoom + delta).clamp(1.0, max_zoom);
     // At contain fit the whole frame must be centered. `zoom + delta <= 1.0`
     // is equivalent to `new_zoom == 1.0` because of the clamp above.
     let new_pan = if zoom + delta <= 1.0 {
-        (0.0, 0.0)
+        Point::default()
     } else {
         cursor.map_or(pan, |cursor| zoom_about_anchor(zoom, new_zoom, pan, cursor))
     };
@@ -4582,12 +4595,12 @@ fn apply_detail_zoom(
 /// `off1 = off0 + (1 - 2^(z1-z0)) * (cursor - off0)`.
 /// Both `pan` and `cursor` are relative to the widget center; the widget
 /// center itself never enters the formula.
-fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: (f32, f32), cursor: Point) -> (f32, f32) {
+fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: Point, cursor: Point) -> Point {
     let ratio = (zoom_new - zoom_old).exp2();
     let k = 1.0 - ratio;
-    (
-        pan.0 + k * (cursor.x - pan.0),
-        pan.1 + k * (cursor.y - pan.1),
+    Point::new(
+        pan.x + k * (cursor.x - pan.x),
+        pan.y + k * (cursor.y - pan.y),
     )
 }
 
@@ -5720,9 +5733,9 @@ mod tests {
 
     #[test]
     fn apply_detail_zoom_clamps_at_both_ends() {
-        let (zoom, _) = apply_detail_zoom(1.0, (0.0, 0.0), None, -1.0, MAX_DETAIL_ZOOM);
+        let (zoom, _) = apply_detail_zoom(1.0, Point::default(), None, -1.0, MAX_DETAIL_ZOOM);
         assert_eq!(zoom, 1.0);
-        let (zoom, _) = apply_detail_zoom(MAX_DETAIL_ZOOM, (0.0, 0.0), None, 9.0, MAX_DETAIL_ZOOM);
+        let (zoom, _) = apply_detail_zoom(MAX_DETAIL_ZOOM, Point::default(), None, 9.0, MAX_DETAIL_ZOOM);
         assert_eq!(zoom, MAX_DETAIL_ZOOM);
     }
 
@@ -5731,27 +5744,27 @@ mod tests {
         // The 1:1 cap is the maximum: zooming past it stops there, and the cap
         // itself is respected even when below MAX_DETAIL_ZOOM.
         let cap = 4.25;
-        let (zoom, _) = apply_detail_zoom(4.0, (0.0, 0.0), None, 9.0, cap);
+        let (zoom, _) = apply_detail_zoom(4.0, Point::default(), None, 9.0, cap);
         assert_eq!(zoom, cap);
         // A cap below the current zoom clamps back down to it.
-        let (zoom, _) = apply_detail_zoom(6.0, (0.0, 0.0), None, 0.0, cap);
+        let (zoom, _) = apply_detail_zoom(6.0, Point::default(), None, 0.0, cap);
         assert_eq!(zoom, cap);
     }
 
     #[test]
     fn apply_detail_zoom_returns_unchanged_pan_without_cursor() {
-        let (zoom, pan) = apply_detail_zoom(2.0, (13.0, -7.0), None, 0.5, 8.0);
+        let (zoom, pan) = apply_detail_zoom(2.0, Point::new(13.0, -7.0), None, 0.5, 8.0);
         assert!((zoom - 2.5).abs() < 1e-6);
-        assert_eq!(pan, (13.0, -7.0));
+        assert_eq!(pan, Point::new(13.0, -7.0));
     }
 
     #[test]
     fn apply_detail_zoom_recenters_when_back_to_contain_fit() {
         // Zooming all the way out must give the centered contain view.
         let (zoom, pan) =
-            apply_detail_zoom(3.0, (50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
+            apply_detail_zoom(3.0, Point::new(50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
         assert_eq!(zoom, 1.0);
-        assert_eq!(pan, (0.0, 0.0));
+        assert_eq!(pan, Point::default());
     }
 
     #[test]
@@ -5781,30 +5794,30 @@ mod tests {
     fn zoom_about_anchor_round_trips() {
         // Zooming in then back out at the same cursor must return the exact
         // original pan (the anchored image point is pinned in both steps).
-        let pan = (5.0, 6.0);
+        let pan = Point::new(5.0, 6.0);
         let cursor = Point::new(-9.0, 4.0);
         let zoomed = zoom_about_anchor(2.0, 3.0, pan, cursor);
         let back = zoom_about_anchor(3.0, 2.0, zoomed, cursor);
-        assert!((back.0 - pan.0).abs() < 1e-5);
-        assert!((back.1 - pan.1).abs() < 1e-5);
+        assert!((back.x - pan.x).abs() < 1e-5);
+        assert!((back.y - pan.y).abs() < 1e-5);
     }
 
     #[test]
     fn zoom_about_anchor_keeps_center_pinned_when_cursor_is_center() {
         // Zooming about the image center (cursor == pan) leaves the pan
         // unchanged: center of the frame stays center of the widget.
-        let pan = (12.0, -8.0);
+        let pan = Point::new(12.0, -8.0);
         let out = zoom_about_anchor(2.0, 4.0, pan, Point::new(12.0, -8.0));
-        assert!((out.0 - pan.0).abs() < 1e-5);
-        assert!((out.1 - pan.1).abs() < 1e-5);
+        assert!((out.x - pan.x).abs() < 1e-5);
+        assert!((out.y - pan.y).abs() < 1e-5);
     }
 
     #[test]
     fn zoom_about_anchor_is_identity_at_delta_zero() {
-        let pan = (5.0, 6.0);
+        let pan = Point::new(5.0, 6.0);
         let out = zoom_about_anchor(2.0, 2.0, pan, Point::new(-9.0, 4.0));
-        assert!((out.0 - pan.0).abs() < 1e-6);
-        assert!((out.1 - pan.1).abs() < 1e-6);
+        assert!((out.x - pan.x).abs() < 1e-6);
+        assert!((out.y - pan.y).abs() < 1e-6);
     }
 
     #[test]

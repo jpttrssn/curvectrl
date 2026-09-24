@@ -42,7 +42,7 @@ pub struct DetailProgram {
     zoom: f32,
     /// Pan offset of the image center from the widget center, in logical
     /// points; converted to physical pixels on the GPU side.
-    pan: (f32, f32),
+    pan: cosmic::iced::Point,
     /// Median of the uploaded positive: the mid-gray the contrast curve
     /// pivots around. Measured once at construction from `mono`.
     mid: f32,
@@ -198,7 +198,7 @@ impl DetailProgram {
             src_h,
             exposure,
             zoom: 1.0,
-            pan: (0.0, 0.0),
+            pan: cosmic::iced::Point::default(),
             mid,
             white,
             shadow,
@@ -261,7 +261,7 @@ impl DetailProgram {
     ///
     /// `zoom` is in `log2` units (1.0 = contain fit). `pan` is in logical
     /// points relative to the widget center.
-    pub fn set_view(&mut self, zoom: f32, pan: (f32, f32)) {
+    pub fn set_view(&mut self, zoom: f32, pan: cosmic::iced::Point) {
         self.zoom = zoom;
         self.pan = pan;
     }
@@ -848,7 +848,7 @@ pub struct DetailPrimitive {
     /// Detail-view zoom in `log2` units; 1.0 = contain fit.
     zoom: f32,
     /// Pan offset of the image center from the widget center (logical points).
-    pan: (f32, f32),
+    pan: cosmic::iced::Point,
     /// Live source-pixel crop margins removed from each edge (uniform UV-remap).
     crop: CropMargins,
     /// User display rotation (cumulative CCW 90° quarter-turns, `0`…`3`),
@@ -1069,8 +1069,8 @@ impl Primitive for DetailPrimitive {
             // pan in logical points converted to physical pixels, same
             // convention as the scissor rect above.
             zoom: self.zoom,
-            pan_x: self.pan.0 * sf,
-            pan_y: self.pan.1 * sf,
+            pan_x: self.pan.x * sf,
+            pan_y: self.pan.y * sf,
             crop_l,
             crop_t,
             crop_w,
