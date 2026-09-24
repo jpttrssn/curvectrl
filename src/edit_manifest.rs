@@ -220,7 +220,7 @@ pub struct RollManifest {
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
-            version: 9,
+            version: 1,
             name: None,
             edits: HashMap::new(),
             preset: None,
@@ -547,23 +547,13 @@ pub fn manifest_path(dir: &Path) -> PathBuf {
 /// A missing manifest maps to a default roll. An unreadable or malformed
 /// manifest likewise falls back to a default roll and is reported to stderr,
 /// so a broken file never blocks scanning the library.
-///
-/// Legacy manifests are migrated on load: the pre-v9 base strategy (a v7
-/// `base_auto = true` toggle or a v8 `auto-per-frame`/`auto-selected-frame`
-/// preset key) becomes the `hp5` film plus the matching [`BaseMode`], the base
-/// strategy now a separate roll-level choice. The older numeric `base`
-/// calibration is preserved verbatim (it remains the `AutoSelectedFrame` black
-/// point).
 #[must_use]
 pub fn load_roll_manifest(dir: &Path) -> RollManifest {
     let path = manifest_path(dir);
     match std::fs::read(&path) {
         Ok(bytes) => match std::str::from_utf8(&bytes) {
             Ok(text) => match toml::from_str(text) {
-                Ok(mut manifest) => {
-                    migrate_legacy_base_auto(&mut manifest, text);
-                    manifest
-                }
+                Ok(manifest) => manifest,
                 Err(err) => {
                     eprintln!("malformed edit manifest {}: {err}", path.display());
                     RollManifest::default()
@@ -578,48 +568,6 @@ pub fn load_roll_manifest(dir: &Path) -> RollManifest {
         Err(err) => {
             eprintln!("failed to read edit manifest {}: {err}", path.display());
             RollManifest::default()
-        }
-    }
-}
-
-/// Migrates pre-v9 manifests to the two-axis model: the film preset and the
-/// base strategy are now separate choices.
-///
-/// Before v8 the `base_auto` toggle lived beside the preset; v8 folded it into
-/// the preset choice as `auto-per-frame`/`auto-selected-frame` keys; v9 splits
-/// the base strategy back out into its own `base_mode` field, so the auto keys
-/// migrate to the HP5+ film (the stock the auto modes always implied) plus the
-/// matching base mode. The older numeric `base` calibration is preserved
-/// verbatim (it remains the `AutoSelectedFrame` black point).
-fn migrate_legacy_base_auto(manifest: &mut RollManifest, text: &str) {
-    if manifest.version >= 9 {
-        return;
-    }
-    // v8 auto presets → the HP5+ film + the matching base mode.
-    match manifest.preset.as_deref() {
-        Some("auto-per-frame") => {
-            manifest.preset = Some(FilmPreset::Hp5Plus.choice_key().to_owned());
-            manifest.base_mode = Some(BaseMode::AutoPerFrame.choice_key().to_owned());
-        }
-        Some("auto-selected-frame") => {
-            manifest.preset = Some(FilmPreset::Hp5Plus.choice_key().to_owned());
-            manifest.base_mode = Some(BaseMode::AutoSelectedFrame.choice_key().to_owned());
-        }
-        _ => {}
-    }
-    // v7 (or older) `base_auto` opt-in → the auto-per-frame base mode.
-    let legacy_auto = match toml::from_str::<toml::Value>(text) {
-        Ok(value) => value
-            .get("base_auto")
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false),
-        Err(_) => false,
-    };
-    if legacy_auto {
-        manifest.base_mode = Some(BaseMode::AutoPerFrame.choice_key().to_owned());
-        // Ensure a film is chosen to carry the inversion (HP5+, as before).
-        if manifest.preset().stock().is_none() {
-            manifest.preset = Some(FilmPreset::Hp5Plus.choice_key().to_owned());
         }
     }
 }
@@ -701,7 +649,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, RollManifest::default());
-        assert_eq!(loaded.version, 9);
+        assert_eq!(loaded.version, 1);
     }
 
     #[test]
@@ -797,9 +745,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.tone("a.DNG").exposure_ev, 1.5);
-        // The on-disk version (`version = 1`) is preserved: loading tolerates
-        // unknown fields AND older schema versions, so a v1 manifest is read
-        // as a v1 manifest.
+        // The on-disk version is preserved verbatim: loading tolerates unknown
+        // fields, so a hand-edited manifest survives a round trip.
         assert_eq!(loaded.version, 1);
     }
 
@@ -997,7 +944,7 @@ mod tests {
     fn legacy_manifest_without_crop_loads_zero_margins() {
         let dir = temp_dir("legacy-crop");
         std::fs::create_dir_all(&dir).unwrap();
-        // A v1 manifest scripted before the crop field ever existed.
+        // A manifest without the crop field.
         std::fs::write(
             manifest_path(&dir),
             "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
@@ -1053,10 +1000,10 @@ mod tests {
     fn legacy_manifest_without_rotation_loads_zero() {
         let dir = temp_dir("legacy-rotation");
         std::fs::create_dir_all(&dir).unwrap();
-        // A v1 manifest scripted before the rotation field ever existed.
+        // A manifest without the rotation field.
         std::fs::write(
             manifest_path(&dir),
-            "version = 4\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
         )
         .unwrap();
 
@@ -1164,7 +1111,7 @@ mod tests {
 
         let dir = temp_dir("preset-absent");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(manifest_path(&dir), "version = 5\n").unwrap();
+        std::fs::write(manifest_path(&dir), "version = 1\n").unwrap();
 
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1205,7 +1152,7 @@ mod tests {
     fn unknown_preset_key_resolves_to_default() {
         let dir = temp_dir("preset-unknown");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(manifest_path(&dir), "version = 5\npreset = \"delta\"\n").unwrap();
+        std::fs::write(manifest_path(&dir), "version = 1\npreset = \"delta\"\n").unwrap();
 
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1217,7 +1164,7 @@ mod tests {
     fn preset_key_string_loads_verbatim() {
         let dir = temp_dir("preset-key");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(manifest_path(&dir), "version = 5\npreset = \"hp5\"\n").unwrap();
+        std::fs::write(manifest_path(&dir), "version = 1\npreset = \"hp5\"\n").unwrap();
 
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1283,17 +1230,17 @@ mod tests {
     fn legacy_manifest_without_base_loads_preset_default() {
         let dir = temp_dir("legacy-base");
         std::fs::create_dir_all(&dir).unwrap();
-        // A v5 manifest predating the base fields.
+        // A manifest without the base fields.
         std::fs::write(
             manifest_path(&dir),
-            "version = 5\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
         )
         .unwrap();
 
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.version, 5, "older schema versions load verbatim");
+        assert_eq!(loaded.version, 1, "the on-disk version is preserved");
         assert_eq!(loaded.calibrated_base(), None);
         assert_eq!(loaded.calibration_frame(), None);
         assert_eq!(loaded.base_mode(), BaseMode::Preset);
@@ -1301,30 +1248,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_base_auto_migrates_to_the_auto_per_frame_base_mode() {
-        let dir = temp_dir("legacy-auto");
-        std::fs::create_dir_all(&dir).unwrap();
-        // A v7 manifest with the pre-v8 per-frame auto opt-in.
-        std::fs::write(
-            manifest_path(&dir),
-            "version = 7\npreset = \"hp5\"\nbase_auto = true\n",
-        )
-        .unwrap();
-
-        let loaded = load_roll_manifest(&dir);
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
-        assert_eq!(loaded.base_mode(), BaseMode::AutoPerFrame);
-    }
-
-    #[test]
-    fn legacy_manifest_without_auto_keeps_its_preset() {
+    fn manifest_without_a_base_mode_keeps_its_preset() {
         let dir = temp_dir("legacy-no-auto");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             manifest_path(&dir),
-            "version = 7\npreset = \"hp5\"\nbase = 0.71\n",
+            "version = 1\npreset = \"hp5\"\nbase = 0.71\n",
         )
         .unwrap();
 
@@ -1334,35 +1263,6 @@ mod tests {
         assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
         assert_eq!(loaded.base_mode(), BaseMode::Preset);
         assert_eq!(loaded.calibrated_base(), Some(0.71));
-    }
-
-    #[test]
-    fn v8_auto_presets_migrate_to_film_plus_base_mode() {
-        // v8 folded the base strategy into the preset choice as auto keys; v9
-        // splits them back out, so the auto keys become the HP5+ film (the stock
-        // they always implied) plus the matching base mode.
-        for (auto_key, film, mode) in [
-            ("auto-per-frame", FilmPreset::Hp5Plus, BaseMode::AutoPerFrame),
-            (
-                "auto-selected-frame",
-                FilmPreset::Hp5Plus,
-                BaseMode::AutoSelectedFrame,
-            ),
-        ] {
-            let dir = temp_dir("v8-auto");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                manifest_path(&dir),
-                format!("version = 8\npreset = \"{auto_key}\"\n"),
-            )
-            .unwrap();
-
-            let loaded = load_roll_manifest(&dir);
-            std::fs::remove_dir_all(&dir).unwrap();
-
-            assert_eq!(loaded.preset(), film, "key {auto_key} migrates the film");
-            assert_eq!(loaded.base_mode(), mode, "key {auto_key} migrates the base mode");
-        }
     }
 
     #[test]
