@@ -385,7 +385,7 @@ pub(crate) async fn export_one(
     )
     .await
     .map_err(|err| {
-        eprintln!("export decode failed for {name}: {err}");
+        log::error!("export decode failed for {name}: {err}");
         err
     })?;
 

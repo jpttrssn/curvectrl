@@ -2124,7 +2124,7 @@ impl cosmic::Application for AppModel {
                         if manifest.calibration_frame().is_none() {
                             manifest.set_calibration_frame(&first);
                             if let Err(err) = edit_manifest::save_roll_manifest(&dir, &manifest) {
-                                eprintln!(
+                                log::error!(
                                     "failed to write roll manifest {}: {err}",
                                     edit_manifest::manifest_path(&dir).display()
                                 );
@@ -2147,7 +2147,7 @@ impl cosmic::Application for AppModel {
                     {
                         manifest.clear_calibration();
                         if let Err(err) = edit_manifest::save_roll_manifest(&dir, &manifest) {
-                            eprintln!(
+                            log::error!(
                                 "failed to write roll manifest {}: {err}",
                                 edit_manifest::manifest_path(&dir).display()
                             );
@@ -2674,7 +2674,7 @@ impl cosmic::Application for AppModel {
             Message::LaunchUrl(url) => match open::that_detached(&url) {
                 Ok(()) => Task::none(),
                 Err(err) => {
-                    eprintln!("failed to open {url:?}: {err}");
+                    log::error!("failed to open {url:?}: {err}");
                     Task::none()
                 }
             },
@@ -3246,7 +3246,7 @@ impl AppModel {
             None => manifest.base = None,
         }
         if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-            eprintln!(
+            log::error!(
                 "failed to write roll manifest {}: {err}",
                 edit_manifest::manifest_path(dir).display()
             );
@@ -3810,7 +3810,7 @@ impl AppModel {
             return;
         };
         if let Err(err) = edit_manifest::save_roll_manifest(dir, &self.roll) {
-            eprintln!("failed to save edits: {err}");
+            log::error!("failed to save edits: {err}");
         }
     }
 
@@ -3822,7 +3822,7 @@ impl AppModel {
             return;
         };
         if let Err(err) = self.config.write_entry(&context) {
-            eprintln!("failed to save config: {err}");
+            log::error!("failed to save config: {err}");
         }
     }
 
@@ -4219,7 +4219,7 @@ impl AppModel {
                     // undecodable file shows one clear line instead of one per
                     // notch.
                     if self.detail_logged_failure.as_deref() != Some(name) {
-                        eprintln!("detail decode failed for {name}: {err}");
+                        log::error!("detail decode failed for {name}: {err}");
                         self.detail_logged_failure = Some(name.to_string());
                     }
                 }
@@ -4260,26 +4260,20 @@ impl AppModel {
     }
 }
 
-/// Logs a detail-pump trace line while `EXPOSURE_TRACE_DETAIL` is set.
-///
-/// Gated on the env var (read per call, so the default build pays nothing)
-/// and allocation-free via [`std::fmt::Arguments`]; used to diagnose the
-/// progressive two-level detail decode — trigger fire/swallow, arrival, and
-/// landing re-pump.
+/// Logs a detail-pump trace line (`RUST_LOG`-gated trace level; the
+/// `EXPOSURE_TRACE_DETAIL` knob forces it). Allocation-free via
+/// [`std::fmt::Arguments`]; used to diagnose the progressive two-level detail
+/// decode — trigger fire/swallow, arrival, and landing re-pump.
 fn detail_trace(args: std::fmt::Arguments<'_>) {
-    if std::env::var("EXPOSURE_TRACE_DETAIL").is_ok() {
-        eprintln!("[detail] {args}");
-    }
+    log::trace!("[detail] {args}");
 }
 
-/// Logs a thumbnail re-bake / frame-decode trace line while
-/// `EXPOSURE_TRACE_REBAKE` is set. Mirrors the `detail_trace` gate so the
-/// default build pays nothing; used to diagnose why a committed edit (crop or
-/// tone) is not showing up in the grid thumbnail / roll cover.
+/// Logs a thumbnail re-bake / frame-decode trace line (the `EXPOSURE_TRACE_REBAKE`
+/// knob forces the trace level). Mirrors `detail_trace`; used to diagnose why a
+/// committed edit (crop or tone) is not showing up in the grid thumbnail / roll
+/// cover.
 fn rebake_trace(args: std::fmt::Arguments<'_>) {
-    if std::env::var("EXPOSURE_TRACE_REBAKE").is_ok() {
-        eprintln!("[rebake] {args}");
-    }
+    log::trace!("[rebake] {args}");
 }
 
 /// Loads one roll's metadata: display name (manifest label, falling back to
@@ -4922,7 +4916,7 @@ where
         let image = match rawloader::decode_file(&path) {
             Ok(image) => image,
             Err(err) => {
-                eprintln!("failed to decode {}: {err}", path.display());
+                log::error!("failed to decode {}: {err}", path.display());
                 return Err(FrameError::Decode {
                     path,
                     message: err.to_string(),

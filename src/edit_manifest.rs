@@ -555,18 +555,18 @@ pub fn load_roll_manifest(dir: &Path) -> RollManifest {
             Ok(text) => match toml::from_str(text) {
                 Ok(manifest) => manifest,
                 Err(err) => {
-                    eprintln!("malformed edit manifest {}: {err}", path.display());
+                    log::error!("malformed edit manifest {}: {err}", path.display());
                     RollManifest::default()
                 }
             },
             Err(err) => {
-                eprintln!("non-UTF-8 edit manifest {}: {err}", path.display());
+                log::error!("non-UTF-8 edit manifest {}: {err}", path.display());
                 RollManifest::default()
             }
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => RollManifest::default(),
         Err(err) => {
-            eprintln!("failed to read edit manifest {}: {err}", path.display());
+            log::error!("failed to read edit manifest {}: {err}", path.display());
             RollManifest::default()
         }
     }

@@ -1112,6 +1112,7 @@ dependencies = [
  "jpeg-encoder",
  "kamadak-exif",
  "libcosmic",
+ "log",
  "naga",
  "open",
  "png 0.18.1",

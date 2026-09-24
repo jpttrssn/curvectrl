@@ -10,11 +10,15 @@ mod export;
 mod film;
 mod i18n;
 mod library;
+mod logging;
 mod pipeline;
 mod shader;
 mod ui;
 
 fn main() -> cosmic::iced::Result {
+    // Route diagnostics through the `log` facade (stderr, `RUST_LOG`-filtered).
+    logging::init();
+
     // Get the system's preferred languages.
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
 

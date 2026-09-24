@@ -24,7 +24,7 @@ pub(crate) fn record_roll_preset(dir: &Path, preset: FilmPreset) {
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_preset(preset);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        eprintln!(
+        log::error!(
             "failed to write roll manifest {}: {err}",
             edit_manifest::manifest_path(dir).display()
         );
@@ -42,7 +42,7 @@ pub(crate) fn record_roll_base_mode(dir: &Path, mode: BaseMode) {
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_base_mode(mode);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        eprintln!(
+        log::error!(
             "failed to write roll manifest {}: {err}",
             edit_manifest::manifest_path(dir).display()
         );
@@ -57,7 +57,7 @@ pub(crate) fn record_roll_dates(dir: &Path, start: Option<String>, end: Option<S
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_dates(start, end);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        eprintln!(
+        log::error!(
             "failed to write roll manifest {}: {err}",
             edit_manifest::manifest_path(dir).display()
         );
@@ -71,7 +71,7 @@ pub(crate) fn record_roll_name(dir: &Path, name: Option<String>) {
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_name(name);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        eprintln!(
+        log::error!(
             "failed to write roll manifest {}: {err}",
             edit_manifest::manifest_path(dir).display()
         );

@@ -21,6 +21,10 @@ kamadak-exif = "0.6.1"
 # the tree already pulls for decode, so no new crates enter the lock).
 image = { version = "0.25", default-features = false, features = ["png"] }
 jpeg-encoder = "0.7"
+# The logging facade only (no subscriber): a tiny stderr sink in `src/logging.rs`
+# honors `RUST_LOG` and the `EXPOSURE_TRACE_*` knobs. Already vendored via
+# libcosmic's tree, so `--locked`/`--frozen` compile nothing new.
+log = "0.4"
 # Direct `png` access for export so the master can tag a `pHYs` density chunk
 # (`image::save_buffer_with_format` exposes no density API). Already in the lock
 # via image 0.25 → png 0.18, so `--locked` compiles nothing new.
