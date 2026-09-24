@@ -8,6 +8,7 @@ Reference for continuing work on the roll library (rolls ↔ frame grid ↔ deta
 
 - `src/app.rs` — UI (tiles, detail crossfade, editing panel), state + messages, the async decode/export pumps.
 - `src/pipeline.rs` — the RAW-to-image pipeline shared by every CPU bake: sensor decode (`decode_raw_detail`), mono reconstruction (`flatten_bayer`, `downsample_thumbnail`), tone shaping (`bake_tone`/`render_tail`/`pivots_for`), and geometry (`crop_rgba`/`rotate_quarters`/`orient`), plus `DetailDecode`.
+- `src/ui.rs` — the widget tree as pure functions of `&AppModel`: library page, frame grid, detail view, editing panel, help overlay, and the tile/card/dot widgets, plus `FrameMeta`/`load_frame_meta`.
 - `src/shader.rs` — `DetailProgram` implementing `iced::widget::shader::{Program, Primitive, Pipeline}` for the detail view; the shared tone model lives here (`tone_model`, `curve_remap`, `apply_curve`).
 - `src/edit_manifest.rs` — per-roll edit persistence: `RollManifest`/`EditData`/`ToneEdit` (serde+toml), the `.film-roll.toml` sidecar reader/writer (atomic temp+rename), `reconcile`, unit tests.
 - `src/exif_writer.rs` — EXIF writing for exports: `shifted_datetime` (ISO date + seconds), the hand-rolled TIFF blob (`build_tiff`), and the JPEG APP1 splice (`jpeg_app1`/`splice_after_soi`); PNG's `eXIf` is written via the `png` crate directly. No new crates; its unit tests round-trip through `exif` (kamadak-exif).

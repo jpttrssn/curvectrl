@@ -11,6 +11,7 @@ mod i18n;
 mod library;
 mod pipeline;
 mod shader;
+mod ui;
 
 fn main() -> cosmic::iced::Result {
     // Get the system's preferred languages.
