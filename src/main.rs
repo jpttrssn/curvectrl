@@ -5,6 +5,7 @@ mod config;
 mod detail_area;
 mod edit_manifest;
 mod exif_writer;
+mod export;
 mod film;
 mod i18n;
 mod pipeline;
