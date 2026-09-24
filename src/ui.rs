@@ -565,7 +565,7 @@ pub(crate) fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a,
 /// A labeled ISO-date text field for the roll-info drawer, committed on Enter
 /// via [`Message::RollDateDraftSubmit`]. Seeded from the live draft so an
 /// in-progress edit survives view re-renders.
-pub(crate) fn roll_date_field(label: String, value: &str, field: RollDateField) -> Element<'_, Message> {
+fn roll_date_field(label: String, value: &str, field: RollDateField) -> Element<'_, Message> {
     widget::column::with_capacity(2)
         .push(widget::text(label))
         .push(
@@ -691,7 +691,7 @@ pub(crate) fn roll_info_panel<'a>(
 /// selection ring so it reads and behaves as another tile — single-clicking
 /// selects it (highlight), double-clicking (or Enter) opens the picker — with
 /// a large plus icon.
-pub(crate) fn add_roll_tile(selected: bool) -> Element<'static, Message> {
+fn add_roll_tile(selected: bool) -> Element<'static, Message> {
     let content = widget::container(
         icon::from_name("list-add-symbolic")
             .size(130)
@@ -718,7 +718,7 @@ pub(crate) fn add_roll_tile(selected: bool) -> Element<'static, Message> {
 /// (or Enter) drills into its frame grid. The selection highlight is an accent
 /// ring drawn OVER the card (see the tail of this function), so the full-bleed
 /// cover never hides it.
-pub(crate) fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
+fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
     let space_xs = cosmic::theme::spacing().space_xs;
     // The tile's corner radius follows the COSMIC system Roundness setting
     // (rounded / slightly-rounded / square) exactly as `Container::Primary`
@@ -839,7 +839,7 @@ pub(crate) fn roll_tile(roll: &Roll, selected: bool) -> Element<'_, Message> {
 /// with an accent ring drawn ON TOP when selected. The selection is NOT a card
 /// style here: iced paints a container's border behind its children, which a
 /// full-bleed cover would cover up, so the ring is a separate overlay layer.
-pub(crate) fn selectable_tile(content: Element<'_, Message>, selected: bool) -> Element<'_, Message> {
+fn selectable_tile(content: Element<'_, Message>, selected: bool) -> Element<'_, Message> {
     let surface = widget::container(content)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -861,7 +861,7 @@ pub(crate) fn selectable_tile(content: Element<'_, Message>, selected: bool) -> 
 /// rounded to the theme radius, so the accent border is visible around a
 /// full-bleed preview on every side. Decorative only — no `MouseArea` — so it
 /// never eats the clicks the card below expects.
-pub(crate) fn selection_ring() -> Element<'static, Message> {
+fn selection_ring() -> Element<'static, Message> {
     widget::container(
         widget::Space::new()
             .width(Length::Fill)
@@ -891,7 +891,7 @@ pub(crate) fn selection_ring() -> Element<'static, Message> {
 /// `is_calibration_frame` overlays a small accent dot in the tile's bottom-right
 /// corner (see [`calibration_frame_dot`]) to mark the frame whose clear-film
 /// plateau drives the roll's black point under the auto-selected-frame preset.
-pub(crate) fn tile_view(tile: &Tile, selected: bool, is_calibration_frame: bool) -> Element<'_, Message> {
+fn tile_view(tile: &Tile, selected: bool, is_calibration_frame: bool) -> Element<'_, Message> {
     // The tile is the image alone in its square cell with ContentFit::Contain
     // (no cropping); placeholders stay centered in the same sheet. The frame
     // name now lives in the frame-info context drawer (its title), not on the
@@ -944,7 +944,7 @@ pub(crate) fn tile_view(tile: &Tile, selected: bool, is_calibration_frame: bool)
 /// calibration frame AND the roll's base mode is [`BaseMode::AutoSelectedFrame`]
 /// (the only mode that reads a designated frame).
 #[must_use]
-pub(crate) fn is_calibration_frame(base_mode: BaseMode, calibration_frame: Option<&str>, name: &str) -> bool {
+fn is_calibration_frame(base_mode: BaseMode, calibration_frame: Option<&str>, name: &str) -> bool {
     base_mode == BaseMode::AutoSelectedFrame && calibration_frame == Some(name)
 }
 
@@ -953,7 +953,7 @@ pub(crate) fn is_calibration_frame(base_mode: BaseMode, calibration_frame: Optio
 /// disturbs the tile's layout (the surface and any selection ring keep their
 /// exact sizes); the fixed-size dot sits in a Fill container aligned to the
 /// corner via the `Stack`'s fill distribution.
-pub(crate) fn calibration_frame_dot() -> Element<'static, Message> {
+fn calibration_frame_dot() -> Element<'static, Message> {
     const DOT_SIZE: f32 = 12.0;
     const DOT_PAD: f32 = 8.0;
 
@@ -989,7 +989,7 @@ pub(crate) fn calibration_frame_dot() -> Element<'static, Message> {
 /// Shows the cached thumbnail while the GPU shader is loading, then
 /// crossfades: the thumbnail sits on top of the shader in a Stack and
 /// fades out via `.opacity()`.
-pub(crate) fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
+fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     let space_s = cosmic::theme::spacing().space_s;
     let name = app.selected.as_ref()?;
     let tile = app.tiles.iter().find(|tile| &tile.name == name)?;

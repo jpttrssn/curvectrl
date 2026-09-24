@@ -43,6 +43,14 @@ xdgen = "0.1"
 # instead of at first launch (naga parses/validates it).
 naga = "28"
 
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
+pedantic = "warn"
+
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
 # See https://github.com/pop-os/libcosmic/blob/master/Cargo.toml for available features.

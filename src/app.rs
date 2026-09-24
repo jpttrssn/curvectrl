@@ -135,7 +135,7 @@ const SEARCH_DEBOUNCE_MS: u64 = 300;
 // export, async decode failures, overwrite dialog), so a shared bitmask or
 // nested structs would only obscure each flag's meaning.
 #[allow(clippy::struct_excessive_bools)]
-pub struct AppModel {
+pub(crate) struct AppModel {
     /// Application state which is managed by the COSMIC runtime.
     core: cosmic::Core,
     /// Display a context drawer with the designated page if defined.
@@ -359,7 +359,7 @@ pub struct AppModel {
 
 /// Which roll date field a draft/commit message targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RollDateField {
+pub(crate) enum RollDateField {
     Start,
     End,
 }
@@ -424,7 +424,7 @@ pub(crate) enum LibrarySelection {
 /// on the library page. Double-clicking (or Enter on the selected roll) drills
 /// into its frame grid.
 #[derive(Debug, Clone)]
-pub struct Roll {
+pub(crate) struct Roll {
     /// Absolute directory holding this roll's negatives.
     pub dir: PathBuf,
     /// Display name: the manifest's human-readable label when set, otherwise
@@ -588,7 +588,7 @@ where
 
 /// Thumbnail loading state of a [`Tile`] or roll cover.
 #[derive(Debug, Clone)]
-pub enum Thumb {
+pub(crate) enum Thumb {
     /// The file has not been decoded yet.
     Loading,
     /// A decoded RGBA thumbnail.
@@ -599,7 +599,7 @@ pub enum Thumb {
 
 /// Messages emitted by the application and its widgets.
 #[derive(Debug, Clone)]
-pub enum Message {
+pub(crate) enum Message {
     /// Close the detail view, returning to the grid.
     DetailClosed,
     /// A hi-res decode for the detail view finished, returning the true
@@ -817,7 +817,7 @@ pub enum Message {
 /// A direction for arrow-key navigation of a grid selection (library rolls or
 /// open-roll frames), and for paging the detail view left/right.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MoveDir {
+pub(crate) enum MoveDir {
     Left,
     Right,
     Up,
@@ -4937,7 +4937,7 @@ fn detail_result_is_current(
 
 /// The context page to display in the context drawer.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub enum ContextPage {
+pub(crate) enum ContextPage {
     #[default]
     About,
     /// The editing panel for the active detail view.
@@ -5003,7 +5003,7 @@ impl DrawerMemory {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MenuAction {
+pub(crate) enum MenuAction {
     AddRoll,
     RemoveRoll,
     Quit,

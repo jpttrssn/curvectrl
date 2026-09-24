@@ -195,7 +195,7 @@ pub(crate) fn is_export_artifact(name: &str) -> bool {
 /// `img_0001.png`). A file name with no extension simply gains the extension; a
 /// hidden leading dot is part of the stem.
 #[must_use]
-pub(crate) fn export_name(name: &str, format: ExportFormat) -> PathBuf {
+fn export_name(name: &str, format: ExportFormat) -> PathBuf {
     let mut out = PathBuf::from(name);
     out.set_extension(format.ext());
     out
@@ -208,7 +208,7 @@ pub(crate) fn export_name(name: &str, format: ExportFormat) -> PathBuf {
 /// never used here) and identical on every platform/run — the same directory,
 /// however it was spelled, always yields the same id.
 #[must_use]
-pub(crate) fn roll_hash(dir: &std::path::Path) -> String {
+fn roll_hash(dir: &std::path::Path) -> String {
     let mut hash = 0x811c_9dc5u32;
     for &byte in dir.to_string_lossy().as_bytes() {
         hash ^= u32::from(byte);
@@ -227,7 +227,7 @@ pub(crate) fn roll_hash(dir: &std::path::Path) -> String {
 /// Returns `None` when `start_iso` is not exactly `YYYY-MM-DD` or the position
 /// does not fit a `u16` frame.
 #[must_use]
-pub(crate) fn dated_export_name(
+fn dated_export_name(
     format: ExportFormat,
     start_iso: &str,
     index: usize,
@@ -249,7 +249,7 @@ pub(crate) fn dated_export_name(
 /// disk. Same filesystem, so the rename is atomic — a failed or interrupted
 /// export leaves any pre-existing `dest` untouched instead of truncating it.
 #[must_use]
-pub(crate) fn temp_export_path(dest: &Path) -> PathBuf {
+fn temp_export_path(dest: &Path) -> PathBuf {
     let mut name = dest
         .file_name()
         .map_or_else(|| "export".to_owned(), |n| n.to_string_lossy().into_owned());
@@ -453,7 +453,7 @@ pub(crate) async fn export_one(
 /// byte-order marker.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn export_jpeg(
+fn export_jpeg(
     mono: Vec<f32>,
     width: u32,
     height: u32,
@@ -534,7 +534,7 @@ pub(crate) fn export_jpeg(
 /// PNG stores without JPEG's `Exif\0\0` prefix).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn export_png(
+fn export_png(
     mono: Vec<f32>,
     width: u32,
     height: u32,

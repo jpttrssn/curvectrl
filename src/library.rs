@@ -324,7 +324,7 @@ pub(crate) fn filtered_rolls<'a>(rolls: &'a [Roll], query: &str, months: &MonthA
 /// lexicographically == chronologically; name decides ties so the order is
 /// deterministic. The sort is derived per-view, so a roll's committed date
 /// reorders it on the next render — never mutating `rolls`.
-pub(crate) fn roll_date_cmp(a: &Roll, b: &Roll) -> Ordering {
+fn roll_date_cmp(a: &Roll, b: &Roll) -> Ordering {
     match (a.start_date.as_deref(), b.start_date.as_deref()) {
         (Some(a_date), Some(b_date)) => b_date.cmp(a_date).then_with(|| a.name.cmp(&b.name)),
         (Some(_), None) => Ordering::Greater,

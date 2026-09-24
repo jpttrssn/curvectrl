@@ -16,7 +16,7 @@ use crate::film::{
     ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
 };
 use crate::shader;
-pub(crate) fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
+fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
     let width = usize::max(image.width, 1);
 
     match &image.data {
@@ -173,14 +173,14 @@ pub(crate) fn luma(rgb: &[f32]) -> Vec<f32> {
 /// Start and length of the source range that output coordinate `out` covers,
 /// offset by `origin` (the cropped edge on that axis).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn block_span(out: u32, source: u32, out_total: u32, origin: usize) -> (usize, usize) {
+fn block_span(out: u32, source: u32, out_total: u32, origin: usize) -> (usize, usize) {
     let start = range(out, source, out_total) + origin;
     let len = range_len(start, range(out + 1, source, out_total) + origin);
     (start, len)
 }
 
 /// Rec.709 luminance of three per-block channel means.
-pub(crate) fn luma_of_means(r: f32, g: f32, b: f32) -> f32 {
+fn luma_of_means(r: f32, g: f32, b: f32) -> f32 {
     0.212_6 * r + 0.715_2 * g + 0.072_2 * b
 }
 
@@ -240,7 +240,7 @@ pub(crate) fn downsample_thumbnail(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-pub(crate) fn downsample_rgb(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> Option<Vec<f32>> {
+fn downsample_rgb(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> Option<Vec<f32>> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
     let cpp = usize::max(image.cpp, 1);
@@ -320,7 +320,7 @@ pub(crate) fn downsample_rgb(image: &rawloader::RawImage, out_w: usize, out_h: u
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-pub(crate) fn downsample_bayer(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> Option<Vec<f32>> {
+fn downsample_bayer(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> Option<Vec<f32>> {
     let width = usize::max(image.width, 1);
     let height = usize::max(image.height, 1);
     let [top, right, bottom, left] = image.crops;
@@ -566,7 +566,7 @@ pub(crate) fn bake_geometry(
 /// samples counter-clockwise by `turns` 90° quarter turns, swapping the print
 /// dims on odd turns. Used by the 16-bit PNG export path.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn rotate_quarters16(rgba: Vec<u16>, width: u32, height: u32, turns: u8) -> (Vec<u16>, u32, u32) {
+fn rotate_quarters16(rgba: Vec<u16>, width: u32, height: u32, turns: u8) -> (Vec<u16>, u32, u32) {
     let out_w = height;
     let out_h = width;
     let mut out = vec![0_u16; width as usize * height as usize * 4];
@@ -631,7 +631,7 @@ pub(crate) fn bake_geometry16(
 /// The 16-bit analogue of [`crop_rgba`]: crops an RGBA buffer of `u16` samples
 /// to the given margins (which the caller scaled to the print's dims), letting
 /// a degenerate crop leave the frame unchanged.
-pub(crate) fn crop_rgba16(
+fn crop_rgba16(
     rgba: Vec<u16>,
     width: u32,
     height: u32,
@@ -703,7 +703,7 @@ pub(crate) fn pivots_for(
 /// gain. `stock_and_base` is `Some((stock, base))` exactly when the buffer is a
 /// negative to invert. Shared by the grid thumbnail bake, the export bake, and
 /// the WGSL-parity tests.
-pub(crate) fn render_tail(
+fn render_tail(
     mono: &mut [f32],
     tone: ToneEdit,
     stock_and_base: Option<(MonoStock, f32)>,
@@ -890,7 +890,7 @@ pub(crate) fn range(out: u32, source: u32, out_total: u32) -> usize {
 /// Length of the source range between `start` and the next output coordinate's
 /// start, always covering at least one source pixel.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn range_len(start: usize, next_start: usize) -> usize {
+fn range_len(start: usize, next_start: usize) -> usize {
     usize::max(next_start.saturating_sub(start), 1)
 }
 
@@ -908,7 +908,7 @@ pub(crate) fn unsharp_mask(samples: &mut [f32], width: usize, height: usize) {
 }
 
 /// Separable 3x3 binomial blur ([1, 2, 1] per axis), replicating edges.
-pub(crate) fn blur_121(samples: &[f32], width: usize, height: usize) -> Vec<f32> {
+fn blur_121(samples: &[f32], width: usize, height: usize) -> Vec<f32> {
     let mut horizontal = vec![0.0_f32; samples.len()];
     for y in 0..height {
         for x in 0..width {
@@ -942,7 +942,7 @@ pub(crate) fn blur_121(samples: &[f32], width: usize, height: usize) -> Vec<f32>
 /// behaviour to orientation-after-quantization when the per-element source
 /// `(sx, sy)` mapping is identical.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn orient_mono(
+fn orient_mono(
     mono: &[f32],
     width: u32,
     height: u32,
@@ -983,7 +983,7 @@ pub(crate) fn orient_mono(
 
 /// Applies the RAW orientation metadata to an RGBA buffer.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn orient(
+fn orient(
     rgba: &[u8],
     width: u32,
     height: u32,

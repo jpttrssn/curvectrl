@@ -49,9 +49,9 @@ build-release *args: (build-debug '--release' args)
 # Compiles release profile with vendored dependencies
 build-vendored *args: vendor-extract (build-release '--frozen --offline' args)
 
-# Runs a clippy check
+# Runs a clippy check against the workspace [lints] table in Cargo.toml
 check *args:
-    cargo clippy --all-features --locked {{args}} -- -W clippy::pedantic
+    cargo clippy --all-features --locked {{args}}
 
 # Runs a clippy check with JSON message format
 check-json: (check '--message-format=json')
