@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::edit_manifest::{self, RollManifest};
+use crate::error::FrameError;
 use crate::export::{
     ExportOptions, export_format_choice, export_fraction, export_frames, export_overwrite_choice,
     is_export_artifact, options_for_choice,
@@ -605,16 +606,16 @@ pub enum Message {
     /// sensor-linear mono buffer for the GPU shader. Carries the preset the
     /// decode ran under so the LRU is keyed consistently with the buffer
     /// contents.
-    DetailReady(String, FilmPreset, Result<DetailDecode, String>),
+    DetailReady(String, FilmPreset, Result<DetailDecode, FrameError>),
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
-    DetailPreloaded(PathBuf, String, FilmPreset, Result<DetailDecode, String>),
+    DetailPreloaded(PathBuf, String, FilmPreset, Result<DetailDecode, FrameError>),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
     RollInfoLoaded(Roll),
     /// A roll cover decode finished.
-    CoverReady(PathBuf, Result<Handle, ()>),
+    CoverReady(PathBuf, Result<Handle, FrameError>),
     /// The folder picker returned a roll directory to add, along with the
     /// film preset chosen for it in the dialog. The base strategy is not part
     /// of the dialog (the open dialog carries a single choice), so a new roll
@@ -684,7 +685,7 @@ pub enum Message {
     RollOpened(PathBuf, Vec<String>),
     /// The frame-info drawer's lazy EXIF parse for a frame finished; carries
     /// the parsed metadata (or a failure, which is cached so it is not retried).
-    FrameInfoReady(String, Result<FrameMeta, ()>),
+    FrameInfoReady(String, Result<FrameMeta, FrameError>),
     /// Activate the search field: reveal the header input (and focus it),
     /// mirroring cosmic-files' search icon toggle. No-op if already active.
     SearchActivate,
@@ -701,7 +702,7 @@ pub enum Message {
     /// A surface action from a menu popup (Wayland): forwarded to the cosmic
     /// runtime, which creates/destroys the popup surface backing the menus.
     Surface(cosmic::surface::Action),
-    ThumbReady(String, Result<Handle, ()>),
+    ThumbReady(String, Result<Handle, FrameError>),
     /// A thumbnail was double-clicked, opening it in the detail view.
     ThumbnailActivated(String),
     /// Animation tick driving the hi-res crossfade.
@@ -2033,7 +2034,7 @@ impl cosmic::Application for AppModel {
                 if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
                     roll.thumb = match result {
                         Ok(handle) => Thumb::Ready(handle),
-                        Err(()) => Thumb::Failed,
+                        Err(_) => Thumb::Failed,
                     };
                 }
                 self.cover_inflight.retain(|pending| pending != &dir);
@@ -2427,11 +2428,11 @@ impl cosmic::Application for AppModel {
                 if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
                     match &result {
                         Ok(_) => rebake_trace(format_args!("ThumbReady: {name} -> Ready")),
-                        Err(()) => rebake_trace(format_args!("ThumbReady: {name} -> Failed")),
+                        Err(_) => rebake_trace(format_args!("ThumbReady: {name} -> Failed")),
                     }
                     tile.thumb = match result {
                         Ok(handle) => Thumb::Ready(handle),
-                        Err(()) => Thumb::Failed,
+                        Err(_) => Thumb::Failed,
                     };
                 } else {
                     rebake_trace(format_args!("ThumbReady: {name} NOT FOUND in tiles"));
@@ -2445,7 +2446,7 @@ impl cosmic::Application for AppModel {
                 if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
                     match result {
                         Ok(meta) => tile.meta = Some(meta),
-                        Err(()) => tile.meta_failed = true,
+                        Err(_) => tile.meta_failed = true,
                     }
                 }
                 if self.frame_meta_inflight.as_deref() == Some(name.as_str()) {
@@ -3375,10 +3376,9 @@ impl AppModel {
             return Task::none();
         };
 
-        let name = self
-            .selected
-            .clone()
-            .expect("selected when a decode is due");
+        let Some(name) = self.selected.clone() else {
+            return Task::none();
+        };
 
         // An overview request that's already in the LRU cache is served without
         // re-decoding the RAW (the whole point of the cache): build the shader
@@ -3487,7 +3487,7 @@ impl AppModel {
         dir: &PathBuf,
         name: &str,
         preset: FilmPreset,
-        result: Result<DetailDecode, String>,
+        result: Result<DetailDecode, FrameError>,
     ) -> Task<cosmic::Action<Message>> {
         self.detail_preload_inflight
             .retain(|(pending_dir, pending_name)| pending_dir != dir || pending_name != name);
@@ -3787,7 +3787,7 @@ impl AppModel {
             let parse_name = name.clone();
             let result =
                 tokio::task::spawn_blocking(move || load_frame_meta(&dir, &parse_name)).await;
-            Message::FrameInfoReady(name, result.unwrap_or(Err(())))
+            Message::FrameInfoReady(name, result.unwrap_or(Err(FrameError::Meta)))
         }))
     }
 
@@ -4088,7 +4088,7 @@ impl AppModel {
         &mut self,
         name: &str,
         preset: FilmPreset,
-        result: Result<DetailDecode, String>,
+        result: Result<DetailDecode, FrameError>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
             self.selected.as_deref(),
@@ -4899,9 +4899,9 @@ async fn measure_frame_base(dir: PathBuf, name: String, preset: FilmPreset) -> M
 
 /// Runs a RAW decode plus conversion on a blocking worker thread so the UI
 /// never stalls on CPU-heavy work.
-async fn decode_raw<F>(dir: PathBuf, name: String, convert: F) -> Result<Handle, ()>
+async fn decode_raw<F>(dir: PathBuf, name: String, convert: F) -> Result<Handle, FrameError>
 where
-    F: Fn(&rawloader::RawImage) -> Result<Handle, ()> + Send + 'static,
+    F: Fn(&rawloader::RawImage) -> Result<Handle, FrameError> + Send + 'static,
 {
     let path = dir.join(name);
 
@@ -4910,13 +4910,16 @@ where
             Ok(image) => image,
             Err(err) => {
                 eprintln!("failed to decode {}: {err}", path.display());
-                return Err(());
+                return Err(FrameError::Decode {
+                    path,
+                    message: err.to_string(),
+                });
             }
         };
         convert(&image)
     })
     .await
-    .unwrap_or(Err(()))
+    .unwrap_or(Err(FrameError::ThreadPanic))
 }
 
 /// Whether a finished hi-res decode belongs to the current selection and is

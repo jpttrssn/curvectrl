@@ -31,6 +31,9 @@ rust-embed = "8.8.0"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["full"] }
 toml = "0.8"
+# Already vendored in Cargo.lock via libcosmic's tree, so `--locked`/`--frozen`
+# compile nothing new; `FrameError` is `Clone` so it can ride `Message` payloads.
+thiserror = "2"
 
 [build-dependencies]
 xdgen = "0.1"

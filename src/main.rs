@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod detail_area;
 mod edit_manifest;
+mod error;
 mod exif_writer;
 mod export;
 mod film;

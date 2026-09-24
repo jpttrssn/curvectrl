@@ -11,6 +11,7 @@ use crate::app::{
     curve_power_for_lift, detail_zoom_delta,
 };
 use crate::detail_area::DetailArea;
+use crate::error::FrameError;
 use crate::exif_writer;
 use crate::film::{BaseMode, FILM_CHOICES, FilmPreset};
 use crate::fl;
@@ -18,7 +19,6 @@ use crate::i18n::fl_dyn;
 use crate::library::{
     LibraryCell, format_roll_card_dates, library_cell_index, library_cells,
 };
-use crate::shader;
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{ContentFit, Length};
@@ -446,11 +446,11 @@ pub(crate) fn help_overlay(_app: &AppModel) -> Element<'_, Message> {
 ///
 /// `display_value()` already formats the fields nicely (`1/250`, `2.8`,
 /// `50.0`, `2024-05-01 …`), so the panel renders them as strings directly.
-pub(crate) fn load_frame_meta(dir: &Path, name: &str) -> Result<FrameMeta, ()> {
-    let file = std::fs::File::open(dir.join(name)).map_err(|_| ())?;
+pub(crate) fn load_frame_meta(dir: &Path, name: &str) -> Result<FrameMeta, FrameError> {
+    let file = std::fs::File::open(dir.join(name)).map_err(|_| FrameError::Meta)?;
     let exif = exif::Reader::new()
         .read_from_container(&mut std::io::BufReader::new(file))
-        .map_err(|_| ())?;
+        .map_err(|_| FrameError::Meta)?;
 
     let field = |tag: exif::Tag| -> Option<String> {
         exif.get_field(tag, exif::In::PRIMARY)
@@ -1012,12 +1012,7 @@ pub(crate) fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
             ])
             .into()
         }
-        (Some(_shader), _, _) => app
-            .detail_shader
-            .as_ref()
-            .map(shader::DetailProgram::view)
-            .unwrap()
-            .into(),
+        (Some(shader), _, _) => shader.view().into(),
         (None, _, _) => {
             // Shader not ready — show the cached thumbnail or a status icon.
             match &tile.thumb {

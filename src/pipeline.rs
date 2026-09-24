@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use cosmic::widget::image::Handle;
 
 use crate::edit_manifest::{CropMargins, ToneEdit};
+use crate::error::FrameError;
 use crate::film::{
     ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
 };
@@ -757,11 +758,12 @@ pub(crate) fn convert_thumbnail(
     rotation: u8,
     preset: FilmPreset,
     base_config: BaseConfig,
-) -> Result<Handle, ()> {
+) -> Result<Handle, crate::error::FrameError> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
     // downscale straight from the sensor samples into a small TRUE sensor-linear
     // mono (the same domain the detail decode produces, for every preset).
-    let (mut mono, width, height) = downsample_thumbnail(image, max_size as u32).ok_or(())?;
+    let (mut mono, width, height) =
+        downsample_thumbnail(image, max_size as u32).ok_or(crate::error::FrameError::ShortSamples)?;
 
     // Restore edge punch lost to the heavy downscale — in true sensor space for
     // every preset, matching the detail decode's unsharp so a film negative
@@ -1039,11 +1041,14 @@ pub(crate) async fn decode_raw_detail(
     max_edge: u32,
     preset: FilmPreset,
     base_config: BaseConfig,
-) -> Result<DetailDecode, String> {
+) -> Result<DetailDecode, FrameError> {
     let path = dir.join(name);
 
     tokio::task::spawn_blocking(move || {
-        let image = rawloader::decode_file(&path).map_err(|err| err.to_string())?;
+        let image = rawloader::decode_file(&path).map_err(|err| FrameError::Decode {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
 
         let width = usize::max(image.width, 1);
         let height = usize::max(image.height, 1);
@@ -1059,7 +1064,7 @@ pub(crate) async fn decode_raw_detail(
 
         let (mono, width, height) = if image.cpp >= 3 {
             if samples.len() < width * height * 3 {
-                return Err("decode produced too few samples for the pixel count".to_string());
+                return Err(FrameError::ShortSamples);
             }
 
             let mut rgb = Vec::with_capacity(width * height * 3);
@@ -1073,7 +1078,7 @@ pub(crate) async fn decode_raw_detail(
             (luma(&rgb), width, height)
         } else {
             if samples.len() < width * height {
-                return Err("decode produced too few samples for the pixel count".to_string());
+                return Err(FrameError::ShortSamples);
             }
 
             let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
@@ -1113,7 +1118,7 @@ pub(crate) async fn decode_raw_detail(
         })
     })
     .await
-    .unwrap_or(Err("raw decode thread panicked".to_string()))
+    .unwrap_or(Err(FrameError::ThreadPanic))
 }
 /// A decoded true sensor-linear mono frame plus the data the detail and export
 /// paths need to shape it.

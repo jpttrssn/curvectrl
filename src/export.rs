@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::edit_manifest;
+use crate::error::FrameError;
 use crate::exif_writer;
 use crate::film::{BaseConfig, FilmPreset};
 use crate::fl;
@@ -362,7 +363,7 @@ pub(crate) async fn export_one(
     preset: FilmPreset,
     base_config: BaseConfig,
     start_date: Option<String>,
-) -> Result<(), ()> {
+) -> Result<(), FrameError> {
     let max_edge = options.size.long_edge();
     // True sensor-linear mono (masked-border cropped, downscaled per the size,
     // unsharpened — the exact detail-view decode), at the size option's long
@@ -385,6 +386,7 @@ pub(crate) async fn export_one(
     .await
     .map_err(|err| {
         eprintln!("export decode failed for {name}: {err}");
+        err
     })?;
 
     // The crop margins are authored in display-upright source pixels; scale
@@ -460,7 +462,7 @@ pub(crate) fn export_jpeg(
     dest: &Path,
     exif_tiff: Option<&[u8]>,
     options: ExportOptions,
-) -> Result<(), ()> {
+) -> Result<(), FrameError> {
     let mut rgba = Vec::with_capacity(mono.len() * 4);
     for &value in &mono {
         let level = (value * 255.0).round() as u8;
@@ -483,8 +485,12 @@ pub(crate) fn export_jpeg(
     // The JPEG header fields are u16; exports are far below that, so the
     // conversion can only fail for absurd geometry — bail before creating any
     // temp file.
-    let width = u16::try_from(width).map_err(|_| ())?;
-    let height = u16::try_from(height).map_err(|_| ())?;
+    let width = u16::try_from(width).map_err(|_| FrameError::Export {
+        message: "export dimensions exceed the JPEG format's limits".to_owned(),
+    })?;
+    let height = u16::try_from(height).map_err(|_| FrameError::Export {
+        message: "export dimensions exceed the JPEG format's limits".to_owned(),
+    })?;
 
     // Encode into an in-memory buffer so we can splice the optional Exif APP1
     // after the SOI marker, then atomically flush the final byte stream to disk
@@ -502,15 +508,21 @@ pub(crate) fn export_jpeg(
         .encode(&gray, width, height, jpeg_encoder::ColorType::Luma)
         .is_err()
     {
-        return Err(());
+        return Err(FrameError::Export {
+            message: "JPEG encode failed".to_owned(),
+        });
     }
     if let Some(tiff) = exif_tiff {
         let app1 = exif_writer::jpeg_app1(tiff);
         bytes = exif_writer::splice_after_soi(&bytes, &app1);
     }
     let tmp = temp_export_path(dest);
-    std::fs::write(&tmp, &bytes).map_err(|_| ())?;
-    std::fs::rename(&tmp, dest).map_err(|_| ())
+    std::fs::write(&tmp, &bytes).map_err(|err| FrameError::Export {
+        message: format!("failed to write {}: {err}", tmp.display()),
+    })?;
+    std::fs::rename(&tmp, dest).map_err(|err| FrameError::Export {
+        message: format!("failed to rename {} into place: {err}", tmp.display()),
+    })
 }
 
 /// Writes `dest` as a lossless 16-bit grayscale PNG via the `png` crate,
@@ -531,7 +543,7 @@ pub(crate) fn export_png(
     dest: &Path,
     exif_tiff: Option<&[u8]>,
     options: ExportOptions,
-) -> Result<(), ()> {
+) -> Result<(), FrameError> {
     let mut rgba = Vec::with_capacity(mono.len() * 4);
     for &value in &mono {
         let level = (value * 65535.0).round() as u16;
@@ -556,7 +568,9 @@ pub(crate) fn export_png(
     // every byte is on disk: a mid-encode failure must not truncate (or, with
     // overwrite on, replace) an existing file.
     let tmp = temp_export_path(dest);
-    let file = std::fs::File::create(&tmp).map_err(|_| ())?;
+    let file = std::fs::File::create(&tmp).map_err(|err| FrameError::Export {
+        message: format!("failed to create {}: {err}", tmp.display()),
+    })?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Grayscale);
     encoder.set_depth(png::BitDepth::Sixteen);
@@ -573,7 +587,9 @@ pub(crate) fn export_png(
             unit: png::Unit::Meter,
         }));
     }
-    let mut writer = encoder.write_header().map_err(|_| ())?;
+    let mut writer = encoder.write_header().map_err(|err| FrameError::Export {
+        message: format!("PNG header write failed: {err}"),
+    })?;
     // `eXIf` holds the raw TIFF blob (no `Exif\0\0` prefix — PNG uses the
     // chunk name to mark EXIF data), written before any IDAT as the spec asks.
     if let Some(tiff) = exif_tiff
@@ -581,21 +597,29 @@ pub(crate) fn export_png(
     {
         drop(writer);
         std::fs::remove_file(&tmp).ok();
-        return Err(());
+        return Err(FrameError::Export {
+            message: "PNG eXIf chunk write failed".to_owned(),
+        });
     }
     if writer.write_image_data(&gray).is_err() {
         drop(writer);
         std::fs::remove_file(&tmp).ok();
-        return Err(());
+        return Err(FrameError::Export {
+            message: "PNG image data write failed".to_owned(),
+        });
     }
     // `finish` writes the IEND trailer and consumes the writer; its dropped
     // BufWriter flushes any residual bytes, so the temp file is complete on
     // success and only then renamed into place.
     if writer.finish().is_err() {
         std::fs::remove_file(&tmp).ok();
-        return Err(());
+        return Err(FrameError::Export {
+            message: "PNG finish failed".to_owned(),
+        });
     }
-    std::fs::rename(&tmp, dest).map_err(|_| ())
+    std::fs::rename(&tmp, dest).map_err(|err| FrameError::Export {
+        message: format!("failed to rename {} into place: {err}", tmp.display()),
+    })
 }
 
 

@@ -18,6 +18,7 @@ Reference for continuing work on the roll library (rolls ↔ frame grid ↔ deta
 - `src/shader/exposure.wgsl` — fullscreen-triangle WGSL that samples a linear mono `R16Float` texture, applies the sensor-space `2^EV` gain (for an inverted/film preset the gain is `2^-EV` and the fragment ALSO density-inverts the transmission first — `curve(invert(s·2^-EV))`), re-shapes the positive via the CPU-built 2048×1 tone LUT (`t_tone`, sampled on `t = p^(1/2.2)` and divided by the 512× pre-scale — the tone model lives only in Rust `tone_model`, so the WGSL never changes for tone work), sRGB-encodes, and maps fragments through a zoom/pan transform (`view_uv`).
 - `src/film.rs` — density-space mono inversion + base measurement (`MonoStock`, `FILM_CHOICES`, `ACTIVE_STOCK` = Ilford HP5+).
 - `src/detail_area.rs` — `DetailArea` widget: an iced-`MouseArea` clone that reports cursor positions relative to the widget **center** (needed by the zoom-anchor math), fires `on_release` when the cursor leaves while pressed (iced suppresses release outside bounds), and stays stateless (`tree::State::None`). A11y nodes omitted (the trait default covers it; no direct `iced_accessibility` dep).
+- `src/error.rs` — `FrameError` (thiserror, `Clone` so it rides `Message` payloads): the single error type for the decode pipeline, exports, and frame-metadata reads. Replaces the old `Result<_, ()>` / `Result<_, String>` ad-hoc error surface.
 
 ### Current behavior
 
