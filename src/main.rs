@@ -7,6 +7,7 @@ mod edit_manifest;
 mod exif_writer;
 mod film;
 mod i18n;
+mod pipeline;
 mod shader;
 
 fn main() -> cosmic::iced::Result {
