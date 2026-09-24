@@ -501,10 +501,10 @@ pub(crate) fn crop_rgba(
 pub(crate) fn rotate_quarters(rgba: Vec<u8>, width: u32, height: u32, turns: u8) -> (Vec<u8>, u32, u32) {
     let out_w = height;
     let out_h = width;
-    let mut out = vec![0_u8; width as usize * height as usize * 4];
     match turns & 3 {
         0 => (rgba, width, height),
         1 => {
+            let mut out = vec![0_u8; width as usize * height as usize * 4];
             for y in 0..height {
                 for x in 0..width {
                     let src = ((y * width + x) as usize) * 4;
@@ -517,6 +517,7 @@ pub(crate) fn rotate_quarters(rgba: Vec<u8>, width: u32, height: u32, turns: u8)
             (out, out_w, out_h)
         }
         2 => {
+            let mut out = vec![0_u8; width as usize * height as usize * 4];
             for y in 0..height {
                 for x in 0..width {
                     let src = ((y * width + x) as usize) * 4;
@@ -529,6 +530,7 @@ pub(crate) fn rotate_quarters(rgba: Vec<u8>, width: u32, height: u32, turns: u8)
             (out, width, height)
         }
         _ => {
+            let mut out = vec![0_u8; width as usize * height as usize * 4];
             for y in 0..height {
                 for x in 0..width {
                     let src = ((y * width + x) as usize) * 4;
@@ -569,10 +571,10 @@ pub(crate) fn bake_geometry(
 fn rotate_quarters16(rgba: Vec<u16>, width: u32, height: u32, turns: u8) -> (Vec<u16>, u32, u32) {
     let out_w = height;
     let out_h = width;
-    let mut out = vec![0_u16; width as usize * height as usize * 4];
     match turns & 3 {
         0 => (rgba, width, height),
         1 => {
+            let mut out = vec![0_u16; width as usize * height as usize * 4];
             for y in 0..height {
                 for x in 0..width {
                     let src = ((y * width + x) as usize) * 4;
@@ -585,6 +587,7 @@ fn rotate_quarters16(rgba: Vec<u16>, width: u32, height: u32, turns: u8) -> (Vec
             (out, out_w, out_h)
         }
         2 => {
+            let mut out = vec![0_u16; width as usize * height as usize * 4];
             for y in 0..height {
                 for x in 0..width {
                     let src = ((y * width + x) as usize) * 4;
@@ -597,6 +600,7 @@ fn rotate_quarters16(rgba: Vec<u16>, width: u32, height: u32, turns: u8) -> (Vec
             (out, width, height)
         }
         _ => {
+            let mut out = vec![0_u16; width as usize * height as usize * 4];
             for y in 0..height {
                 for x in 0..width {
                     let src = ((y * width + x) as usize) * 4;
