@@ -273,7 +273,11 @@ impl DetailProgram {
     /// `contrast` pivots at the image's measured mid-gray, `rolloff` at the
     /// measured white point, `shadows` at the measured 10th-percentile shadow
     /// anchor (`1.0` = identity for each); all three compose into the single
-    /// `ratio * p^exp` remap the shader applies.
+    /// `ratio * p^exp` remap the shader applies. The Highlights/Shadows slider
+    /// and keyboard layers present these powers through a stop-based "lift
+    /// value" (`app::curve_lift_value = -log2(power)`, 0 = identity at the
+    /// track center, +n = n stops lifting) so increasing on screen brightens
+    /// the region; this method is the unconverted raw-power boundary.
     pub fn set_curve(&mut self, contrast: f32, rolloff: f32, shadows: f32) {
         self.contrast = contrast;
         self.rolloff = rolloff;
@@ -338,8 +342,25 @@ impl DetailProgram {
     /// never drops below the minimum zoom.
     #[must_use]
     pub fn zoom_100(&self, widget_w: f32, widget_h: f32, scale_factor: f32) -> f32 {
-        let (_, (cw, ch)) =
-            crop_uv_geometry(self.crop, self.width, self.height, self.src_w, self.src_h);
+        self.zoom_100_for(self.width, self.height, widget_w, widget_h, scale_factor)
+    }
+
+    /// The same 1:1 ("100%") cap math as [`Self::zoom_100`], but for a
+    /// hypothetical texture of `tex_w` × `tex_h` under the live crop, display
+    /// rotation and pad. Lets the detail view project the cap a pending native
+    /// (level-up) decode will unlock while only the coarse overview is
+    /// installed, so zooming can continue through the load without ever
+    /// passing the point the upcoming texture's pixels cover.
+    #[must_use]
+    pub fn zoom_100_for(
+        &self,
+        tex_w: u32,
+        tex_h: u32,
+        widget_w: f32,
+        widget_h: f32,
+        scale_factor: f32,
+    ) -> f32 {
+        let (_, (cw, ch)) = crop_uv_geometry(self.crop, tex_w, tex_h, self.src_w, self.src_h);
         let (dw, dh) = if (self.rotation & 1) != 0 { (ch, cw) } else { (cw, ch) };
         // The 1:1 cap mirrors the WGSL contain-fit, which in crop mode shrinks
         // the available box by the minimum padding on every side (`pad` is in
@@ -1719,6 +1740,61 @@ mod tests {
         // Zero padding is the unpadded layout (regression guard for the mirror).
         padded.set_pad(0.0);
         assert!((padded.zoom_100(1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zoom_100_for_delegates_on_the_own_texture_and_scales_in_log2() {
+        // The projection helper with the shader's own texture dims is exactly
+        // `zoom_100` (same 2000x1000 texture → cap 2.0 in a 1000x1000 widget).
+        let program = DetailProgram::new(
+            vec![0.0; 2000 * 1000],
+            2000,
+            1000,
+            0.0,
+            CropMargins::default(),
+            0,
+            1,
+            2000,
+            None,
+        );
+        assert!(
+            (program.zoom_100_for(2000, 1000, 1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5
+        );
+        assert!(
+            (program.zoom_100_for(2000, 1000, 1000.0, 1000.0, 1.0)
+                - program.zoom_100(1000.0, 1000.0, 1.0))
+                .abs()
+                < 1e-5
+        );
+
+        // Doubling both texture axes doubles the physical pixel count at the
+        // same scale, so the 1:1 cap grows by exactly one log2 unit — this is
+        // what lets the detail view project the native level-up's cap.
+        let native = program.zoom_100_for(4000, 2000, 1000.0, 1000.0, 1.0);
+        assert!((native - (1.0 + 4.0f32.log2())).abs() < 1e-5);
+
+        // Cropping half the *projected* frame magnifies the projected cap the
+        // same way it does the real one (crop is authored in source space).
+        let cropped = DetailProgram::new(
+            vec![0.0; 2000 * 1000],
+            2000,
+            1000,
+            0.0,
+            CropMargins {
+                top: 0,
+                right: 1000,
+                bottom: 0,
+                left: 0,
+            },
+            0,
+            1,
+            2000,
+            None,
+        );
+        assert!((cropped.zoom_100_for(4000, 2000, 1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
+
+        // The 1:1 projection is floored at contain fit like the real cap.
+        assert!((program.zoom_100_for(1000, 500, 4000.0, 4000.0, 1.0) - 1.0).abs() < 1e-5);
     }
 
     #[test]

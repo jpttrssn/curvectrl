@@ -72,7 +72,8 @@ const EDIT_STEP_EV: f32 = 0.50;
 /// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier.
 const EDIT_NUDGE_EV: f32 = 0.05;
 /// Keyboard shortcut step for a tone-curve power (contrast/rolloff/shadows)
-/// with a bare key.
+/// with a bare key. Highlights and Shadows apply it to their user-facing lift
+/// value in stops (the `-log2` of the power), so a step UP lifts the region.
 const EDIT_STEP_CURVE: f32 = 0.20;
 /// Keyboard shortcut nudge step for a tone-curve power with the Shift modifier.
 const EDIT_NUDGE_CURVE: f32 = 0.05;
@@ -1935,7 +1936,7 @@ impl cosmic::Application for AppModel {
                     self.detail_pan,
                     self.detail_cursor,
                     delta,
-                    self.max_detail_zoom(),
+                    self.max_detail_zoom_for_wheel(),
                 );
                 self.detail_zoom = new_zoom;
                 self.detail_pan = new_pan;
@@ -1944,8 +1945,14 @@ impl cosmic::Application for AppModel {
                 }
                 // Level up to native once the view crosses the trigger zoom;
                 // the trigger adapts to the preview size so it always stays
-                // reachable (see `native_level_up_zoom`).
-                if self.detail_zoom >= self.native_level_up_zoom() && !self.detail_native_queued {
+                // reachable (see `native_level_up_zoom`). The inflight gate
+                // keeps wheels that keep zooming through a running decode
+                // (up to the projected native cap) from re-entering the busy
+                // slot — the landing re-pump covers a zoom taken mid-load.
+                if self.detail_inflight.is_none()
+                    && self.detail_zoom >= self.native_level_up_zoom()
+                    && !self.detail_native_queued
+                {
                     return self.decode_detail_next();
                 }
                 Task::none()
@@ -3804,6 +3811,35 @@ impl AppModel {
             .min(MAX_DETAIL_ZOOM)
     }
 
+    /// The clamp applied to the detail-view wheel and view re-clamps while a
+    /// hi-res decode is running: the live texture's 1:1 (see
+    /// [`Self::max_detail_zoom`]) would freeze the wheel at the coarse
+    /// texture's 100% point — exactly when the native level-up is in flight.
+    /// While a decode runs the cap rises to the **projected** native 1:1: the
+    /// source's own 1:1 computed for the texture the in-flight decode will
+    /// produce (`resized_dims` with the wgpu ceiling, aspect preserved), so
+    /// zooming continues through the load but never passes the point the
+    /// upcoming texture's pixels cover — and the landing re-clamps to that
+    /// exact same value, so there is no yank-back. Idle, it is precisely
+    /// [`Self::max_detail_zoom`].
+    fn max_detail_zoom_for_wheel(&self) -> f32 {
+        let Some(shader) = &self.detail_shader else {
+            return MAX_DETAIL_ZOOM;
+        };
+        let Some(size) = self.detail_area_size else {
+            return self.max_detail_zoom();
+        };
+        if self.detail_inflight.is_none() {
+            return self.max_detail_zoom();
+        }
+        let (src_w, src_h) = shader.source_dimensions();
+        let (dw, dh) = resized_dims(src_w, src_h, MAX_TEXTURE_EDGE);
+        let sf = self.core().scale_factor();
+        shader
+            .zoom_100_for(dw, dh, size.width, size.height, sf)
+            .min(MAX_DETAIL_ZOOM)
+    }
+
     /// The zoom (log2 units) at which the native hi-res level-up should fire:
     /// the earlier of the current texture's 1:1 ("100%") cap and the fixed
     /// [`NATIVE_ZOOM_THRESHOLD`].
@@ -3828,12 +3864,16 @@ impl AppModel {
         cap.min(NATIVE_ZOOM_THRESHOLD)
     }
 
-    /// Recompute the 1:1 zoom cap and pull the current zoom down to it if it
-    /// shrank (texture level-up installs a larger texture and RAISES the cap;
-    /// a crop/rotation/resize can LOWER it). Pushes the (possibly clamped) view
+    /// Recompute the zoom cap and pull the current zoom down to it if it shrank
+    /// (texture level-up installs a larger texture and RAISES the cap; a
+    /// crop/rotation/resize can LOWER it). Uses [`Self::max_detail_zoom_for_wheel`],
+    /// so during a native decode the bound is the projected native 1:1 rather
+    /// than the coarse texture's — a window/drawer resize mid-load must not
+    /// snatch the zoom back to the overview's 100%, and the landing re-clamp
+    /// lands on the exact projected value. Pushes the (possibly clamped) view
     /// to the shader so the render and state agree.
     fn reclamp_detail_zoom(&mut self) {
-        let max = self.max_detail_zoom();
+        let max = self.max_detail_zoom_for_wheel();
         if self.detail_zoom > max {
             self.detail_zoom = max;
             if let Some(shader) = &mut self.detail_shader {
@@ -4010,12 +4050,19 @@ impl AppModel {
                 let contrast = clamp_curve_power(self.curve_contrast + delta);
                 self.set_curve(contrast, self.curve_rolloff, self.curve_shadows);
             }
+            // Highlights and Shadows step their user-facing LIFT value in
+            // stops (the `-log2` of the stored power), so the "increase" keys
+            // `'`/`.` lift/brighten the region exactly like dragging their
+            // slider right — keeping keyboard and slider directions in
+            // lockstep.
             EditAdjust::Rolloff(delta) => {
-                let rolloff = clamp_curve_power(self.curve_rolloff + delta);
+                let rolloff =
+                    curve_power_for_lift(curve_lift_value(self.curve_rolloff) + delta);
                 self.set_curve(self.curve_contrast, rolloff, self.curve_shadows);
             }
             EditAdjust::Shadows(delta) => {
-                let shadows = clamp_curve_power(self.curve_shadows + delta);
+                let shadows =
+                    curve_power_for_lift(curve_lift_value(self.curve_shadows) + delta);
                 self.set_curve(self.curve_contrast, self.curve_rolloff, shadows);
             }
             // A display rotation steps one quarter-turn counter-clockwise
@@ -5337,10 +5384,15 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // via a uniform-only remap — contrast pivots at the image's measured
     // mid-gray, highlight rolloff at the measured white point, shadows at the
     // measured shadow anchor. Grid thumbnails are unaffected; every detail
-    // open starts from the stored edits.
+    // open starts from the stored edits. The Highlights and Shadows sliders
+    // expose their power as a stop-based "lift value" (`curve_lift_value`)
+    // centered on the identity, so dragging right brightens the region instead
+    // of crushing it — the direction other photo apps use, with the sweet spot
+    // in the middle of the track. Contrast keeps its conventional sense
+    // (up = more contrast).
     let contrast_label = widget::text(fl!("contrast-label"));
     let contrast_slider = widget::slider(
-        0.2..=3.0,
+        0.25..=4.0,
         app.curve_contrast,
         // When any slider moves, the other values travel along so the
         // remap always composes the full curve, not a half-updated one.
@@ -5350,14 +5402,22 @@ fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // A finished drag is an edit flush point, like exposure.
     .on_release(Message::EditSave);
     let rolloff_label = widget::text(fl!("rolloff-label"));
-    let rolloff_slider = widget::slider(0.2..=3.0, app.curve_rolloff, move |rolloff| {
-        Message::CurveChanged(app.curve_contrast, rolloff, app.curve_shadows)
+    let rolloff_slider = widget::slider(-2.0..=2.0, curve_lift_value(app.curve_rolloff), move |lift| {
+        Message::CurveChanged(
+            app.curve_contrast,
+            curve_power_for_lift(lift),
+            app.curve_shadows,
+        )
     })
     .step(0.05_f32)
     .on_release(Message::EditSave);
     let shadows_label = widget::text(fl!("shadows-label"));
-    let shadows_slider = widget::slider(0.2..=3.0, app.curve_shadows, move |shadows| {
-        Message::CurveChanged(app.curve_contrast, app.curve_rolloff, shadows)
+    let shadows_slider = widget::slider(-2.0..=2.0, curve_lift_value(app.curve_shadows), move |lift| {
+        Message::CurveChanged(
+            app.curve_contrast,
+            app.curve_rolloff,
+            curve_power_for_lift(lift),
+        )
     })
     .step(0.05_f32)
     .on_release(Message::EditSave);
@@ -6233,9 +6293,34 @@ fn clamp_ev(ev: f32) -> f32 {
 }
 
 /// Clamps a tone-curve power (contrast/rolloff/shadows) to the slider's range
-/// (0.2..=3.0) so a keyboard shortcut and the slider agree on bounds.
+/// (0.25..=4.0) so a keyboard shortcut and the slider agree on bounds. The
+/// range is a symmetric reciprocal pair around the `1.0` identity, so the
+/// stop-based lift scale (`curve_lift_value`) spans an even ±2 stops.
 fn clamp_curve_power(power: f32) -> f32 {
-    power.clamp(0.2, 3.0)
+    power.clamp(0.25, 4.0)
+}
+
+/// The tone slider's user-facing "lift value" in stops: `-log2(power)`, so
+/// INCREASING it lifts/brightens the region (conventional photo app direction —
+/// drag right = lift, "how other apps work"). Identity at `0.0` (power 1.0 ⇔ 0
+/// stops), at the CENTER of the symmetric `−2..=2` track; power 0.5 is +1 stop
+/// of lift, power 2.0 is −1 stop (crush). Two stops of lift is a 4× (0.25)
+/// power, two of crush a 4× (4.0) power — equal perceptual reach each way. The
+/// stored `curve_rolloff`/`curve_shadows` power keeps its meaning (1.0 =
+/// identity, above = crush, below = lift), so the GPU math, manifests, and
+/// bakes never change — only this boundary layer flips the direction the user
+/// meets.
+fn curve_lift_value(power: f32) -> f32 {
+    -(power.log2())
+}
+
+/// The stored curve power for a lift value (in stops) picked by a slider or
+/// keyboard step. Bound-sensitive inverse of [`curve_lift_value`] across the
+/// power range, so a value that exits `−2..=2` clamps to the same endpoints
+/// `clamp_curve_power` produces (round-trip `lift ↔ power` is exact within the
+/// range).
+fn curve_power_for_lift(value: f32) -> f32 {
+    clamp_curve_power((-value).exp2())
 }
 
 /// Translates the crop window by `delta_px` in `direction`, keeping the window
@@ -6376,7 +6461,10 @@ fn resize_crop_box(
 /// The four control pairs are laid out on a US keyboard left-to-right to match
 /// the editing panel's control order (Exposure → Contrast → Rolloff → Shadows):
 /// `-`/`=` exposure, `[`/`]` contrast, `;`/`'` rolloff, `,`/`.` shadows. A bare
-/// key uses the coarse step; holding `Shift` selects the fine nudge step.
+/// key uses the coarse step; holding `Shift` selects the fine nudge step. The
+/// "increase" key of each pair (`=`/`]`/`'`/`.`) applies a POSITIVE step — for
+/// the rolloff/shadows arms this steps the user-facing lift value (see
+/// [`curve_lift_value`]), so `'`/`.` lift the region's shadows or highlights.
 /// `-`/`=` stay the exposure pair here; the crop-mode handler reinterprets them
 /// as the window resize. `r` rotates the display one quarter-turn
 /// counter-clockwise (cumulative; modifiers ignored). The VIM movement keys
@@ -7751,6 +7839,29 @@ fn convert_thumbnail(
     Ok(Handle::from_rgba(width, height, rgba))
 }
 
+/// Output dimensions a downscale of `src_w` × `src_h` to a `max_edge` long-edge
+/// cap would produce: both axes scale by the same factor `max_edge / long_edge`
+/// (≤ 1), preserving aspect, with the float truncation [`resize_area`] applies.
+/// Single-sourcing the size math lets the detail view project the dimensions a
+/// native (level-up) decode will produce before it lands, so the zoom cap can
+/// track the upcoming texture's 1:1 to the pixel.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+#[must_use]
+fn resized_dims(src_w: u32, src_h: u32, max_edge: u32) -> (u32, u32) {
+    let scale = f32::min(
+        1.0,
+        max_edge as f32 / f32::max(src_w.max(1) as f32, src_h.max(1) as f32),
+    );
+    (
+        u32::max((src_w as f32 * scale) as u32, 1),
+        u32::max((src_h as f32 * scale) as u32, 1),
+    )
+}
+
 /// Downscales an interleaved buffer of `channels`-component samples so no
 /// dimension exceeds `max`, never upscaling. Each output pixel averages the
 /// block of source pixels that maps into it, which suppresses noise and grain
@@ -7767,12 +7878,7 @@ fn resize_area(
     max: u32,
     channels: usize,
 ) -> (Vec<f32>, u32, u32) {
-    let scale = f32::min(
-        1.0,
-        f32::min(max as f32 / width as f32, max as f32 / height as f32),
-    );
-    let out_width = u32::max((width as f32 * scale) as u32, 1);
-    let out_height = u32::max((height as f32 * scale) as u32, 1);
+    let (out_width, out_height) = resized_dims(width, height, max);
 
     let mut resized = Vec::with_capacity(out_width as usize * out_height as usize * channels);
     let mut sums = vec![0.0_f32; channels];
@@ -8893,6 +8999,40 @@ mod tests {
         assert_eq!(out, vec![2.5]); // mean of {1, 2, 3, 4}
     }
 
+    #[test]
+    fn resized_dims_caps_the_long_edge_preserving_aspect() {
+        // A source already under the ceiling keeps its exact dimensions.
+        assert_eq!(resized_dims(3000, 2000, 8192), (3000, 2000));
+        // A portrait source under the ceiling is untouched too.
+        assert_eq!(resized_dims(2000, 3000, 8192), (2000, 3000));
+        // A landscape source over the wgpu ceiling is capped on the long edge,
+        // the short axis truncating to the same fractional scale as the real
+        // downscale (6000·(8192/9000) = 5461.3 → 5461).
+        assert_eq!(resized_dims(9000, 6000, 8192), (8192, 5461));
+        // Portrait mirrors it: the capped edge lands on the height axis.
+        assert_eq!(resized_dims(6000, 9000, 8192), (5461, 8192));
+        // Degenerate dims never divide by zero or shrink below a pixel.
+        assert_eq!(resized_dims(0, 3, 8192), (1, 3));
+        assert_eq!(resized_dims(1, 1, 8192), (1, 1));
+    }
+
+    #[test]
+    fn resized_dims_matches_resize_area_output_dims() {
+        // The projection must agree with the decoder's own size math to the
+        // pixel, so a projected 1:1 cap equals the cap of the real decode.
+        for (w, h, max) in [
+            (9000, 6000, 8192),
+            (6000, 9000, 8192),
+            (2000, 1500, 2048),
+            (2500, 2000, 2048),
+            (800, 600, 2048),
+        ] {
+            let samples = vec![0.0_f32; w as usize * h as usize];
+            let (_, out_w, out_h) = resize_area(&samples, w, h, max, 1);
+            assert_eq!((out_w, out_h), resized_dims(w, h, max));
+        }
+    }
+
     /// Builds an Integer RAW whose per-class normalization yields the supplied
     /// per-site transmissions: raw = transmission × 1000, white = 1000,
     /// black = 0, so cast compression happens exactly at sample time.
@@ -9431,9 +9571,44 @@ mod tests {
 
     #[test]
     fn clamp_curve_power_bounds_to_the_slider_range() {
-        assert_eq!(clamp_curve_power(0.0), 0.2);
-        assert_eq!(clamp_curve_power(9.0), 3.0);
+        assert_eq!(clamp_curve_power(0.0), 0.25);
+        assert_eq!(clamp_curve_power(9.0), 4.0);
         assert_eq!(clamp_curve_power(1.0), 1.0);
+    }
+
+    #[test]
+    fn curve_lift_value_inverts_the_power_direction() {
+        // Identity sits at the center 0.0 for the stop-based lift value.
+        assert!((curve_lift_value(1.0) - 0.0).abs() < 1e-6);
+        // The log flips direction: a power below 1.0 (a LIFT) reads as a
+        // POSITIVE lift value, so dragging the slider right brightens.
+        assert!((curve_lift_value(0.5) - 1.0).abs() < 1e-6);
+        assert!((curve_lift_value(2.0) - (-1.0)).abs() < 1e-6);
+        // One stop is a 2× power either way (symmetric around identity).
+        let (a, b) = (curve_lift_value(0.5), curve_lift_value(2.0));
+        assert!((a - 1.0).abs() < 1e-6 && (b + 1.0).abs() < 1e-6);
+        // The lift value is monotone decreasing in the power, which is the point.
+        let (a, b) = (curve_lift_value(0.6), curve_lift_value(1.4));
+        assert!(a > b);
+    }
+
+    #[test]
+    fn curve_power_for_lift_round_trips_across_the_power_range() {
+        // Round-tripping a power through its lift value is exact within bounds.
+        for power in [0.25_f32, 0.5, 1.0, 1.7, 4.0] {
+            let back = curve_power_for_lift(curve_lift_value(power));
+            assert!(
+                (back - power).abs() < 1e-5,
+                "power {power} round-tripped to {back}"
+            );
+        }
+        // Values leaving the symmetric ±2-stop window clamp to the power
+        // endpoints, so an exited lift track and `clamp_curve_power` agree on
+        // bounds.
+        assert_eq!(curve_power_for_lift(3.0), 0.25);
+        assert_eq!(curve_power_for_lift(-3.0), 4.0);
+        // The identity lift value maps to the identity power.
+        assert!((curve_power_for_lift(0.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
