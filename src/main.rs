@@ -8,6 +8,7 @@ mod exif_writer;
 mod export;
 mod film;
 mod i18n;
+mod library;
 mod pipeline;
 mod shader;
 
