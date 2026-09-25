@@ -276,6 +276,12 @@ pub(crate) struct AppModel {
     detail_zoom: Zoom,
     /// The detail preview's laid-out logical size, reported by `DetailArea`
     /// via `DetailAreaResized`; drives the 1:1 ("100%") zoom cap.
+    ///
+    /// This is view geometry, so it is NOT cleared by `clear_detail`: frame
+    /// paging keeps `DetailArea` mounted with unchanged bounds and therefore
+    /// never re-publishes, and dropping the measurement would silently disable
+    /// the cap (the wheel would fall back to `MAX_DETAIL_ZOOM`) until a drawer
+    /// toggle forced a resize.
     detail_area_size: Option<Size>,
     /// Pan offset of the image center from the widget center (logical points).
     pub(crate) detail_pan: Point,
@@ -3597,7 +3603,13 @@ impl AppModel {
         self.detail_last_frame = None;
         self.detail_thumb = None;
         self.detail_zoom = Zoom::CONTAIN;
-        self.detail_area_size = None;
+        // `detail_area_size` deliberately survives: it is the preview's laid-out
+        // geometry, not per-frame detail state. Frame paging keeps `DetailArea`
+        // mounted with unchanged bounds, so it never re-publishes a size; that
+        // left the field `None` and the 1:1 zoom cap disabled (falling back to
+        // `MAX_DETAIL_ZOOM`) until the editing drawer first changed the bounds —
+        // letting the wheel zoom past native 100% (see the measured-size note on
+        // the field).
         self.detail_native_queued = false;
         self.detail_logged_failure = None;
         self.detail_pan = Point::default();
