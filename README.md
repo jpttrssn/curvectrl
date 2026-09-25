@@ -1,5 +1,5 @@
 # CurveCtrl
-A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls.
+A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls developed for the COSMIC desktop.
 
 - Manage your film rolls
 - Film inversion presets
