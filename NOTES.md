@@ -19,7 +19,7 @@ Reference for continuing work on the roll library (rolls ↔ frame grid ↔ deta
 - `src/film.rs` — density-space mono inversion + base measurement (`MonoStock`, `FILM_CHOICES`, `ACTIVE_STOCK` = Ilford HP5+).
 - `src/detail_area.rs` — `DetailArea` widget: an iced-`MouseArea` clone that reports cursor positions relative to the widget **center** (needed by the zoom-anchor math), fires `on_release` when the cursor leaves while pressed (iced suppresses release outside bounds), and stays stateless (`tree::State::None`). A11y nodes omitted (the trait default covers it; no direct `iced_accessibility` dep).
 - `src/error.rs` — `FrameError` (thiserror, `Clone` so it rides `Message` payloads): the single error type for the decode pipeline, exports, and frame-metadata reads. Replaces the old `Result<_, ()>` / `Result<_, String>` ad-hoc error surface.
-- `src/logging.rs` — the `log`-facade sink: a ~30-line stderr writer installed in `main` honoring `RUST_LOG` (e.g. `curvectrl=debug`); the `EXPOSURE_TRACE_DETAIL`/`EXPOSURE_TRACE_REBAKE` knobs force the trace level. Output keeps the established prefix-less style (`failed to decode /path: reason`).
+- `src/logging.rs` — the `log`-facade sink: a ~70-line stderr writer installed in `main`. **Target-scoped by default**: only this crate's records are emitted (all the app's diagnostics are `log::error!`), so the dependency tree (libcosmic/iced/wgpu/zbus/i18n-embed) stays silent unless opted in — `RUST_LOG=debug` (bare) raises every scope, `RUST_LOG=curvectrl=trace` only ours; `EXPOSURE_TRACE_DETAIL`/`EXPOSURE_TRACE_REBAKE` force our crate to `trace`. Output keeps the established prefix-less style (`failed to decode /path: reason`).
 
 ### Current behavior
 
