@@ -1062,7 +1062,11 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                 .on_resize(Message::DetailAreaResized)
                 .on_press(Message::DetailPanPress)
                 .on_move(Message::DetailPanMove)
-                .on_release(Message::DetailPanRelease),
+                .on_release(Message::DetailPanRelease)
+                // Grab/grasping hand once the view is pannable (zoomed past
+                // contain fit) and while a drag is in progress, so the preview
+                // advertises that press+drag pans.
+                .interaction(app.detail_cursor_interaction()),
             )
             .spacing(space_s)
             .align_x(Horizontal::Center)

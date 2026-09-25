@@ -3707,6 +3707,17 @@ impl AppModel {
         cap.min(NATIVE_ZOOM_THRESHOLD)
     }
 
+    /// The cursor to show over the detail preview: a grab hand once the view is
+    /// zoomed past the contain fit, and a grasping hand while a grab-pan drag is
+    /// active. At fit (or before any zoom) it stays the default arrow.
+    ///
+    /// Any `zoom > 1.0` already overflows the preview in at least the
+    /// constraining axis (`scale = contain_s · 2^(zoom−1) > contain_s`), so
+    /// "zoomed" and "able to pan" coincide at that threshold.
+    pub(crate) fn detail_cursor_interaction(&self) -> cosmic::iced::mouse::Interaction {
+        detail_cursor_for(self.detail_zoom.0, self.detail_panning)
+    }
+
     /// Recompute the zoom cap and pull the current zoom down to it if it shrank
     /// (texture level-up installs a larger texture and RAISES the cap; a
     /// crop/rotation/resize can LOWER it). Uses [`Self::max_detail_zoom_for_wheel`],
@@ -4571,6 +4582,23 @@ pub(crate) fn detail_zoom_delta(delta: cosmic::iced::mouse::ScrollDelta) -> f32 
     match delta {
         cosmic::iced::mouse::ScrollDelta::Lines { y, .. } => y * 0.5,
         cosmic::iced::mouse::ScrollDelta::Pixels { y, .. } => y / 400.0,
+    }
+}
+
+/// The detail-preview cursor for a given zoom (`1.0` = contain fit) and
+/// grab-pan state: a grasping hand while dragging, a grab hand once the view is
+/// zoomed in far enough to pan, and the default arrow otherwise. Pure so the
+/// policy is unit-tested; [`AppModel::detail_cursor_interaction`] feeds it the
+/// live state.
+#[must_use]
+fn detail_cursor_for(zoom: f32, panning: bool) -> cosmic::iced::mouse::Interaction {
+    use cosmic::iced::mouse::Interaction;
+    if panning {
+        Interaction::Grabbing
+    } else if zoom > 1.0 {
+        Interaction::Grab
+    } else {
+        Interaction::None
     }
 }
 
@@ -5853,6 +5881,18 @@ mod tests {
         assert!((detail_zoom_delta(pixels) - 1.0).abs() < 1e-6);
         let up = cosmic::iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 };
         assert!((detail_zoom_delta(up) + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn detail_cursor_is_arrow_at_fit_grab_when_zoomed_and_grabbing_on_drag() {
+        use cosmic::iced::mouse::Interaction;
+        // Contain fit (or zoomed out) cannot pan: default arrow.
+        assert_eq!(detail_cursor_for(1.0, false), Interaction::None);
+        // A live grab-pan drag always grasps, even at fit.
+        assert_eq!(detail_cursor_for(1.0, true), Interaction::Grabbing);
+        // Zoomed past contain: the image overflows, so panning is meaningful.
+        assert_eq!(detail_cursor_for(2.5, false), Interaction::Grab);
+        assert_eq!(detail_cursor_for(2.5, true), Interaction::Grabbing);
     }
 
     #[test]
