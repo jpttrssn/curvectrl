@@ -80,9 +80,9 @@ const DETAIL_PRELOAD_DISTANCE: usize = 1;
 const EDIT_STEP_EV: f32 = 0.50;
 /// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier.
 const EDIT_NUDGE_EV: f32 = 0.05;
-/// Keyboard shortcut step for a tone-curve power (contrast/rolloff/shadows)
+/// Keyboard shortcut step for a tone-curve power (contrast/highlights/shadows)
 /// with a bare key. Highlights and Shadows apply it to their user-facing lift
-/// value in stops (the `-log2` of the power), so a step UP lifts the region.
+/// value in stops, so a step UP lifts the region.
 const EDIT_STEP_CURVE: f32 = 0.20;
 /// Keyboard shortcut nudge step for a tone-curve power with the Shift modifier.
 const EDIT_NUDGE_CURVE: f32 = 0.05;
@@ -289,13 +289,13 @@ pub(crate) struct AppModel {
     /// `1.0` (identity) on every detail open. GPU-uniform only — the grid
     /// thumbnails always render with the default curve.
     pub(crate) curve_contrast: f32,
-    /// Highlight-rolloff power previewed in the detail view, pivoting the
-    /// live tone curve at the image's measured white point. Same lifecycle
-    /// and rules as [`Self::curve_contrast`].
-    pub(crate) curve_rolloff: f32,
-    /// Shadows power previewed in the detail view, pivoting the live tone
+    /// Highlights power previewed in the detail view, pivoting the live tone
     /// curve at the image's measured 10th-percentile shadow anchor. Same
     /// lifecycle and rules as [`Self::curve_contrast`].
+    pub(crate) curve_highlights: f32,
+    /// Shadows power previewed in the detail view, pivoting the live tone
+    /// curve at the image's measured white point. Same lifecycle and rules as
+    /// [`Self::curve_contrast`].
     pub(crate) curve_shadows: f32,
     /// Exposure compensation in EV (−3.00 to +3.00).
     pub(crate) exposure_ev: f32,
@@ -331,7 +331,7 @@ pub(crate) struct AppModel {
     /// the identity, so reset reverts the panel to its opened state.
     reset_exposure_ev: f32,
     reset_curve_contrast: f32,
-    reset_curve_rolloff: f32,
+    reset_curve_highlights: f32,
     reset_curve_shadows: f32,
     /// Crop as it was when the detail panel was opened; `ResetAll` restores it.
     reset_crop: edit_manifest::CropMargins,
@@ -744,7 +744,7 @@ pub(crate) enum Message {
     DetailPanMove(Point),
     /// The mouse was released or left the preview — grab-pan ends.
     DetailPanRelease,
-    /// The live tone curve changed: new contrast, rolloff, and shadows
+    /// The live tone curve changed: new contrast, highlights, and shadows
     /// powers. Applies to the shader as a uniform-only remap.
     CurveChanged(f32, f32, f32),
     /// Reset every first-class edit (exposure + tone curve) to their
@@ -845,7 +845,7 @@ pub(crate) enum MoveDir {
 pub enum EditAdjust {
     Exposure(f32),
     Contrast(f32),
-    Rolloff(f32),
+    Highlights(f32),
     Shadows(f32),
     /// Rotate the display one quarter-turn counter-clockwise (a discrete step,
     /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
@@ -1014,7 +1014,7 @@ impl cosmic::Application for AppModel {
             detail_panning: false,
             detail_cursor: None,
             curve_contrast: 1.0,
-            curve_rolloff: 1.0,
+            curve_highlights: 1.0,
             curve_shadows: 1.0,
             exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             crop: edit_manifest::CropMargins::default(),
@@ -1029,7 +1029,7 @@ impl cosmic::Application for AppModel {
             help_visible: false,
             reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
             reset_curve_contrast: 1.0,
-            reset_curve_rolloff: 1.0,
+            reset_curve_highlights: 1.0,
             reset_curve_shadows: 1.0,
             reset_crop: edit_manifest::CropMargins::default(),
             reset_rotation: 0,
@@ -1822,11 +1822,11 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::CurveChanged(contrast, rolloff, shadows) => {
+            Message::CurveChanged(contrast, highlights, shadows) => {
                 // RAM-only until an edit flush point (slider `on_release`,
                 // `DetailClosed`, window close) — same lifecycle as exposure.
                 // Shared with the keyboard `AdjustEdit` path via `set_curve`.
-                self.set_curve(contrast, rolloff, shadows);
+                self.set_curve(contrast, highlights, shadows);
                 Task::none()
             }
 
@@ -1840,7 +1840,7 @@ impl cosmic::Application for AppModel {
                 // `EditSave` points persist it).
                 self.exposure_ev = self.reset_exposure_ev;
                 self.curve_contrast = self.reset_curve_contrast;
-                self.curve_rolloff = self.reset_curve_rolloff;
+                self.curve_highlights = self.reset_curve_highlights;
                 self.curve_shadows = self.reset_curve_shadows;
                 self.crop = self.reset_crop;
                 self.rotation = self.reset_rotation;
@@ -1849,7 +1849,7 @@ impl cosmic::Application for AppModel {
                     self.roll.set_curve(
                         selected,
                         self.reset_curve_contrast,
-                        self.reset_curve_rolloff,
+                        self.reset_curve_highlights,
                         self.reset_curve_shadows,
                     );
                     self.roll.set_crop(selected, self.reset_crop);
@@ -1859,7 +1859,7 @@ impl cosmic::Application for AppModel {
                     shader.set_exposure(self.reset_exposure_ev);
                     shader.set_curve(
                         self.reset_curve_contrast,
-                        self.reset_curve_rolloff,
+                        self.reset_curve_highlights,
                         self.reset_curve_shadows,
                     );
                     shader.set_crop(self.reset_crop);
@@ -2780,7 +2780,7 @@ impl AppModel {
             self.clear_detail();
             self.exposure_ev = stored_tone.exposure_ev;
             self.curve_contrast = stored_tone.curve_contrast;
-            self.curve_rolloff = stored_tone.curve_rolloff;
+            self.curve_highlights = stored_tone.curve_highlights;
             self.curve_shadows = stored_tone.curve_shadows;
             self.crop = self.roll.crop(name);
             self.rotation = self.roll.rotation(name) & 3;
@@ -2791,7 +2791,7 @@ impl AppModel {
             // manifest values), so Reset reverts here rather than to identity.
             self.reset_exposure_ev = stored_tone.exposure_ev;
             self.reset_curve_contrast = stored_tone.curve_contrast;
-            self.reset_curve_rolloff = stored_tone.curve_rolloff;
+            self.reset_curve_highlights = stored_tone.curve_highlights;
             self.reset_curve_shadows = stored_tone.curve_shadows;
             self.reset_crop = self.crop;
             self.reset_rotation = self.rotation;
@@ -3468,7 +3468,7 @@ impl AppModel {
         ));
         if let Some(shader) = &mut self.detail_shader {
             shader.set_view(self.detail_zoom.0, self.detail_pan);
-            shader.set_curve(self.curve_contrast, self.curve_rolloff, self.curve_shadows);
+            shader.set_curve(self.curve_contrast, self.curve_highlights, self.curve_shadows);
             shader.set_crop(self.crop);
             shader.set_rotation(self.rotation);
             // A fresh program starts with the mask off; re-assert the current
@@ -3608,7 +3608,7 @@ impl AppModel {
         // no-op rather than committing a stale selection.
         self.editing_key_held = false;
         self.curve_contrast = 1.0;
-        self.curve_rolloff = 1.0;
+        self.curve_highlights = 1.0;
         self.curve_shadows = 1.0;
         self.exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
         self.crop = edit_manifest::CropMargins::default();
@@ -3618,7 +3618,7 @@ impl AppModel {
         // to identity on close; the next `ThumbnailActivated` re-syncs it.
         self.reset_exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
         self.reset_curve_contrast = 1.0;
-        self.reset_curve_rolloff = 1.0;
+        self.reset_curve_highlights = 1.0;
         self.reset_curve_shadows = 1.0;
         self.reset_crop = edit_manifest::CropMargins::default();
         self.reset_rotation = 0;
@@ -3843,17 +3843,18 @@ impl AppModel {
 
     /// Writes the open frame's tone-curve powers live: the RAM roll edit and
     /// the GPU shader uniforms. The slider (`CurveChanged`) and a keyboard step
-    /// (`EditAdjust::Contrast`/`Rolloff`/`Shadows`) both route here; committing
-    /// (persist + re-bake) stays separate like [`Self::set_exposure`].
-    fn set_curve(&mut self, contrast: f32, rolloff: f32, shadows: f32) {
+    /// (`EditAdjust::Contrast`/`Highlights`/`Shadows`) both route here;
+    /// committing (persist + re-bake) stays separate like
+    /// [`Self::set_exposure`].
+    fn set_curve(&mut self, contrast: f32, highlights: f32, shadows: f32) {
         self.curve_contrast = contrast;
-        self.curve_rolloff = rolloff;
+        self.curve_highlights = highlights;
         self.curve_shadows = shadows;
         if let Some(selected) = &self.selected {
-            self.roll.set_curve(selected, contrast, rolloff, shadows);
+            self.roll.set_curve(selected, contrast, highlights, shadows);
         }
         if let Some(shader) = &mut self.detail_shader {
-            shader.set_curve(contrast, rolloff, shadows);
+            shader.set_curve(contrast, highlights, shadows);
         }
     }
 
@@ -3879,22 +3880,24 @@ impl AppModel {
             // current values so the composed curve stays fully defined.
             EditAdjust::Contrast(delta) => {
                 let contrast = clamp_curve_power(self.curve_contrast + delta);
-                self.set_curve(contrast, self.curve_rolloff, self.curve_shadows);
+                self.set_curve(contrast, self.curve_highlights, self.curve_shadows);
             }
             // Highlights and Shadows step their user-facing LIFT value in
-            // stops (the `-log2` of the stored power), so the "increase" keys
-            // `'`/`.` lift/brighten the region exactly like dragging their
-            // slider right — keeping keyboard and slider directions in
-            // lockstep.
-            EditAdjust::Rolloff(delta) => {
-                let rolloff =
-                    curve_power_for_lift(curve_lift_value(self.curve_rolloff) + delta);
-                self.set_curve(self.curve_contrast, rolloff, self.curve_shadows);
+            // stops, so the "increase" keys `'`/`.` lift/brighten the region
+            // exactly like dragging their slider right — keeping keyboard and
+            // slider directions in lockstep. The two arms use opposite
+            // power↔lift maps because their pivots sit at opposite ends: a
+            // highlight lift raises the shadow-pivoted power, a shadow lift
+            // lowers the white-pivoted power.
+            EditAdjust::Highlights(delta) => {
+                let highlights =
+                    highlight_power_for_lift(highlight_lift(self.curve_highlights) + delta);
+                self.set_curve(self.curve_contrast, highlights, self.curve_shadows);
             }
             EditAdjust::Shadows(delta) => {
                 let shadows =
-                    curve_power_for_lift(curve_lift_value(self.curve_shadows) + delta);
-                self.set_curve(self.curve_contrast, self.curve_rolloff, shadows);
+                    shadow_power_for_lift(shadow_lift(self.curve_shadows) + delta);
+                self.set_curve(self.curve_contrast, self.curve_highlights, shadows);
             }
             // A display rotation steps one quarter-turn counter-clockwise
             // (authoring the composite of the crop + the EXIF-upright frame;
@@ -4018,11 +4021,11 @@ impl AppModel {
         {
             self.exposure_ev = tone.exposure_ev;
             self.curve_contrast = tone.curve_contrast;
-            self.curve_rolloff = tone.curve_rolloff;
+            self.curve_highlights = tone.curve_highlights;
             self.curve_shadows = tone.curve_shadows;
             if let Some(shader) = &mut self.detail_shader {
                 shader.set_exposure(tone.exposure_ev);
-                shader.set_curve(tone.curve_contrast, tone.curve_rolloff, tone.curve_shadows);
+                shader.set_curve(tone.curve_contrast, tone.curve_highlights, tone.curve_shadows);
             }
         }
 
@@ -4180,7 +4183,7 @@ impl AppModel {
                         shader.set_view(self.detail_zoom.0, self.detail_pan);
                         shader.set_curve(
                             self.curve_contrast,
-                            self.curve_rolloff,
+                            self.curve_highlights,
                             self.curve_shadows,
                         );
                         shader.set_crop(self.crop);
@@ -4603,35 +4606,50 @@ fn clamp_ev(ev: f32) -> f32 {
     ev.clamp(-3.0, 4.0)
 }
 
-/// Clamps a tone-curve power (contrast/rolloff/shadows) to the slider's range
-/// (0.25..=4.0) so a keyboard shortcut and the slider agree on bounds. The
-/// range is a symmetric reciprocal pair around the `1.0` identity, so the
-/// stop-based lift scale (`curve_lift_value`) spans an even ±2 stops.
+/// Clamps a tone-curve power (contrast/highlights/shadows) to the slider's
+/// range (0.25..=4.0) so a keyboard shortcut and the slider agree on bounds.
+/// The range is a symmetric reciprocal pair around the `1.0` identity, so the
+/// stop-based lift scales below span an even ±2 stops.
 fn clamp_curve_power(power: f32) -> f32 {
     power.clamp(0.25, 4.0)
 }
 
-/// The tone slider's user-facing "lift value" in stops: `-log2(power)`, so
-/// INCREASING it lifts/brightens the region (conventional photo app direction —
-/// drag right = lift, "how other apps work"). Identity at `0.0` (power 1.0 ⇔ 0
-/// stops), at the CENTER of the symmetric `−2..=2` track; power 0.5 is +1 stop
-/// of lift, power 2.0 is −1 stop (crush). Two stops of lift is a 4× (0.25)
-/// power, two of crush a 4× (4.0) power — equal perceptual reach each way. The
-/// stored `curve_rolloff`/`curve_shadows` power keeps its meaning (1.0 =
-/// identity, above = crush, below = lift), so the GPU math, manifests, and
-/// bakes never change — only this boundary layer flips the direction the user
-/// meets.
-pub(crate) fn curve_lift_value(power: f32) -> f32 {
+/// The Shadows slider's user-facing "lift value" in stops: `-log2(power)`, so
+/// INCREASING it lifts/brightens the lower tones. The shadows power pivots at
+/// the white point, so a lift drives the power BELOW 1.0 (a lower-tones lift
+/// with white pinned). Identity at `0.0` (power 1.0 ⇔ 0 stops), at the CENTER
+/// of the symmetric `−2..=2` track; power 0.5 is +1 stop of lift, power 2.0 is
+/// −1 stop (crush). Two stops of lift is a 4× (0.25) power, two of crush a 4×
+/// (4.0) power — equal perceptual reach each way.
+pub(crate) fn shadow_lift(power: f32) -> f32 {
     -(power.log2())
 }
 
-/// The stored curve power for a lift value (in stops) picked by a slider or
-/// keyboard step. Bound-sensitive inverse of [`curve_lift_value`] across the
-/// power range, so a value that exits `−2..=2` clamps to the same endpoints
+/// The stored shadows power for a lift value (in stops) picked by a slider or
+/// keyboard step. Bound-sensitive inverse of [`shadow_lift`] across the power
+/// range, so a value that exits `−2..=2` clamps to the same endpoints
 /// `clamp_curve_power` produces (round-trip `lift ↔ power` is exact within the
 /// range).
-pub(crate) fn curve_power_for_lift(value: f32) -> f32 {
+pub(crate) fn shadow_power_for_lift(value: f32) -> f32 {
     clamp_curve_power((-value).exp2())
+}
+
+/// The Highlights slider's user-facing "lift value" in stops: `+log2(power)`,
+/// so INCREASING it lifts/brightens the upper tones. The highlights power
+/// pivots at the shadow anchor, so a lift drives the power ABOVE 1.0 (an
+/// upper-tones lift with the shadow anchor pinned) — the opposite power
+/// direction from [`shadow_lift`], which is exactly what makes both sliders
+/// brighten their named region on a rightward drag. Identity at `0.0`, centered
+/// on the symmetric `−2..=2` track like the shadows arm.
+pub(crate) fn highlight_lift(power: f32) -> f32 {
+    power.log2()
+}
+
+/// The stored highlights power for a lift value (in stops) picked by a slider
+/// or keyboard step. Bound-sensitive inverse of [`highlight_lift`] across the
+/// power range (round-trip `lift ↔ power` is exact within the range).
+pub(crate) fn highlight_power_for_lift(value: f32) -> f32 {
+    clamp_curve_power(value.exp2())
 }
 
 /// Translates the crop window by `delta_px` in `direction`, keeping the window
@@ -4770,12 +4788,13 @@ fn resize_crop_box(
 /// key is not bound. `alt` and `shift` are the event's modifier state.
 ///
 /// The four control pairs are laid out on a US keyboard left-to-right to match
-/// the editing panel's control order (Exposure → Contrast → Rolloff → Shadows):
-/// `-`/`=` exposure, `[`/`]` contrast, `;`/`'` rolloff, `,`/`.` shadows. A bare
-/// key uses the coarse step; holding `Shift` selects the fine nudge step. The
-/// "increase" key of each pair (`=`/`]`/`'`/`.`) applies a POSITIVE step — for
-/// the rolloff/shadows arms this steps the user-facing lift value (see
-/// [`curve_lift_value`]), so `'`/`.` lift the region's shadows or highlights.
+/// the editing panel's control order (Exposure → Contrast → Highlights →
+/// Shadows): `-`/`=` exposure, `[`/`]` contrast, `;`/`'` highlights, `,`/`.`
+/// shadows. A bare key uses the coarse step; holding `Shift` selects the fine
+/// nudge step. The "increase" key of each pair (`=`/`]`/`'`/`.`) applies a
+/// POSITIVE step — for the highlights/shadows arms this steps the user-facing
+/// lift value (see [`shadow_lift`]/[`highlight_lift`]), so `'`/`.` brighten the
+/// region's highlights or shadows.
 /// `-`/`=` stay the exposure pair here; the crop-mode handler reinterprets them
 /// as the window resize. `r` rotates the display one quarter-turn
 /// counter-clockwise (cumulative; modifiers ignored). The VIM movement keys
@@ -4800,8 +4819,8 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
         "=" => Some(EditAdjust::Exposure(ev)),
         "[" => Some(EditAdjust::Contrast(-curve)),
         "]" => Some(EditAdjust::Contrast(curve)),
-        ";" => Some(EditAdjust::Rolloff(-curve)),
-        "'" => Some(EditAdjust::Rolloff(curve)),
+        ";" => Some(EditAdjust::Highlights(-curve)),
+        "'" => Some(EditAdjust::Highlights(curve)),
         "," => Some(EditAdjust::Shadows(-curve)),
         "." => Some(EditAdjust::Shadows(curve)),
         // Rotate the display one quarter-turn counter-clockwise. A bare `r`
@@ -5938,38 +5957,57 @@ mod tests {
     }
 
     #[test]
-    fn curve_lift_value_inverts_the_power_direction() {
+    fn shadow_lift_value_inverts_the_power_direction() {
         // Identity sits at the center 0.0 for the stop-based lift value.
-        assert!((curve_lift_value(1.0) - 0.0).abs() < 1e-6);
-        // The log flips direction: a power below 1.0 (a LIFT) reads as a
-        // POSITIVE lift value, so dragging the slider right brightens.
-        assert!((curve_lift_value(0.5) - 1.0).abs() < 1e-6);
-        assert!((curve_lift_value(2.0) - (-1.0)).abs() < 1e-6);
-        // One stop is a 2× power either way (symmetric around identity).
-        let (a, b) = (curve_lift_value(0.5), curve_lift_value(2.0));
-        assert!((a - 1.0).abs() < 1e-6 && (b + 1.0).abs() < 1e-6);
+        assert!((shadow_lift(1.0) - 0.0).abs() < 1e-6);
+        // The log flips direction: a shadows power below 1.0 (a lower-tones
+        // lift, white-pivoted) reads as a POSITIVE lift value, so dragging the
+        // slider right brightens the shadows.
+        assert!((shadow_lift(0.5) - 1.0).abs() < 1e-6);
+        assert!((shadow_lift(2.0) - (-1.0)).abs() < 1e-6);
         // The lift value is monotone decreasing in the power, which is the point.
-        let (a, b) = (curve_lift_value(0.6), curve_lift_value(1.4));
+        let (a, b) = (shadow_lift(0.6), shadow_lift(1.4));
         assert!(a > b);
     }
 
     #[test]
-    fn curve_power_for_lift_round_trips_across_the_power_range() {
-        // Round-tripping a power through its lift value is exact within bounds.
+    fn highlight_lift_value_follows_the_power_direction() {
+        // Identity sits at the center 0.0.
+        assert!((highlight_lift(1.0) - 0.0).abs() < 1e-6);
+        // The highlights power pivots at the shadow anchor, so a lift drives
+        // the power ABOVE 1.0: a positive lift value must map to power > 1 so
+        // dragging the highlights slider right brightens the upper tones.
+        assert!((highlight_lift(2.0) - 1.0).abs() < 1e-6);
+        assert!((highlight_lift(0.5) - (-1.0)).abs() < 1e-6);
+        // Monotone increasing in the power — the opposite of the shadows arm.
+        let (a, b) = (highlight_lift(0.6), highlight_lift(1.4));
+        assert!(a < b);
+    }
+
+    #[test]
+    fn lift_maps_round_trip_across_the_power_range() {
         for power in [0.25_f32, 0.5, 1.0, 1.7, 4.0] {
-            let back = curve_power_for_lift(curve_lift_value(power));
+            let shadow_back = shadow_power_for_lift(shadow_lift(power));
             assert!(
-                (back - power).abs() < 1e-5,
-                "power {power} round-tripped to {back}"
+                (shadow_back - power).abs() < 1e-5,
+                "shadows power {power} round-tripped to {shadow_back}"
+            );
+            let highlight_back = highlight_power_for_lift(highlight_lift(power));
+            assert!(
+                (highlight_back - power).abs() < 1e-5,
+                "highlights power {power} round-tripped to {highlight_back}"
             );
         }
         // Values leaving the symmetric ±2-stop window clamp to the power
         // endpoints, so an exited lift track and `clamp_curve_power` agree on
         // bounds.
-        assert_eq!(curve_power_for_lift(3.0), 0.25);
-        assert_eq!(curve_power_for_lift(-3.0), 4.0);
-        // The identity lift value maps to the identity power.
-        assert!((curve_power_for_lift(0.0) - 1.0).abs() < 1e-6);
+        assert_eq!(shadow_power_for_lift(3.0), 0.25);
+        assert_eq!(shadow_power_for_lift(-3.0), 4.0);
+        assert_eq!(highlight_power_for_lift(3.0), 4.0);
+        assert_eq!(highlight_power_for_lift(-3.0), 0.25);
+        // The identity lift value maps to the identity power on both arms.
+        assert!((shadow_power_for_lift(0.0) - 1.0).abs() < 1e-6);
+        assert!((highlight_power_for_lift(0.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -6008,22 +6046,22 @@ mod tests {
             edit_adjust_for("]", false, true),
             Some(EditAdjust::Contrast(EDIT_NUDGE_CURVE))
         );
-        // Rolloff pair: `;`/`'` coarse, Shift nudge.
+        // Highlights pair: `;`/`'` coarse, Shift nudge.
         assert_eq!(
             edit_adjust_for(";", false, false),
-            Some(EditAdjust::Rolloff(-EDIT_STEP_CURVE))
+            Some(EditAdjust::Highlights(-EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for("'", false, false),
-            Some(EditAdjust::Rolloff(EDIT_STEP_CURVE))
+            Some(EditAdjust::Highlights(EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for(";", false, true),
-            Some(EditAdjust::Rolloff(-EDIT_NUDGE_CURVE))
+            Some(EditAdjust::Highlights(-EDIT_NUDGE_CURVE))
         );
         assert_eq!(
             edit_adjust_for("'", false, true),
-            Some(EditAdjust::Rolloff(EDIT_NUDGE_CURVE))
+            Some(EditAdjust::Highlights(EDIT_NUDGE_CURVE))
         );
         // Shadows pair: `,`/`.` coarse, Shift nudge.
         assert_eq!(
@@ -6587,7 +6625,7 @@ mod tests {
             let tone = edit_manifest::ToneEdit {
                 exposure_ev: ev,
                 curve_contrast: rng.next() * 1.5 + 0.5,
-                curve_rolloff: rng.next() * 1.5 + 0.5,
+                curve_highlights: rng.next() * 1.5 + 0.5,
                 curve_shadows: rng.next() * 1.5 + 0.5,
             };
             let preset = if rng.next() < 0.5 {
@@ -6613,7 +6651,7 @@ mod tests {
             // The GPU side delivers the same tone model through the LUT.
             let lut = half_lut_bytes_to_f32(&shader::build_tone_lut(
                 tone.curve_contrast,
-                tone.curve_rolloff,
+                tone.curve_highlights,
                 tone.curve_shadows,
                 shadow,
                 mid,

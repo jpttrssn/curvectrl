@@ -47,19 +47,21 @@ pub struct DetailProgram {
     /// pivots around. Measured once at construction from `mono`.
     mid: f32,
     /// 98th percentile of the uploaded positive: the white point the
-    /// highlight-rolloff curve pivots around.
+    /// shadows curve pivots around.
     white: f32,
     /// 10th percentile of the uploaded positive: the shadow anchor the
-    /// shadows curve pivots around. Measured once at construction from `mono`.
+    /// highlights curve pivots around. Measured once at construction from `mono`.
     shadow: f32,
     /// Contrast power `kc`: the live tone curve pivots at `mid`,
     /// `C(p) = mid^(1-kc) * p^kc`. `1.0` = identity (no contrast change).
     contrast: f32,
-    /// Highlight-rolloff power `kr`: the live tone curve pivots at `white`,
-    /// `R(p) = white^(1-kr) * p^kr`. `1.0` = identity.
-    rolloff: f32,
-    /// Shadows power `ks`: the live tone curve pivots at `shadow`,
-    /// `S(p) = shadow^(1-ks) * p^ks`. `1.0` = identity.
+    /// Highlights power `kh`: the live tone curve pivots at `shadow`,
+    /// `H(p) = shadow^(1-kh) * p^kh`. `1.0` = identity; raising it brightens the
+    /// upper tones (a highlight lift, pinning the shadow anchor).
+    highlights: f32,
+    /// Shadows power `ks`: the live tone curve pivots at `white`,
+    /// `S(p) = white^(1-ks) * p^ks`. `1.0` = identity; lowering it brightens the
+    /// lower tones (a shadow lift, pinning the white point).
     shadows: f32,
     /// Live source-pixel crop margins removed from each edge of the
     /// full-resolution display-oriented frame. Applied as a uniform UV-remap
@@ -203,7 +205,7 @@ impl DetailProgram {
             white,
             shadow,
             contrast: 1.0,
-            rolloff: 1.0,
+            highlights: 1.0,
             shadows: 1.0,
             crop,
             rotation,
@@ -228,7 +230,7 @@ impl DetailProgram {
     fn rebuild_tone_lut(&mut self) {
         self.tone_lut = build_tone_lut(
             self.contrast,
-            self.rolloff,
+            self.highlights,
             self.shadows,
             self.shadow,
             self.mid,
@@ -266,21 +268,21 @@ impl DetailProgram {
         self.pan = pan;
     }
 
-    /// Update the contrast/rolloff/shadows tone curve (called on editing
+    /// Update the contrast/highlights/shadows tone curve (called on editing
     /// drawer sliders). Only the two remap uniforms change — the uploaded
     /// texture stays the fixed render, re-curved per pixel in WGSL.
     ///
-    /// `contrast` pivots at the image's measured mid-gray, `rolloff` at the
-    /// measured white point, `shadows` at the measured 10th-percentile shadow
-    /// anchor (`1.0` = identity for each); all three compose into the single
+    /// `contrast` pivots at the image's measured mid-gray, `highlights` at the
+    /// measured 10th-percentile shadow anchor, `shadows` at the measured white
+    /// point (`1.0` = identity for each); all three compose into the single
     /// `ratio * p^exp` remap the shader applies. The Highlights/Shadows slider
     /// and keyboard layers present these powers through a stop-based "lift
-    /// value" (`app::curve_lift_value = -log2(power)`, 0 = identity at the
+    /// value" (`app::highlight_lift`/`app::shadow_lift`, 0 = identity at the
     /// track center, +n = n stops lifting) so increasing on screen brightens
     /// the region; this method is the unconverted raw-power boundary.
-    pub fn set_curve(&mut self, contrast: f32, rolloff: f32, shadows: f32) {
+    pub fn set_curve(&mut self, contrast: f32, highlights: f32, shadows: f32) {
         self.contrast = contrast;
-        self.rolloff = rolloff;
+        self.highlights = highlights;
         self.shadows = shadows;
         self.rebuild_tone_lut();
     }
@@ -393,7 +395,7 @@ impl Clone for DetailProgram {
             white: self.white,
             shadow: self.shadow,
             contrast: self.contrast,
-            rolloff: self.rolloff,
+            highlights: self.highlights,
             shadows: self.shadows,
             crop: self.crop,
             rotation: self.rotation,
@@ -426,7 +428,7 @@ impl std::fmt::Debug for DetailProgram {
             .field("white", &self.white)
             .field("shadow", &self.shadow)
             .field("contrast", &self.contrast)
-            .field("rolloff", &self.rolloff)
+            .field("highlights", &self.highlights)
             .field("shadows", &self.shadows)
             .field("crop", &self.crop)
             .field("rotation", &self.rotation)
@@ -689,19 +691,19 @@ fn percentile(bins: &[u64], total: usize, q: f32) -> f32 {
 
 /// Precompute the per-frame tone remap `T(p) = clamp(ratio * p^exp, 0, 1)`.
 ///
-/// Contrast, rolloff, and shadows are power curves pivoted at the image's
-/// measured mid-gray (`mid`), white point (`white`), and shadow anchor
-/// (`shadow`):
+/// Contrast, highlights, and shadows are power curves pivoted at the image's
+/// measured mid-gray (`mid`), shadow anchor (`shadow`), and white point
+/// (`white`):
 ///
 /// `C(p) = mid^(1-kc) · p^kc`          (pivot at `mid`: `C(mid) = mid`)
-/// `R(p) = white^(1-kr) · p^kr`         (pivot at `white`: `R(white) = white`)
-/// `S(p) = shadow^(1-ks) · p^ks`        (pivot at `shadow`: `S(shadow) =
+/// `H(p) = shadow^(1-kh) · p^kh`        (pivot at `shadow`: `H(shadow) =
 ///                                                    shadow`)
+/// `S(p) = white^(1-ks) · p^ks`         (pivot at `white`: `S(white) = white`)
 ///
 /// Three monotone powers compose exactly into one power, so all three fit a
 /// single `(ratio, exp)` pair the WGSL shader applies as `ratio·p^exp`:
-/// `S∘R∘C(p) = (shadow^(1-ks) · white^(ks(1-kr)) · mid^(ks·kr(1-kc))) · p^(kc·kr·ks)`.
-/// At `kc = kr = ks = 1` the remap is the identity (`ratio = 1`, `exp = 1`),
+/// `H∘S∘C(p) = (shadow^(1-kh) · white^(kh(1-ks)) · mid^(kh·ks(1-kc))) · p^(kc·ks·kh)`.
+/// At `kc = kh = ks = 1` the remap is the identity (`ratio = 1`, `exp = 1`),
 /// so untouched renders stay byte-identical.
 ///
 /// `pub(crate)` — the shared helper the CPU thumbnail bake reuses so grid and
@@ -709,22 +711,22 @@ fn percentile(bins: &[u64], total: usize, q: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn curve_remap(
     contrast: f32,
-    rolloff: f32,
+    highlights: f32,
     shadows: f32,
     shadow: f32,
     mid: f32,
     white: f32,
 ) -> (f32, f32) {
     // A shadow pivot pinned to literal black (the clear-film plateau at EV ≤ 0)
-    // would make the Shadows power explode: `s^(1-ks)` near `s ≈ 0` lifts the
+    // would make the highlights power explode: `s^(1-kh)` near `s ≈ 0` lifts the
     // whole positive to white. Floor the pivot to a share of the mid so the
     // control keeps acting on the darkest detail; at the identity defaults
-    // (`ks = 1`) every pivot power vanishes and the remap stays exactly 1.
+    // (`kh = 1`) every pivot power vanishes and the remap stays exactly 1.
     let shadow = shadow.max(mid * SHADOW_PIVOT_FLOOR);
-    let ratio = shadow.powf(1.0 - shadows)
-        * white.powf(shadows * (1.0 - rolloff))
-        * mid.powf(shadows * rolloff * (1.0 - contrast));
-    let exponent = contrast * rolloff * shadows;
+    let ratio = shadow.powf(1.0 - highlights)
+        * white.powf(highlights * (1.0 - shadows))
+        * mid.powf(highlights * shadows * (1.0 - contrast));
+    let exponent = contrast * highlights * shadows;
     (ratio, exponent)
 }
 
@@ -743,13 +745,13 @@ pub(crate) fn curve_remap(
 pub(crate) fn apply_curve(
     mono: &mut [f32],
     contrast: f32,
-    rolloff: f32,
+    highlights: f32,
     shadows: f32,
     shadow: f32,
     mid: f32,
     white: f32,
 ) {
-    let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
+    let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
     for value in mono.iter_mut() {
         *value = tone_model(*value, ratio, exponent);
     }
@@ -797,13 +799,13 @@ pub(crate) const TONE_LUT_SCALE: f32 = 512.0;
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub(crate) fn build_tone_lut(
     contrast: f32,
-    rolloff: f32,
+    highlights: f32,
     shadows: f32,
     shadow: f32,
     mid: f32,
     white: f32,
 ) -> Vec<u8> {
-    let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
+    let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
     let mut lut = Vec::with_capacity(TONE_LUT_ENTRIES * 2);
     for i in 0..TONE_LUT_ENTRIES {
         let t = i as f32 / (TONE_LUT_ENTRIES - 1) as f32;
@@ -2048,45 +2050,69 @@ mod tests {
     }
 
     #[test]
-    fn rolloff_pivots_around_the_image_white_point() {
+    fn highlights_pivots_around_the_image_shadow_anchor() {
         let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        for kr in [0.6_f32, 1.3] {
-            let (ratio, exponent) = curve_remap(1.0, kr, 1.0, shadow, mid, white);
-            let t_white = (ratio * white.powf(exponent)).clamp(0.0, 1.0);
+        for kh in [0.6_f32, 1.3] {
+            let (ratio, exponent) = curve_remap(1.0, kh, 1.0, shadow, mid, white);
+            let t_shadow = (ratio * shadow.powf(exponent)).clamp(0.0, 1.0);
             assert!(
-                (t_white - white).abs() < 1e-5,
-                "rolloff {kr}: T(white) = {t_white}"
+                (t_shadow - shadow).abs() < 1e-5,
+                "highlights {kh}: T(shadow) = {t_shadow}"
             );
         }
     }
 
     #[test]
-    fn shadows_pivots_around_the_image_shadow_anchor() {
+    fn shadows_pivots_around_the_image_white_point() {
         let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
         for ks in [0.6_f32, 1.3] {
             let (ratio, exponent) = curve_remap(1.0, 1.0, ks, shadow, mid, white);
-            let t_shadow = (ratio * shadow.powf(exponent)).clamp(0.0, 1.0);
+            let t_white = (ratio * white.powf(exponent)).clamp(0.0, 1.0);
             assert!(
-                (t_shadow - shadow).abs() < 1e-5,
-                "shadows {ks}: T(shadow) = {t_shadow}"
+                (t_white - white).abs() < 1e-5,
+                "shadows {ks}: T(white) = {t_white}"
             );
         }
+    }
+
+    #[test]
+    fn highlights_and_shadows_lift_their_own_region() {
+        // The user-facing direction: raising a lift value presses `2^-L` (shadow
+        // power, pivot white) or `2^+L` (highlight power, pivot shadow). Each
+        // must brighten its named region while pinning the far anchor.
+        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
+        let dark = 0.2_f32;
+        let bright = 0.7_f32;
+        let tone = |kh: f32, ks: f32, p: f32| {
+            let (ratio, exponent) = curve_remap(1.0, kh, ks, shadow, mid, white);
+            (ratio * p.powf(exponent)).clamp(0.0, 1.0)
+        };
+        // Highlight lift: power up, the bright patch rises, the deep shadow
+        // barely moves (pivoted at the shadow anchor).
+        let (hid, hlift) = (1.0_f32, 2.0_f32);
+        assert!(tone(hlift, 1.0, bright) > tone(hid, 1.0, bright));
+        // Shadow lift: power down, the dark patch rises, white stays pinned.
+        let (sid, slift) = (1.0_f32, 0.5_f32);
+        assert!(tone(1.0, slift, dark) > tone(1.0, sid, dark));
+        assert!((tone(1.0, slift, white) - white).abs() < 1e-5);
+        // Both directions are the identity at the centered lift value.
+        assert!((tone(1.0, 1.0, bright) - bright).abs() < 1e-5);
     }
 
     #[test]
     fn curve_remap_composes_the_three_pivots_exactly() {
-        // Applying the rolloff and shadows powers after the contrast power must
-        // equal the single (ratio, exp) the shader applies — the composition is
-        // exact for the underlying power functions. The shader applies one
-        // final clamp (never an intermediate one), so compare raw then
-        // both-clamped.
+        // Applying the highlights and shadows powers after the contrast power
+        // must equal the single (ratio, exp) the shader applies — the
+        // composition is exact for the underlying power functions. The shader
+        // applies one final clamp (never an intermediate one), so compare raw
+        // then both-clamped.
         let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        let (kc, kr, ks) = (1.25_f32, 0.75_f32, 1.4_f32);
-        let (ratio, exponent) = curve_remap(kc, kr, ks, shadow, mid, white);
+        let (kc, kh, ks) = (1.25_f32, 0.75_f32, 1.4_f32);
+        let (ratio, exponent) = curve_remap(kc, kh, ks, shadow, mid, white);
         for p in [0.0_f32, 0.05, 0.15, 0.4, 0.6, 0.92, 1.0] {
             let c = mid.powf(1.0 - kc) * p.powf(kc);
-            let r = white.powf(1.0 - kr) * c.powf(kr);
-            let sequential = shadow.powf(1.0 - ks) * r.powf(ks);
+            let s = white.powf(1.0 - ks) * c.powf(ks);
+            let sequential = shadow.powf(1.0 - kh) * s.powf(kh);
             let composed = ratio * p.powf(exponent);
             assert!(
                 (sequential - composed).abs() < 1e-4,
@@ -2236,14 +2262,14 @@ mod tests {
     }
 
     #[test]
-    fn shadow_pivot_floor_keeps_the_shadows_power_usable() {
+    fn shadow_pivot_floor_keeps_the_highlights_power_usable() {
         // A frame whose bottom decile is literal black (the clear-film plateau
         // at EV ≤ 0) yields a shadow pivot near MIN_ANCHOR. Without the floor,
-        // `s^(1-ks)` ≈ 31× at ks=1.5 would blow the whole positive to white.
+        // `s^(1-kh)` ≈ 31× at kh=1.5 would blow the whole positive to white.
         let (shadow, mid, white) = (MIN_ANCHOR, 0.3_f32, 0.9_f32);
-        let (ratio, exp) = curve_remap(1.0, 1.0, 1.5, shadow, mid, white);
+        let (ratio, exp) = curve_remap(1.0, 1.5, 1.0, shadow, mid, white);
         let lifted_mid = ratio * mid.powf(exp);
-        assert!(lifted_mid < 1.0, "shadows power blew out the mid-gray: {lifted_mid}");
+        assert!(lifted_mid < 1.0, "highlights power blew out the mid-gray: {lifted_mid}");
 
         // The identity still travels through the floored pivot untouched.
         let (ratio_id, exp_id) = curve_remap(1.0, 1.0, 1.0, shadow, mid, white);
@@ -2274,13 +2300,13 @@ mod tests {
         // the expression). Re-derive the expression independently and confirm
         // they agree across the input range.
         let (shadow, mid, white) = (0.18_f32, 0.42_f32, 0.93_f32);
-        let (contrast, rolloff, shadows) = (1.25_f32, 0.7_f32, 1.3_f32);
-        let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
+        let (contrast, highlights, shadows) = (1.25_f32, 0.7_f32, 1.3_f32);
+        let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
 
         for p in [0.0_f32, 0.05, 0.18, 0.25, 0.42, 0.7, 0.93, 1.0, 3.0] {
             let expected = (ratio * p.powf(exponent)).clamp(0.0, 1.0);
             let mut v = [p];
-            apply_curve(&mut v, contrast, rolloff, shadows, shadow, mid, white);
+            apply_curve(&mut v, contrast, highlights, shadows, shadow, mid, white);
             assert!((v[0] - expected).abs() < 1e-6, "p {p}: {v:?} vs {expected}");
         }
     }
@@ -2293,11 +2319,11 @@ mod tests {
         // R16Float sampler would), and interpolating must stay within a small
         // tolerance of the exact expression everywhere.
         let (shadow, mid, white) = (0.15_f32, 0.45_f32, 0.92_f32);
-        for (contrast, rolloff, shadows) in
+        for (contrast, highlights, shadows) in
             [(1.0_f32, 1.0_f32, 1.0_f32), (1.25, 0.7, 1.3), (0.5, 2.0, 0.4), (1.8, 1.1, 2.5)]
         {
-            let (ratio, exponent) = curve_remap(contrast, rolloff, shadows, shadow, mid, white);
-            let bytes = build_tone_lut(contrast, rolloff, shadows, shadow, mid, white);
+            let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
+            let bytes = build_tone_lut(contrast, highlights, shadows, shadow, mid, white);
             let lut: Vec<f32> = bytes
                 .chunks_exact(2)
                 .map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -2307,7 +2333,7 @@ mod tests {
                 let sampled = sample_tone_lut_f32(&lut, p);
                 assert!(
                     (sampled - exact).abs() <= 1e-3,
-                    "curve {contrast}/{rolloff}/{shadows} p {p}: lut {sampled} vs exact {exact}"
+                    "curve {contrast}/{highlights}/{shadows} p {p}: lut {sampled} vs exact {exact}"
                 );
             }
         }

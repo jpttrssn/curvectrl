@@ -298,9 +298,9 @@ fn shade(uv: vec2<f32>) -> f32 {
         // --- Already-positive scan (unchanged path) ---
         // Live tone curve re-shapes the baked positive's values via the same
         // gamma-domain tone LUT: the CPU folds the contrast power (pivot at the
-        // image's measured mid-gray), the highlight-rolloff power (pivot at the
-        // measured white point), and the shadows power (pivot at the measured
-        // shadow anchor) into the LUT at build time. Identity at the defaults
+        // image's measured mid-gray), the shadows power (pivot at the measured
+        // white point), and the highlights power (pivot at the measured shadow
+        // anchor) into the LUT at build time. Identity at the defaults
         // (byte-identical render).
         let remapped = textureSample(t_tone, s_tone, vec2<f32>(pow(mono_linear, 0.4545455), 0.5)).r
             / 512.0;

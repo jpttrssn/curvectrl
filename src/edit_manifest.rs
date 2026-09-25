@@ -22,12 +22,12 @@ pub const DEFAULT_EXPOSURE_EV: f32 = 0.7;
 /// Contrast power applied until an edit records otherwise (identity `1.0`).
 pub const DEFAULT_CURVE_CONTRAST: f32 = 1.0;
 
-/// Highlight-rolloff power applied until an edit records otherwise (identity
-/// `1.0`).
-pub const DEFAULT_CURVE_ROLLOFF: f32 = 1.0;
-
-/// Shadows power (pivoted at the image's measured shadow anchor) applied
+/// Highlights power (pivoted at the image's measured shadow anchor) applied
 /// until an edit records otherwise (identity `1.0`).
+pub const DEFAULT_CURVE_HIGHLIGHTS: f32 = 1.0;
+
+/// Shadows power (pivoted at the image's measured white point) applied until an
+/// edit records otherwise (identity `1.0`).
 pub const DEFAULT_CURVE_SHADOWS: f32 = 1.0;
 
 /// Serializable per-file edits.
@@ -40,12 +40,12 @@ pub struct EditData {
     /// `1.0` = identity. Missing in older manifests stays `1.0`.
     #[serde(default = "default_curve_identity")]
     pub curve_contrast: f32,
-    /// Tone-curve highlight-rolloff power (pivoted at the image's measured
-    /// white point), `1.0` = identity. Missing in older manifests stays `1.0`.
-    #[serde(default = "default_curve_identity")]
-    pub curve_rolloff: f32,
-    /// Tone-curve shadows power (pivoted at the image's measured shadow
+    /// Tone-curve highlights power (pivoted at the image's measured shadow
     /// anchor), `1.0` = identity. Missing in older manifests stays `1.0`.
+    #[serde(default = "default_curve_identity")]
+    pub curve_highlights: f32,
+    /// Tone-curve shadows power (pivoted at the image's measured white point),
+    /// `1.0` = identity. Missing in older manifests stays `1.0`.
     #[serde(default = "default_curve_identity")]
     pub curve_shadows: f32,
     /// Source-pixel crop margins removed from each edge. Missing in older
@@ -71,7 +71,7 @@ impl Default for EditData {
         Self {
             exposure_ev: DEFAULT_EXPOSURE_EV,
             curve_contrast: DEFAULT_CURVE_CONTRAST,
-            curve_rolloff: DEFAULT_CURVE_ROLLOFF,
+            curve_highlights: DEFAULT_CURVE_HIGHLIGHTS,
             curve_shadows: DEFAULT_CURVE_SHADOWS,
             crop: CropMargins::default(),
             rotation: 0,
@@ -103,7 +103,7 @@ fn default_exposure() -> f32 {
 pub struct ToneEdit {
     pub exposure_ev: f32,
     pub curve_contrast: f32,
-    pub curve_rolloff: f32,
+    pub curve_highlights: f32,
     pub curve_shadows: f32,
 }
 
@@ -112,7 +112,7 @@ impl Default for ToneEdit {
         Self {
             exposure_ev: DEFAULT_EXPOSURE_EV,
             curve_contrast: DEFAULT_CURVE_CONTRAST,
-            curve_rolloff: DEFAULT_CURVE_ROLLOFF,
+            curve_highlights: DEFAULT_CURVE_HIGHLIGHTS,
             curve_shadows: DEFAULT_CURVE_SHADOWS,
         }
     }
@@ -251,15 +251,14 @@ impl RollManifest {
         }
     }
 
-    /// Records the tone curve for `name` (contrast + highlight rolloff +
-    /// shadows), updating an existing entry in place. All identities are
-    /// `1.0`.
+    /// Records the tone curve for `name` (contrast + highlights + shadows),
+    /// updating an existing entry in place. All identities are `1.0`.
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
-    pub fn set_curve(&mut self, name: &str, contrast: f32, rolloff: f32, shadows: f32) {
+    pub fn set_curve(&mut self, name: &str, contrast: f32, highlights: f32, shadows: f32) {
         if let Some(edit) = self.edits.get_mut(name) {
             edit.curve_contrast = contrast;
-            edit.curve_rolloff = rolloff;
+            edit.curve_highlights = highlights;
             edit.curve_shadows = shadows;
         } else {
             self.edits.insert(
@@ -267,7 +266,7 @@ impl RollManifest {
                 EditData {
                     exposure_ev: DEFAULT_EXPOSURE_EV,
                     curve_contrast: contrast,
-                    curve_rolloff: rolloff,
+                    curve_highlights: highlights,
                     curve_shadows: shadows,
                     ..EditData::default()
                 },
@@ -288,7 +287,7 @@ impl RollManifest {
             .map_or_else(ToneEdit::identity, |edit| ToneEdit {
                 exposure_ev: edit.exposure_ev,
                 curve_contrast: edit.curve_contrast,
-                curve_rolloff: edit.curve_rolloff,
+                curve_highlights: edit.curve_highlights,
                 curve_shadows: edit.curve_shadows,
             })
     }
@@ -312,7 +311,7 @@ impl RollManifest {
             EditData {
                 exposure_ev: tone.exposure_ev,
                 curve_contrast: tone.curve_contrast,
-                curve_rolloff: tone.curve_rolloff,
+                curve_highlights: tone.curve_highlights,
                 curve_shadows: tone.curve_shadows,
                 crop: existing,
                 rotation,
@@ -628,7 +627,7 @@ mod tests {
         assert_eq!(loaded.tone("IMG_0002.RAW").exposure_ev, -0.75);
         let tone_one = loaded.tone("IMG_0001.DNG");
         assert_eq!(tone_one.curve_contrast, 0.85);
-        assert_eq!(tone_one.curve_rolloff, 1.15);
+        assert_eq!(tone_one.curve_highlights, 1.15);
         assert_eq!(tone_one.curve_shadows, 1.1);
         // The second image carried only an exposure edit → curve identity.
         assert_eq!(
@@ -781,7 +780,7 @@ mod tests {
         let tone = loaded.tone("a.DNG");
         assert_eq!(tone.exposure_ev, 0.75);
         assert_eq!(tone.curve_contrast, DEFAULT_CURVE_CONTRAST);
-        assert_eq!(tone.curve_rolloff, DEFAULT_CURVE_ROLLOFF);
+        assert_eq!(tone.curve_highlights, DEFAULT_CURVE_HIGHLIGHTS);
         assert_eq!(tone.curve_shadows, DEFAULT_CURVE_SHADOWS);
     }
 
@@ -801,7 +800,7 @@ mod tests {
         assert_eq!(loaded, manifest);
         let tone = loaded.tone("IMG_0001.DNG");
         assert_eq!(tone.curve_contrast, 0.8);
-        assert_eq!(tone.curve_rolloff, 1.2);
+        assert_eq!(tone.curve_highlights, 1.2);
         assert_eq!(tone.curve_shadows, 1.05);
         // Exposure survives alongside the curve on the same edit.
         assert_eq!(tone.exposure_ev, 0.42);
@@ -816,7 +815,7 @@ mod tests {
         assert_eq!(manifest.edits.len(), 1);
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.curve_contrast, 1.0);
-        assert_eq!(tone.curve_rolloff, 1.0);
+        assert_eq!(tone.curve_highlights, 1.0);
         assert_eq!(tone.curve_shadows, 1.0);
     }
 
@@ -844,7 +843,7 @@ mod tests {
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, -0.5);
         assert_eq!(tone.curve_contrast, 1.2);
-        assert_eq!(tone.curve_rolloff, 0.8);
+        assert_eq!(tone.curve_highlights, 0.8);
         assert_eq!(tone.curve_shadows, 0.9);
     }
 
@@ -860,7 +859,7 @@ mod tests {
             ToneEdit {
                 exposure_ev: -1.2,
                 curve_contrast: 0.7,
-                curve_rolloff: 1.4,
+                curve_highlights: 1.4,
                 curve_shadows: 1.3,
             },
         );
@@ -868,7 +867,7 @@ mod tests {
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, -1.2);
         assert_eq!(tone.curve_contrast, 0.7);
-        assert_eq!(tone.curve_rolloff, 1.4);
+        assert_eq!(tone.curve_highlights, 1.4);
         assert_eq!(tone.curve_shadows, 1.3);
         assert_eq!(manifest.edits.len(), 1);
     }
@@ -881,7 +880,7 @@ mod tests {
             ToneEdit {
                 exposure_ev: 0.4,
                 curve_contrast: 1.1,
-                curve_rolloff: 0.9,
+                curve_highlights: 0.9,
                 curve_shadows: 1.0,
             },
         );
@@ -1072,7 +1071,7 @@ mod tests {
             ToneEdit {
                 exposure_ev: -1.2,
                 curve_contrast: 0.7,
-                curve_rolloff: 1.4,
+                curve_highlights: 1.4,
                 curve_shadows: 1.3,
             },
         );

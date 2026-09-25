@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use crate::app::{
-    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Tile, Thumb, curve_lift_value,
-    curve_power_for_lift, detail_zoom_delta,
+    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Tile, Thumb,
+    detail_zoom_delta, highlight_lift, highlight_power_for_lift, shadow_lift, shadow_power_for_lift,
 };
 use crate::detail_area::DetailArea;
 use crate::error::FrameError;
@@ -212,43 +212,52 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
 
     // Tone-editing controls: three pivoted powers re-shape the GPU texture
     // via a uniform-only remap — contrast pivots at the image's measured
-    // mid-gray, highlight rolloff at the measured white point, shadows at the
+    // mid-gray, shadows at the measured white point, highlights at the
     // measured shadow anchor. Grid thumbnails are unaffected; every detail
     // open starts from the stored edits. The Highlights and Shadows sliders
-    // expose their power as a stop-based "lift value" (`curve_lift_value`)
-    // centered on the identity, so dragging right brightens the region instead
-    // of crushing it — the direction other photo apps use, with the sweet spot
-    // in the middle of the track. Contrast keeps its conventional sense
-    // (up = more contrast).
+    // expose their power as a stop-based "lift value" (`highlight_lift`/
+    // `shadow_lift`) centered on the identity, so dragging right brightens the
+    // region instead of crushing it — the direction other photo apps use, with
+    // the sweet spot in the middle of the track. The two arms use opposite
+    // power↔lift maps because their pivots sit at opposite ends. Contrast keeps
+    // its conventional sense (up = more contrast).
     let contrast_label = widget::text(fl!("contrast-label"));
     let contrast_slider = widget::slider(
         0.25..=4.0,
         app.curve_contrast,
         // When any slider moves, the other values travel along so the
         // remap always composes the full curve, not a half-updated one.
-        move |contrast| Message::CurveChanged(contrast, app.curve_rolloff, app.curve_shadows),
+        move |contrast| Message::CurveChanged(contrast, app.curve_highlights, app.curve_shadows),
     )
     .step(0.05_f32)
     // A finished drag is an edit flush point, like exposure.
     .on_release(Message::EditSave);
-    let rolloff_label = widget::text(fl!("rolloff-label"));
-    let rolloff_slider = widget::slider(-2.0..=2.0, curve_lift_value(app.curve_rolloff), move |lift| {
-        Message::CurveChanged(
-            app.curve_contrast,
-            curve_power_for_lift(lift),
-            app.curve_shadows,
-        )
-    })
+    let highlights_label = widget::text(fl!("highlights-label"));
+    let highlights_slider = widget::slider(
+        -2.0..=2.0,
+        highlight_lift(app.curve_highlights),
+        move |lift| {
+            Message::CurveChanged(
+                app.curve_contrast,
+                highlight_power_for_lift(lift),
+                app.curve_shadows,
+            )
+        },
+    )
     .step(0.05_f32)
     .on_release(Message::EditSave);
     let shadows_label = widget::text(fl!("shadows-label"));
-    let shadows_slider = widget::slider(-2.0..=2.0, curve_lift_value(app.curve_shadows), move |lift| {
-        Message::CurveChanged(
-            app.curve_contrast,
-            app.curve_rolloff,
-            curve_power_for_lift(lift),
-        )
-    })
+    let shadows_slider = widget::slider(
+        -2.0..=2.0,
+        shadow_lift(app.curve_shadows),
+        move |lift| {
+            Message::CurveChanged(
+                app.curve_contrast,
+                app.curve_highlights,
+                shadow_power_for_lift(lift),
+            )
+        },
+    )
     .step(0.05_f32)
     .on_release(Message::EditSave);
     // Keyboard crop readout + arm hint. The four values are the live margins
@@ -273,8 +282,8 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(slider)
         .push(contrast_label)
         .push(contrast_slider)
-        .push(rolloff_label)
-        .push(rolloff_slider)
+        .push(highlights_label)
+        .push(highlights_slider)
         .push(shadows_label)
         .push(shadows_slider)
         .push(reset_all)

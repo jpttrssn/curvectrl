@@ -721,7 +721,7 @@ fn render_tail(
     shader::apply_curve(
         mono,
         tone.curve_contrast,
-        tone.curve_rolloff,
+        tone.curve_highlights,
         tone.curve_shadows,
         shadow,
         mid,
